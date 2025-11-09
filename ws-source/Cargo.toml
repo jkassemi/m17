@@ -1,3 +1,5 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
+
 [package]
 name = "ws-source"
 version = "0.1.0"
@@ -5,8 +7,7 @@ edition = "2021"
 
 [dependencies]
 core-types = { path = "../core-types" }
-data-client = { path = "../data-client" }
 tokio = { version = "1.0", features = ["full"] }
-tokio-tungstenite = "0.20"
+tokio-tungstenite = "0.18"
 futures = "0.3"
-async-trait = "0.1"
+url = "2.3"

@@ -1,3 +1,5 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
+
 # Trade Capture M17
 
 ## Overview

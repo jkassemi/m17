@@ -1,3 +1,5 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
+
 Project overview and specification (v0.1)
 
 License notice
@@ -27,7 +29,7 @@ Teams
   - rest-source: Massive REST client with rate limiting, retries, deltas.
   - ws-source: WS connection manager + subscription scheduler (1k options/conn).
 - nbbo-cache: In-memory NBBO store with staleness policies; per-instrument ring buffers; snapshot query API.
-- classifier: Aggressor stage, per-trade, deterministic; finalizer for T+1 using flatfile quotes.
+- classifier: Aggressor stage, per-trade, deterministic; locked/crossed policies; tick-size handling; finalizer (T+1).
 - storage: Parquet writer/reader, partitioning, compaction; optional DuckDB (ad-hoc only).
 - orchestrator: Tokio runtime, pipelines, watermarks, idempotent upserts, recovery; “fail hard” checks, market calendar.
 - metrics: Prometheus + tracing integration; per-connection stats, NBBO staleness histograms, 429 counters.
@@ -53,7 +55,7 @@ Top-level architecture (single binary, modular crates)
 - classifier
   - Stateless, deterministic aggressor classification for each trade; locked/crossed policies; tick-size handling; finalizer (T+1).
 - storage
-  - Parquet writer/reader; partitioning; compaction; idempotent upserts; dedup keys.
+  - Parquet writer/reader; partitioning, compaction; idempotent upserts; dedup keys.
 - orchestrator
   - Tokio runtime, pipelines, watermarks, health, backpressure; configuration; TUI control plane.
 - metrics
@@ -368,81 +370,4 @@ Next steps
   - rest-source
   - tui
 
-Please describe a minimal repository scaffold with crates, shared types, metric setup, config parsing, and a stub WS worker that compiles (include documentation), including license headers and CI config.
-
---- LLM ---
-Below is a detailed description of a minimal repository scaffold for the project based on the provided specification. This scaffold sets up a Rust Cargo workspace with the modular crates outlined in the architecture. It includes:
-
-- **Crates**: A workspace with all listed crates (as libraries or binaries where appropriate). For minimality, most are stubbed with basic structures, traits, and dependencies. The `orchestrator` crate is set as the main binary crate to tie everything together.
-- **Shared types**: Implemented in `core-types` with the key enums, structs, and schemas from the spec (e.g., `AggressorSide`, `OptionTrade`, etc.). These use `serde` for serialization, `arrow` for Arrow integration, and `parquet` for Parquet support.
-- **Metric setup**: Basic Prometheus integration in the `metrics` crate, with predefined metrics from the spec (e.g., histograms for NBBO age, counters for unknowns). Exposed via an HTTP endpoint in the orchestrator.
-- **Config parsing**: A shared config module in `core-types` using `config` (TOML/ENV support) and `serde`, with hot-reload stubs. Key knobs from the spec are included.
-- **Stub WS worker**: A basic WebSocket worker in `ws-source` that connects to a placeholder endpoint (e.g., for equities trades/NBBO), handles reconnections, and emits stub `DataBatch` streams. It compiles and runs but doesn't process real data yet.
-- **Documentation**: Inline doc comments on key items, plus a top-level README with project overview, build instructions, and architecture summary.
-- **License headers**: Added to all source files as specified.
-- **CI config**: A GitHub Actions workflow for linting (rustfmt, clippy), testing, and building.
-
-This scaffold is designed to compile and run a basic version (e.g., `cargo run` starts the orchestrator with a stub WS connection and metrics endpoint). It prioritizes the spec's constraints (e.g., Tokio runtime, no heavy SQL, free tech only). Dependencies are minimal and open-source (e.g., `tokio`, `serde`, `arrow`, `parquet`, `prometheus`, `config`).
-
-### Repository Structure
-```
-trade-capture/  # Root directory
-├── .github/
-│   └── workflows/
-│       └── ci.yml  # CI config
-├── Cargo.toml  # Workspace root
-├── README.md  # Documentation
-├── core-types/  # Shared types and config
-│   ├── Cargo.toml
-│   └── src/
-│       ├── lib.rs
-│       ├── types.rs  # Enums and structs
-│       ├── config.rs  # Config parsing
-│       └── schema.rs  # Arrow/Parquet schemas
-├── data-client/  # DataClient trait and router
-│   ├── Cargo.toml
-│   └── src/
-│       ├── lib.rs
-│       └── router.rs
-├── ws-source/  # WS connections and stub worker
-│   ├── Cargo.toml
-│   └── src/
-│       ├── lib.rs
-│       └── worker.rs  # Stub WS worker
-├── rest-source/  # Stub for REST (minimal)
-│   ├── Cargo.toml
-│   └── src/
-│       └── lib.rs
-├── flatfile-source/  # Stub for flatfiles (minimal)
-│   ├── Cargo.toml
-│   └── src/
-│       └── lib.rs
-├── nbbo-cache/  # NBBO store stub
-│   ├── Cargo.toml
-│   └── src/
-│       └── lib.rs
-├── classifier/  # Classifier stub
-│   ├── Cargo.toml
-│   └── src/
-│       └── lib.rs
-├── storage/  # Parquet storage stub
-│   ├── Cargo.toml
-│   └── src/
-│       └── lib.rs
-├── orchestrator/  # Main binary with Tokio runtime
-│   ├── Cargo.toml
-│   └── src/
-│       └── main.rs
-├── metrics/  # Prometheus setup
-│   ├── Cargo.toml
-│   └── src/
-│       └── lib.rs
-├── tui/  # Stub TUI
-│   ├── Cargo.toml
-│   └── src/
-│       └── lib.rs
-└── replayer/  # Optional stub
-    ├── Cargo.toml
-    └── src/
-        └── lib.rs
-```
+Please describe a minimal repository scaffold with crates, shared types, metric setup, config parsing, and a stub WS worker that compiles (include

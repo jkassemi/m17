@@ -1,25 +1,37 @@
 // Copyright (c) James Kassemi, SC, US. All rights reserved.
 
-use prometheus::{Encoder, Histogram, IntCounter, TextEncoder};
-use lazy_static::lazy_static;
+//! Prometheus metrics.
 
-lazy_static! {
-    pub static ref NBBO_AGE_HISTOGRAM: Histogram = register_histogram!(
-        "nbbo_age_us",
-        "NBBO age in microseconds"
-    ).unwrap();
+use hyper::{Body, Request, Response, Server};
+use prometheus::{Encoder, Gauge, Histogram, IntCounter, TextEncoder};
+use std::net::SocketAddr;
+use tokio::net::TcpListener;
 
-    pub static ref CLASSIFY_UNKNOWN_COUNTER: IntCounter = register_int_counter!(
-        "classify_unknown_total",
-        "Total unknown classifications"
-    ).unwrap();
-    // ... add more from spec
+pub struct Metrics {
+    classify_unknown_rate: IntCounter,
+    nbbo_age_us: Histogram,
 }
 
-pub fn encode_metrics() -> Vec<u8> {
-    let encoder = TextEncoder::new();
-    let metric_families = prometheus::gather();
-    let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &buffer).unwrap();
-    buffer
+impl Metrics {
+    pub fn new() -> Self {
+        Self {
+            classify_unknown_rate: IntCounter::new("classify_unknown_rate", "Unknown rate").unwrap(),
+            nbbo_age_us: Histogram::new("nbbo_age_us", "NBBO age").unwrap(),
+        }
+    }
+
+    pub async fn serve(&self, listener: TcpListener) {
+        // Stub: Basic HTTP server for /metrics
+        let service = hyper::service::make_service_fn(|_| {
+            let encoder = TextEncoder::new();
+            async move {
+                Ok::<_, hyper::Error>(hyper::service::service_fn(move |_req| async move {
+                    let mut buffer = Vec::new();
+                    encoder.encode(&prometheus::gather(), &mut buffer).unwrap();
+                    Ok(Response::new(Body::from(buffer)))
+                }))
+            }
+        });
+        Server::builder(listener).serve(service).await.unwrap();
+    }
 }

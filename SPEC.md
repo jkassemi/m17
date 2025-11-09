@@ -344,8 +344,8 @@ Appendix: exemplar Rust signatures (abbreviated)
 
 - NbboStore
   - fn put(&self, q: &Nbbo);
-  - fn get_best_before(&self, id: &str, ts_ns: i64, max_staleness_us: u32) -> Option<Nbbo>;
-  - fn get_state_before(&self, id: &str, ts_ns: i64) -> Option<NbboState>;
+  - fn get_best_before(id: &str, ts_ns: i64, max_staleness_us: u32) -> Option<Nbbo>;
+  - fn get_state_before(id: &str, ts_ns: i64) -> Option<NbboState>;
 
 - Classifier
   - fn classify_trade(&self, trade: &mut TradeLike, nbbo: &NbboStore, params: &ClassParams);

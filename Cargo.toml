@@ -1,16 +1,10 @@
-[workspace]
-members = [
-    "core-types",
-    "data-client",
-    "ws-source",
-    "rest-source",
-    "flatfile-source",
-    "nbbo-cache",
-    "classifier",
-    "storage",
-    "orchestrator",
-    "metrics",
-    "tui",
-    "replayer",
-]
-resolver = "2"
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
+
+[package]
+name = "classifier"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core-types = { path = "../core-types" }
+nbbo-cache = { path = "../nbbo-cache" }

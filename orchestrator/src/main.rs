@@ -15,20 +15,4 @@ async fn main() {
     let config = AppConfig::load().unwrap_or_default();
     let data_client = DataClientRouter::new();
     let nbbo_store = NbboStore::new();
-    let classifier = classifier::Classifier::new();
-    let storage = Storage::new();
-    let metrics = Metrics::new();
-
-    // Stub WS worker
-    let ws_worker = WsWorker::new("ws://example.com"); // Placeholder URL
-    let _stream = ws_worker.run().await;
-
-    // Stub metrics server
-    let listener = TcpListener::bind("127.0.0.1:9090").await.unwrap();
-    tokio::spawn(async move {
-        metrics.serve(listener).await;
-    });
-
-    // Stub: Run forever
-    tokio::signal::ctrl_c().await.unwrap();
-}
+    let classifier = classifier::

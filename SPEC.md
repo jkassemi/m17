@@ -348,7 +348,7 @@ Appendix: exemplar Rust signatures (abbreviated)
   - fn get_state_before(&self, id: &str, ts_ns: i64) -> Option<NbboState>;
 
 - Classifier
-  - fn classify_trade(&self, trade: &mut TradeLike, nbbo: &dyn NbboStore, params: &ClassParams);
+  - fn classify_trade(&self, trade: &mut TradeLike, nbbo: &NbboStore, params: &ClassParams);
 
 - Dedup key
   - trait DedupKey { fn key(&self) -> DedupKeyHash; }

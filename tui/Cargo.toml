@@ -1,5 +1,3 @@
-// Copyright (c) James Kassemi, SC, US. All rights reserved.
-
 [package]
 name = "tui"
 version = "0.1.0"

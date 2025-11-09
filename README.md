@@ -1,6 +1,7 @@
-// Copyright (c) James Kassemi, SC, US. All rights reserved.
-
 # Trade Capture M17
+
+**Copyright (c) James Kassemi, SC, US. All rights reserved.**
+
 
 ## Overview
 This system captures trades with NBBO snapshots, classifies aggressors, calculates greeks, stores data in Parquet, and provides a dashboard for realtime application of trading algorithms and strategies.

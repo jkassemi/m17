@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "core-types",
+    "data-client",
+    "ws-source",
+    "rest-source",
+    "flatfile-source",
+    "nbbo-cache",
+    "classifier",
+    "storage",
+    "orchestrator",
+    "metrics",
+    "tui",
+    "replayer",
+]
+resolver = "2"

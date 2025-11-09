@@ -1,0 +1,13 @@
+[package]
+name = "core-types"
+version = "0.1.0"
+edition = "2025"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+arrow = "57.0"
+parquet = { version = "57.0", features = ["arrow"] }
+config = "0.15"
+tokio = { version = "1.48", features = ["full"] }
+thiserror = "2.0"
+anyhow = "1.0"

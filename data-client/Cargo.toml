@@ -1,0 +1,9 @@
+[package]
+name = "data-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core-types = { path = "../core-types" }
+tokio-stream = "0.1"
+futures = "0.3"

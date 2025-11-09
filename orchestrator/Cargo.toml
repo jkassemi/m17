@@ -1,0 +1,13 @@
+[package]
+name = "orchestrator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core-types = { path = "../core-types" }
+ws-source = { path = "../ws-source" }
+metrics = { path = "../metrics" }
+tokio = { version = "1.0", features = ["full"] }
+warp = "0.3"  // For metrics HTTP endpoint
+tracing = "0.1"
+tracing-subscriber = "0.3"

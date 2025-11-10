@@ -2,9 +2,8 @@
 
 //! Prometheus metrics.
 
-use hyper::{Body, Request, Response, Server};
-use prometheus::{Encoder, Gauge, Histogram, HistogramOpts, IntCounter, TextEncoder};
-use std::net::SocketAddr;
+use hyper::{body::Body, Request, Response, Server};
+use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, TextEncoder};
 use tokio::net::TcpListener;
 
 pub struct Metrics {
@@ -22,15 +21,11 @@ impl Metrics {
 
     pub async fn serve(&self, listener: TcpListener) {
         // Stub: Basic HTTP server for /metrics
-        let service = hyper::service::make_service_fn(|_| {
-            let encoder = TextEncoder::new();
-            async move {
-                Ok::<_, hyper::Error>(hyper::service::service_fn(move |_req| async move {
-                    let mut buffer = Vec::new();
-                    encoder.encode(&prometheus::gather(), &mut buffer).unwrap();
-                    Ok(Response::new(Body::from(buffer)))
-                }))
-            }
+        let encoder = TextEncoder::new();
+        let service = hyper::service::service_fn(move |_req: Request<Body>| async move {
+            let mut buffer = Vec::new();
+            encoder.encode(&prometheus::gather(), &mut buffer).unwrap();
+            Ok::<_, hyper::Error>(Response::new(Body::from(buffer)))
         });
         Server::builder(listener).serve(service).await.unwrap();
     }

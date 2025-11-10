@@ -1,7 +1,8 @@
 // Copyright (c) James Kassemi, SC, US. All rights reserved.
 
-//! Shared schemas, enums, error types, and feature flags for the trade capture system.
+//! Core types and schemas.
 
 pub mod types;
 pub mod config;
 pub mod schema;
+pub mod data_client;

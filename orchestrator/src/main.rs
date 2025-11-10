@@ -4,27 +4,33 @@
 
 use classifier::Classifier;
 use core_types::config::AppConfig;
+use core_types::data_client::DataClient;
 use data_client::DataClientRouter;
 use flatfile_source::{FlatfileSource, LocalFileStore};
+use futures::StreamExt;
 use metrics::Metrics;
 use nbbo_cache::NbboStore;
 use storage::Storage;
 use tokio::net::TcpListener;
-use tui::Tui;
-use ws_source::worker::WsWorker;
 use tokio::sync::oneshot;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use tokio::time::sleep;
+use tui::Tui;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::path::PathBuf;
+use chrono::{DateTime, Utc, NaiveDate, Datelike};
+use tokio::sync::Semaphore;
 
 #[tokio::main]
 async fn main() {
     let config = AppConfig::load().expect("Failed to load config: required environment variables POLYGONIO_KEY, POLYGONIO_ACCESS_KEY_ID, POLYGONIO_SECRET_ACCESS_KEY must be set");
-    let data_client = DataClientRouter::new();
+    let local_store = LocalFileStore::new(PathBuf::from("data"));
+    let flatfile_source = FlatfileSource::new(Arc::new(local_store));
+    let data_client = Arc::new(DataClientRouter::new(flatfile_source));
     let nbbo_store = NbboStore::new();
     let classifier = Classifier::new();
-    let storage = Storage::new(config.storage);
+    let storage = Arc::new(Mutex::new(Storage::new(config.storage)));
     let metrics = Arc::new(Metrics::new());  // Wrap in Arc to match the serve method signature
 
     // Set initial config reload timestamp
@@ -34,19 +40,11 @@ async fn main() {
         .as_nanos() as i64;
     metrics.set_last_config_reload_ts_ns(now);
 
-    // Create shutdown channel
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-    // Stub WS worker
-    let ws_worker = WsWorker::new("ws://example.com"); // Placeholder URL
-    let _stream = ws_worker.run().await;
-
     // Launch flatfile source
-    let local_store = LocalFileStore::new(PathBuf::from("data"));
-    let flatfile_source = FlatfileSource::new(Box::new(local_store));
     let flatfile_config = config.flatfile.clone();
     let metrics_clone_for_flatfile = metrics.clone();
     tokio::spawn(async move {
+        let flatfile_source = FlatfileSource::new(Arc::new(LocalFileStore::new(PathBuf::from("data"))));
         flatfile_source.run(flatfile_config).await;
     });
 
@@ -87,12 +85,62 @@ async fn main() {
     });
 
     // Launch TUI dashboard
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let mut tui = Tui::new(metrics.clone(), shutdown_tx);
     tokio::spawn(async move {
         if let Err(e) = tui.run().await {
             eprintln!("TUI error: {}", e);
         }
     });
+
+    // Ingestion loop for equity trades
+    let semaphore = Arc::new(Semaphore::new(2)); // Limit to 2 concurrent days
+    for range in &config.flatfile.date_ranges {
+        let start_ts_ns = range.start_ts_ns().unwrap_or(0);
+        let end_ts_ns = range.end_ts_ns().unwrap_or(Some(i64::MAX)).unwrap_or(i64::MAX);
+        let start_date = if let Some(dt) = DateTime::<Utc>::from_timestamp(start_ts_ns / 1_000_000_000, (start_ts_ns % 1_000_000_000) as u32) {
+            dt.naive_utc().date()
+        } else {
+            // Default to a recent date if invalid, e.g., 2023-01-01
+            NaiveDate::from_ymd_opt(2023, 1, 1).unwrap()
+        };
+        let end_date = if let Some(dt) = DateTime::<Utc>::from_timestamp(end_ts_ns / 1_000_000_000, (end_ts_ns % 1_000_000_000) as u32) {
+            dt.naive_utc().date()
+        } else {
+            // Default to today if invalid
+            Utc::now().naive_utc().date()
+        };
+        let mut current_date = start_date;
+        while current_date <= end_date {
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let data_client = data_client.clone();
+            let storage = storage.clone();
+            let metrics = metrics.clone();
+            let day_start_ns = current_date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_nanos_opt().unwrap_or(i64::MIN);
+            let day_end_ns = if let Some(next_day) = current_date.succ_opt() {
+                next_day.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_nanos_opt().unwrap_or(i64::MAX).saturating_sub(1)
+            } else {
+                i64::MAX
+            };
+            let scope = core_types::types::QueryScope {
+                instruments: vec![], // All instruments
+                time_range: (day_start_ns, day_end_ns),
+                mode: "Historical".to_string(),
+                quality_target: core_types::types::Quality::Prelim,
+            };
+            tokio::spawn(async move {
+                let mut stream = data_client.get_equity_trades(scope).await;
+                while let Some(batch) = stream.next().await {
+                    if let Err(e) = storage.lock().unwrap().write_equity_trades(&batch) {
+                        eprintln!("Failed to write equity trades batch: {}", e);
+                    }
+                }
+                metrics.set_flatfile_status(format!("Ingested day: {}", current_date));
+                drop(permit);
+            });
+            current_date = current_date.succ_opt().unwrap();
+        }
+    }
 
     // Wait for shutdown signal or ctrl_c
     tokio::select! {

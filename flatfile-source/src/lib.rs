@@ -6,16 +6,16 @@ use async_compression::tokio::bufread::GzipDecoder;
 use async_trait::async_trait;
 use bytes::Bytes;
 use core_types::config::FlatfileConfig;
+use core_types::data_client::DataClient;
 use core_types::types::{
     AggressorSide, ClassMethod, Completeness, DataBatch, DataBatchMeta, EquityTrade, Nbbo,
     OptionTrade, Quality, QueryScope, Source, Watermark,
 };
 use csv::Reader;
-use flate2::read::GzDecoder;
 use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
-use std::io::{Cursor, Read};
+use std::io::Cursor;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -307,6 +307,31 @@ impl FlatfileSource {
             }
         });
         Box::pin(ReceiverStream::new(rx))
+    }
+}
+
+#[async_trait::async_trait]
+impl DataClient for FlatfileSource {
+    async fn get_option_trades(
+        &self,
+        _scope: QueryScope,
+    ) -> Pin<Box<dyn Stream<Item = DataBatch<OptionTrade>> + Send>> {
+        // Stub: Return empty stream
+        Box::pin(futures::stream::empty())
+    }
+
+    async fn get_equity_trades(
+        &self,
+        scope: QueryScope,
+    ) -> Pin<Box<dyn Stream<Item = DataBatch<EquityTrade>> + Send>> {
+        self.get_equity_trades(scope).await
+    }
+
+    async fn get_nbbo(
+        &self,
+        scope: QueryScope,
+    ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>> {
+        self.get_nbbo(scope).await
     }
 }
 

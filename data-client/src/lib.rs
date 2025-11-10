@@ -2,33 +2,19 @@
 
 //! DataClient trait and router (stub).
 
+use core_types::data_client::DataClient;
 use core_types::types::{DataBatch, EquityTrade, Nbbo, OptionTrade, QueryScope};
 use futures::Stream;
 use std::pin::Pin;
 
-/// DataClient trait as per spec.
-#[async_trait::async_trait]
-pub trait DataClient {
-    async fn get_option_trades(
-        &self,
-        scope: QueryScope,
-    ) -> Pin<Box<dyn Stream<Item = DataBatch<OptionTrade>> + Send>>;
-    async fn get_equity_trades(
-        &self,
-        scope: QueryScope,
-    ) -> Pin<Box<dyn Stream<Item = DataBatch<EquityTrade>> + Send>>;
-    async fn get_nbbo(
-        &self,
-        scope: QueryScope,
-    ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>>;
+/// Router implementation (stub).
+pub struct DataClientRouter {
+    flatfile_source: flatfile_source::FlatfileSource,
 }
 
-/// Router implementation (stub).
-pub struct DataClientRouter;
-
 impl DataClientRouter {
-    pub fn new() -> Self {
-        Self
+    pub fn new(flatfile_source: flatfile_source::FlatfileSource) -> Self {
+        Self { flatfile_source }
     }
 }
 
@@ -44,10 +30,9 @@ impl DataClient for DataClientRouter {
 
     async fn get_equity_trades(
         &self,
-        _scope: QueryScope,
+        scope: QueryScope,
     ) -> Pin<Box<dyn Stream<Item = DataBatch<EquityTrade>> + Send>> {
-        // Stub: Return empty stream
-        Box::pin(tokio_stream::empty())
+        self.flatfile_source.get_equity_trades(scope).await
     }
 
     async fn get_nbbo(

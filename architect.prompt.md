@@ -129,10 +129,6 @@ Lower-priority or follow-on gaps
 
 3) Concrete, small steps to completion
 
-- A5. FlatfileSource: CSV gz reader/parser -> DataBatch<EquityTrade>
-  - Stream parse with bounded buffers, spawn_blocking for CSV decode; batch every N rows; set DataBatchMeta.
-  - Acceptance: unit test with a small sample file yields expected EquityTrade rows; conditions parsed; timestamps correct.
-
 - A6. DataClientRouter and orchestrator wiring
   - Implement DataClient for FlatfileSource.get_equity_trades(scope).
   - In orchestrator: for each date range day, call get_equity_trades and pipe batches to Storage.write_equity_trades. Use a simple concurrency of 1–2 days at a time.

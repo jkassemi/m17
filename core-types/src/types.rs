@@ -127,6 +127,13 @@ pub struct EquityTrade {
     pub source: Source,
     pub quality: Quality,
     pub watermark_ts_ns: i64,
+    pub trade_id: Option<String>,
+    pub seq: Option<u64>,
+    pub participant_ts_ns: Option<i64>,
+    pub tape: Option<String>,
+    pub correction: Option<i32>,
+    pub trf_id: Option<String>,
+    pub trf_ts_ns: Option<i64>,
 }
 
 /// NBBO row (stub).

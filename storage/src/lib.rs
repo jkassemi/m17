@@ -4,8 +4,8 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array};
-use arrow::datatypes::SchemaRef;
+use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StringArray, UInt32Array, UInt64Array};
+use arrow::datatypes::{Int32Type, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use chrono::DateTime;
 use core_types::schema::{equity_trade_schema, nbbo_schema, option_trade_schema};
@@ -226,13 +226,101 @@ impl Storage {
         Ok(RecordBatch::try_new(schema, arrays)?)
     }
 
-    fn equity_trades_to_record_batch(&self, _trades: &[EquityTrade], _meta: &DataBatchMeta) -> Result<RecordBatch, StorageError> {
-        // Similar to option_trades, but with equity fields.
-        // Omitted for brevity; implement analogously.
+    fn equity_trades_to_record_batch(&self, trades: &[EquityTrade], meta: &DataBatchMeta) -> Result<RecordBatch, StorageError> {
+        let mut symbol = Vec::new();
+        let mut trade_ts_ns = Vec::new();
+        let mut price = Vec::new();
+        let mut size = Vec::new();
+        let mut conditions = Vec::new();
+        let mut exchange = Vec::new();
+        let mut aggressor_side = Vec::new();
+        let mut class_method = Vec::new();
+        let mut aggressor_offset_mid_bp = Vec::new();
+        let mut aggressor_offset_touch_ticks = Vec::new();
+        let mut nbbo_bid = Vec::new();
+        let mut nbbo_ask = Vec::new();
+        let mut nbbo_bid_sz = Vec::new();
+        let mut nbbo_ask_sz = Vec::new();
+        let mut nbbo_ts_ns = Vec::new();
+        let mut nbbo_age_us = Vec::new();
+        let mut nbbo_state = Vec::new();
+        let mut tick_size_used = Vec::new();
+        let mut source = Vec::new();
+        let mut quality = Vec::new();
+        let mut watermark_ts_ns = Vec::new();
+        let mut trade_id = Vec::new();
+        let mut seq = Vec::new();
+        let mut participant_ts_ns = Vec::new();
+        let mut tape = Vec::new();
+        let mut correction = Vec::new();
+        let mut trf_id = Vec::new();
+        let mut trf_ts_ns = Vec::new();
+
+        for trade in trades {
+            symbol.push(trade.symbol.clone());
+            trade_ts_ns.push(trade.trade_ts_ns);
+            price.push(trade.price);
+            size.push(trade.size);
+            conditions.push(trade.conditions.clone());
+            exchange.push(trade.exchange);
+            aggressor_side.push(format!("{:?}", trade.aggressor_side));
+            class_method.push(format!("{:?}", trade.class_method));
+            aggressor_offset_mid_bp.push(trade.aggressor_offset_mid_bp);
+            aggressor_offset_touch_ticks.push(trade.aggressor_offset_touch_ticks);
+            nbbo_bid.push(trade.nbbo_bid);
+            nbbo_ask.push(trade.nbbo_ask);
+            nbbo_bid_sz.push(trade.nbbo_bid_sz);
+            nbbo_ask_sz.push(trade.nbbo_ask_sz);
+            nbbo_ts_ns.push(trade.nbbo_ts_ns);
+            nbbo_age_us.push(trade.nbbo_age_us);
+            nbbo_state.push(format!("{:?}", trade.nbbo_state));
+            tick_size_used.push(trade.tick_size_used);
+            source.push(format!("{:?}", meta.source));
+            quality.push(format!("{:?}", meta.quality));
+            watermark_ts_ns.push(meta.watermark.watermark_ts_ns);
+            trade_id.push(trade.trade_id.clone());
+            seq.push(trade.seq);
+            participant_ts_ns.push(trade.participant_ts_ns);
+            tape.push(trade.tape.clone());
+            correction.push(trade.correction);
+            trf_id.push(trade.trf_id.clone());
+            trf_ts_ns.push(trade.trf_ts_ns);
+        }
+
         let schema: SchemaRef = Arc::new(equity_trade_schema());
-        // Build arrays...
-        // For now, return empty batch.
-        Ok(RecordBatch::new_empty(schema))
+        let conditions_array = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(conditions.into_iter().map(|v| Some(v.into_iter().map(Some)))));
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(symbol)),
+            Arc::new(Int64Array::from(trade_ts_ns)),
+            Arc::new(Float64Array::from(price)),
+            Arc::new(UInt32Array::from(size)),
+            conditions_array,
+            Arc::new(Int32Array::from(exchange)),
+            Arc::new(StringArray::from(aggressor_side)),
+            Arc::new(StringArray::from(class_method)),
+            Arc::new(Int32Array::from(aggressor_offset_mid_bp)),
+            Arc::new(Int32Array::from(aggressor_offset_touch_ticks)),
+            Arc::new(Float64Array::from(nbbo_bid)),
+            Arc::new(Float64Array::from(nbbo_ask)),
+            Arc::new(UInt32Array::from(nbbo_bid_sz)),
+            Arc::new(UInt32Array::from(nbbo_ask_sz)),
+            Arc::new(Int64Array::from(nbbo_ts_ns)),
+            Arc::new(UInt32Array::from(nbbo_age_us)),
+            Arc::new(StringArray::from(nbbo_state)),
+            Arc::new(Float64Array::from(tick_size_used)),
+            Arc::new(StringArray::from(source)),
+            Arc::new(StringArray::from(quality)),
+            Arc::new(Int64Array::from(watermark_ts_ns)),
+            Arc::new(StringArray::from(trade_id)),
+            Arc::new(UInt64Array::from(seq)),
+            Arc::new(Int64Array::from(participant_ts_ns)),
+            Arc::new(StringArray::from(tape)),
+            Arc::new(Int32Array::from(correction)),
+            Arc::new(StringArray::from(trf_id)),
+            Arc::new(Int64Array::from(trf_ts_ns)),
+        ];
+
+        Ok(RecordBatch::try_new(schema, arrays)?)
     }
 
     fn nbbo_to_record_batch(&self, _nbbos: &[Nbbo], _meta: &DataBatchMeta) -> Result<RecordBatch, StorageError> {
@@ -240,5 +328,63 @@ impl Storage {
         let schema: SchemaRef = Arc::new(nbbo_schema());
         // Build arrays...
         Ok(RecordBatch::new_empty(schema))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_types::types::{EquityTrade, Source, Quality, AggressorSide, ClassMethod, NbboState, DataBatchMeta, Watermark, Completeness};
+
+    #[test]
+    fn test_serialize_equity_trade() {
+        let trade = EquityTrade {
+            symbol: "AAPL".to_string(),
+            trade_ts_ns: 1640995200000000000,
+            price: 150.0,
+            size: 100,
+            conditions: vec![1, 2],
+            exchange: 1,
+            aggressor_side: AggressorSide::Buyer,
+            class_method: ClassMethod::NbboTouch,
+            aggressor_offset_mid_bp: Some(10),
+            aggressor_offset_touch_ticks: Some(5),
+            nbbo_bid: Some(149.0),
+            nbbo_ask: Some(151.0),
+            nbbo_bid_sz: Some(200),
+            nbbo_ask_sz: Some(300),
+            nbbo_ts_ns: Some(1640995200000000000),
+            nbbo_age_us: Some(1000),
+            nbbo_state: Some(NbboState::Normal),
+            tick_size_used: Some(0.01),
+            source: Source::Ws,
+            quality: Quality::Prelim,
+            watermark_ts_ns: 1640995200000000000,
+            trade_id: Some("12345".to_string()),
+            seq: Some(123456),
+            participant_ts_ns: Some(1640995200000000000),
+            tape: Some("A".to_string()),
+            correction: Some(0),
+            trf_id: Some("trf123".to_string()),
+            trf_ts_ns: Some(1640995200000000000),
+        };
+        let meta = DataBatchMeta {
+            source: Source::Ws,
+            quality: Quality::Prelim,
+            watermark: Watermark {
+                watermark_ts_ns: 1640995200000000000,
+                completeness: Completeness::Complete,
+                hints: None,
+            },
+            schema_version: 2,
+        };
+        let batch = DataBatch {
+            rows: vec![trade],
+            meta,
+        };
+        let storage = Storage::new(core_types::config::StorageConfig::default());
+        let record_batch = storage.equity_trades_to_record_batch(&batch.rows, &batch.meta).unwrap();
+        assert_eq!(record_batch.num_rows(), 1);
+        assert_eq!(record_batch.num_columns(), 27);
     }
 }

@@ -301,9 +301,51 @@ impl SourceTrait for FlatfileSource {
 
     async fn get_option_trades(
         &self,
-        _scope: QueryScope,
+        scope: QueryScope,
     ) -> Pin<Box<dyn Stream<Item = DataBatch<OptionTrade>> + Send>> {
-        Box::pin(futures::stream::empty())
+        let (tx, rx) = mpsc::channel(100);
+        let self_clone = self.clone();
+        let scope_clone = scope.clone();
+        tokio::spawn(async move {
+            let calendar = TradingCalendar::new(Market::NYSE).unwrap();
+            let start_ts = scope_clone.time_range.0;
+            let end_ts = scope_clone.time_range.1;
+            let start_dt: DateTime<Utc> = DateTime::from_timestamp(
+                start_ts / 1_000_000_000,
+                (start_ts % 1_000_000_000) as u32,
+            )
+            .unwrap_or(Utc::now());
+            let end_dt: DateTime<Utc> =
+                DateTime::from_timestamp(end_ts / 1_000_000_000, (end_ts % 1_000_000_000) as u32)
+                    .unwrap_or(Utc::now());
+            let mut current_date = start_dt.date_naive();
+            let end_date = end_dt.date_naive();
+            while current_date <= end_date {
+                if calendar.is_trading_day(current_date).unwrap_or(false) {
+                    let year = current_date.year();
+                    let month = current_date.month();
+                    let day = current_date.day();
+                    // OPRA options trades layout
+                    let path = format!(
+                        "us_options_opra/trades_v1/{}/{:02}/{}-{:02}-{:02}.csv.gz",
+                        year, month, year, month, day
+                    );
+                    info!("Checking path for option trades: {}", path);
+                    process_option_trades_stream(
+                        &self_clone,
+                        &path,
+                        &scope_clone,
+                        tx.clone(),
+                        self_clone.ingest_batch_size,
+                        self_clone.progress_update_ms,
+                        self_clone.metrics.clone(),
+                    )
+                    .await;
+                }
+                current_date += TimeDelta::try_days(1).unwrap();
+            }
+        });
+        Box::pin(ReceiverStream::new(rx))
     }
 
     async fn get_equity_trades(
@@ -536,11 +578,169 @@ async fn process_equity_trades_stream<S: SourceTrait>(
     }
 }
 
+async fn process_option_trades_stream<S: SourceTrait>(
+    source: &S,
+    path: &str,
+    scope: &QueryScope,
+    tx: mpsc::Sender<DataBatch<OptionTrade>>,
+    batch_size: usize,
+    progress_update_ms: u64,
+    metrics: Option<Arc<Metrics>>,
+) {
+    info!("Attempting to get stream for path: {}", path);
+    match source.get_stream(path).await {
+        Ok(stream) => {
+            let total_len = source.object_len(path).await;
+            if let Some(m) = metrics.as_ref() {
+                m.set_current_file(path.to_string(), total_len.unwrap_or(0));
+            }
+            let bytes_read = Arc::new(AtomicU64::new(0));
+            let reader = StreamReader::new(stream);
+            let counting = CountingReader::new(reader, bytes_read.clone());
+            let buf = BufReader::new(counting);
+            let mut csv_reader = AsyncReaderBuilder::new().create_reader(buf);
+            let mut records = csv_reader.records();
+            let instruments = scope.instruments.clone();
+            let mut batch: Vec<OptionTrade> = Vec::with_capacity(batch_size);
+            let mut last_update = Instant::now();
+
+            while let Some(rec) = records.next().await {
+                if let Ok(record) = rec {
+                    // ticker,conditions,correction,exchange,participant_timestamp,price,sip_timestamp,size
+                    let contract = record[0].to_string();
+                    if !instruments.is_empty() && !instruments.contains(&contract) {
+                        if let Some(m) = metrics.as_ref() {
+                            if last_update.elapsed() >= Duration::from_millis(progress_update_ms) {
+                                m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
+                                last_update = Instant::now();
+                            }
+                        }
+                        continue;
+                    }
+
+                    let (contract_direction, strike_price, expiry_ts_ns, underlying) =
+                        parse_opra_contract(&contract, record.get(6).and_then(|s| s.parse::<i64>().ok()));
+
+                    let trade = OptionTrade {
+                        contract: contract.clone(),
+                        contract_direction,
+                        strike_price,
+                        underlying,
+                        trade_ts_ns: record[6].parse().unwrap_or(0),
+                        price: record[5].parse().unwrap_or(0.0),
+                        size: record[7].parse().unwrap_or(0),
+                        conditions: record[1]
+                            .split(',')
+                            .filter_map(|s| s.trim().parse().ok())
+                            .collect(),
+                        exchange: record[3].parse().unwrap_or(0),
+                        expiry_ts_ns,
+                        aggressor_side: AggressorSide::Unknown,
+                        class_method: ClassMethod::Unknown,
+                        aggressor_offset_mid_bp: None,
+                        aggressor_offset_touch_ticks: None,
+                        nbbo_bid: None,
+                        nbbo_ask: None,
+                        nbbo_bid_sz: None,
+                        nbbo_ask_sz: None,
+                        nbbo_ts_ns: None,
+                        nbbo_age_us: None,
+                        nbbo_state: None,
+                        tick_size_used: None,
+                        delta: None,
+                        gamma: None,
+                        vega: None,
+                        theta: None,
+                        iv: None,
+                        greeks_flags: 0,
+                        source: Source::Flatfile,
+                        quality: Quality::Prelim,
+                        watermark_ts_ns: 0,
+                    };
+                    batch.push(trade);
+                    if batch.len() >= batch_size {
+                        let meta = DataBatchMeta {
+                            source: Source::Flatfile,
+                            quality: Quality::Prelim,
+                            watermark: Watermark {
+                                watermark_ts_ns: 0,
+                                completeness: Completeness::Complete,
+                                hints: None,
+                            },
+                            schema_version: 1,
+                        };
+                        let _ = tx.try_send(DataBatch { rows: std::mem::take(&mut batch), meta });
+                    }
+                }
+                if let Some(m) = metrics.as_ref() {
+                    if last_update.elapsed() >= Duration::from_millis(progress_update_ms) {
+                        m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
+                        last_update = Instant::now();
+                    }
+                }
+            }
+
+            if !batch.is_empty() {
+                let meta = DataBatchMeta {
+                    source: Source::Flatfile,
+                    quality: Quality::Prelim,
+                    watermark: Watermark {
+                        watermark_ts_ns: 0,
+                        completeness: Completeness::Complete,
+                        hints: None,
+                    },
+                    schema_version: 1,
+                };
+                let _ = tx.try_send(DataBatch { rows: batch, meta });
+            }
+
+            if let Some(m) = metrics.as_ref() {
+                if let Some(total) = total_len {
+                    let read = bytes_read.load(Ordering::Relaxed);
+                    if read < total { m.set_current_file_read(total); } else { m.set_current_file_read(read); }
+                } else {
+                    m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to get stream for {}: {}", path, e);
+        }
+    }
+}
+
+fn parse_opra_contract(contract: &str, ts_ns_hint: Option<i64>) -> (char, f64, i64, String) {
+    // Parse OPRA: O:<UNDERLYING><YYMMDD><C|P><STRIKE 8 digits>
+    let mut dir = 'C';
+    let mut strike = 0.0f64;
+    let mut expiry_ts_ns = ts_ns_hint.unwrap_or(0);
+    let mut underlying = String::new();
+    if let Some(sym) = contract.strip_prefix("O:") {
+        if sym.len() >= 15 {
+            let len = sym.len();
+            let date_start = len - 15; // 6 date + 1 dir + 8 strike
+            underlying = sym[..date_start].to_string();
+            let (y, m, d) = (&sym[date_start..date_start+2], &sym[date_start+2..date_start+4], &sym[date_start+4..date_start+6]);
+            if let (Ok(yy), Ok(mm), Ok(dd)) = (y.parse::<u32>(), m.parse::<u32>(), d.parse::<u32>()) {
+                let year = 2000 + yy as i32;
+                if let Some(date) = chrono::NaiveDate::from_ymd_opt(year, mm, dd) {
+                    expiry_ts_ns = date.and_hms_opt(0,0,0).unwrap().and_utc().timestamp_nanos_opt().unwrap_or(expiry_ts_ns);
+                }
+            }
+            dir = sym.chars().nth(len - 9).unwrap_or('C');
+            let strike_raw = &sym[len - 8..];
+            if let Ok(v) = strike_raw.parse::<u32>() { strike = (v as f64) / 1000.0; }
+        }
+    }
+    (dir, strike, expiry_ts_ns, underlying)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::StreamExt;
     use std::path::PathBuf;
+    use tokio_stream::StreamExt as _; // explicit for test modules
 
     #[derive(Clone)]
     pub struct LocalFileSource {
@@ -655,7 +855,7 @@ mod tests {
             .await
             .unwrap();
         let mut bytes_collected = Vec::new();
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
             bytes_collected.push(chunk.unwrap());
         }
         assert!(
@@ -672,7 +872,7 @@ mod tests {
             .await
             .unwrap();
         let mut bytes_collected = Vec::new();
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
             bytes_collected.push(chunk.unwrap());
         }
         assert!(
@@ -682,6 +882,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_local_file_source_get_option_trades() {
+        let source = LocalFileSource::new(PathBuf::from("fixtures"));
+        let scope = QueryScope {
+            instruments: vec![],
+            time_range: (0, i64::MAX),
+            mode: "Historical".to_string(),
+            quality_target: Quality::Prelim,
+        };
+        // Reuse LocalFileSource get_stream; add a small runner for options fixture
+        let (tx, mut rx) = mpsc::channel(10);
+        process_option_trades_stream(
+            &source,
+            "options_trades_example.csv.gz",
+            &scope,
+            tx,
+            1000,
+            250,
+            None,
+        )
+        .await;
+        // Collect all rows
+        let mut all_rows = Vec::new();
+        let mut rx_stream = ReceiverStream::new(rx);
+        while let Some(batch) = tokio_stream::StreamExt::next(&mut rx_stream).await {
+            all_rows.extend(batch.rows);
+        }
+        assert!(!all_rows.is_empty(), "Should yield OptionTrade rows");
+        // Validate a couple of fields from the fixture
+        let first = &all_rows[0];
+        assert_eq!(first.contract, "O:SPY230327P00390000");
+        assert_eq!(first.price, 11.82);
+        assert_eq!(first.size, 1);
+        assert_eq!(first.exchange, 312);
+        assert!(first.trade_ts_ns > 0);
+        // OPRA parsing
+        assert_eq!(first.contract_direction, 'P');
+        assert!((first.strike_price - 390.0).abs() < 1e-6);
+        assert_eq!(first.underlying, "SPY");
+    }
+
+    #[test]
+    fn test_parse_opra_contract() {
+        let (dir, strike, expiry, underlying) = parse_opra_contract("O:SPY241220P00720000", None);
+        assert_eq!(dir, 'P');
+        assert!((strike - 720.0).abs() < 1e-6);
+        assert_eq!(underlying, "SPY");
+        assert!(expiry > 0);
+        let (dir2, strike2, _exp2, und2) = parse_opra_contract("O:TSLA251219C00650000", None);
+        assert_eq!(dir2, 'C');
+        assert!((strike2 - 650.0).abs() < 1e-6);
+        assert_eq!(und2, "TSLA");
+    }
     async fn test_local_file_source_get_equity_trades() {
         let source = LocalFileSource::new(PathBuf::from("fixtures"));
         let scope = QueryScope {
@@ -692,7 +944,7 @@ mod tests {
         };
         let mut stream = source.get_equity_trades(scope).await;
         let mut all_trades = Vec::new();
-        while let Some(batch) = stream.next().await {
+        while let Some(batch) = futures::StreamExt::next(&mut stream).await {
             all_trades.extend(batch.rows);
         }
         assert!(!all_trades.is_empty(), "Should yield EquityTrade rows");

@@ -55,6 +55,10 @@ pub struct GreeksConfig {
     pub notional_threshold: f64,
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
+    #[serde(default = "default_risk_free_rate")]
+    pub risk_free_rate: f64,
+    #[serde(default = "default_dividend_yield")]
+    pub dividend_yield: f64,
 }
 
 fn default_moneyness_threshold() -> f64 {
@@ -67,6 +71,14 @@ fn default_notional_threshold() -> f64 {
 
 fn default_pool_size() -> usize {
     4
+}
+
+fn default_risk_free_rate() -> f64 {
+    0.02
+}
+
+fn default_dividend_yield() -> f64 {
+    0.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

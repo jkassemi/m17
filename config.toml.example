@@ -1,0 +1,33 @@
+[greeks]
+pool_size = 4
+risk_free_rate = 0.02
+dividend_yield = 0.0
+
+[ingest]
+batch_size = 20000
+concurrent_days = 4
+progress_update_ms = 250
+
+[storage]
+file_size_mb_target = 128
+paths.base = "data"
+
+[flatfile]
+massive_key = "YOUR_MASSIVE_KEY"
+massive_access_key_id = "YOUR_ACCESS_KEY_ID"
+massive_secret_access_key = "YOUR_SECRET_ACCESS_KEY"
+massive_flatfiles_endpoint = "https://s3.massive.example"
+massive_flatfiles_region = "custom"
+massive_flatfiles_bucket = "massive-flatfiles"
+
+# Example date ranges
+[[flatfile.date_ranges]]
+start_ts = "2023-03-27T00:00:00Z"
+end_ts = "2023-03-27T23:59:59Z"
+
+# Greeks staleness settings (microseconds)
+# Use up to 1s old underlying NBBO bid for S when computing greeks
+[greeks_staleness]
+flatfile_underlying_staleness_us = 1_000_000
+realtime_underlying_staleness_us = 1_000_000
+

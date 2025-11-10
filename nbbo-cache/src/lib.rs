@@ -3,10 +3,15 @@
 use core_types::types::{Nbbo, NbboState, StalenessParams};
 use std::collections::HashMap;
 
+fn age_us(trade_ts_ns: i64, quote_ts_ns: i64) -> u32 {
+    let diff = trade_ts_ns.saturating_sub(quote_ts_ns);
+    (diff / 1_000) as u32
+}
+
 /// Stub for in-memory NBBO store with per-instrument ring buffers.
 /// Tracks quote states (Normal/Locked/Crossed) and adaptive staleness.
 pub struct NbboStore {
-    // Placeholder: per-instrument storage (e.g., ring buffers for quotes)
+    // Per-instrument sorted quotes by quote_ts_ns
     pub data: HashMap<String, Vec<Nbbo>>,
 }
 
@@ -17,25 +22,56 @@ impl NbboStore {
         }
     }
 
-    /// Put a new NBBO quote into the store.
+    /// Put a new NBBO quote into the store. Assumes quotes arrive roughly sorted by time.
     pub fn put(&mut self, quote: &Nbbo) {
-        // Stub: Insert into per-instrument buffer (no-op for now)
-        self.data
+        let buf = self
+            .data
             .entry(quote.instrument_id.clone())
-            .or_insert_with(Vec::new)
-            .push(quote.clone());
+            .or_insert_with(Vec::new);
+        if buf.last().map(|q| q.quote_ts_ns <= quote.quote_ts_ns).unwrap_or(true) {
+            buf.push(quote.clone());
+        } else {
+            // Fallback: insert keeping order (rare for out-of-order)
+            let pos = buf
+                .binary_search_by_key(&quote.quote_ts_ns, |q| q.quote_ts_ns)
+                .unwrap_or_else(|e| e);
+            buf.insert(pos, quote.clone());
+        }
     }
 
-    /// Get the best NBBO before the given timestamp within max staleness.
-    pub fn get_best_before(&self, id: &str, _ts_ns: i64, _max_staleness_us: u32) -> Option<Nbbo> {
-        // Stub: Return the most recent quote if within staleness (no-op for now)
-        self.data.get(id)?.last().cloned()
+    /// Get the NBBO before or at ts_ns, if within staleness in microseconds.
+    pub fn get_best_before(&self, id: &str, ts_ns: i64, max_staleness_us: u32) -> Option<Nbbo> {
+        let buf = self.data.get(id)?;
+        // binary search last index with quote_ts_ns <= ts_ns
+        let mut lo = 0i64;
+        let mut hi = (buf.len() as i64) - 1;
+        if hi < 0 { return None; }
+        if buf[hi as usize].quote_ts_ns <= ts_ns {
+            let q = &buf[hi as usize];
+            let a = age_us(ts_ns, q.quote_ts_ns);
+            return if a <= max_staleness_us { Some(q.clone()) } else { None };
+        }
+        let mut res: Option<usize> = None;
+        while lo <= hi {
+            let mid = (lo + hi) / 2;
+            let qts = buf[mid as usize].quote_ts_ns;
+            if qts <= ts_ns {
+                res = Some(mid as usize);
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        res.and_then(|idx| {
+            let q = &buf[idx];
+            let a = age_us(ts_ns, q.quote_ts_ns);
+            if a <= max_staleness_us { Some(q.clone()) } else { None }
+        })
     }
 
     /// Get the NBBO state before the given timestamp.
-    pub fn get_state_before(&self, id: &str, _ts_ns: i64) -> Option<NbboState> {
-        // Stub: Return state from the most recent quote (no-op for now)
-        self.data.get(id)?.last().map(|q| q.state.clone())
+    pub fn get_state_before(&self, id: &str, ts_ns: i64) -> Option<NbboState> {
+        self.get_best_before(id, ts_ns, u32::MAX).map(|q| q.state)
     }
 
     /// Get adaptive staleness parameters for an instrument.

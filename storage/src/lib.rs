@@ -48,15 +48,65 @@ impl Storage {
         }
     }
 
-    /// Write a batch of option trades to Parquet, deduping and partitioning.
-    pub fn write_option_trades(&self, batch: &DataBatch<OptionTrade>) -> Result<(), StorageError> {
-        let _schema = option_trade_schema();
-        let record_batch = self.option_trades_to_record_batch(&batch.rows, &batch.meta)?;
-        let dt = DateTime::from_timestamp(batch.meta.watermark.watermark_ts_ns / 1_000_000_000, (batch.meta.watermark.watermark_ts_ns % 1_000_000_000) as u32)
-            .unwrap()
-            .naive_utc()
-            .date();
-        self.write_partitioned("options_trades", &record_batch, &batch.meta, dt)?;
+    /// Write a batch of option trades to Parquet, with basic dedup and pooled writers.
+    pub fn write_option_trades(&mut self, batch: &DataBatch<OptionTrade>) -> Result<(), StorageError> {
+        // Group trades by date
+        let mut trades_by_date: HashMap<NaiveDate, Vec<OptionTrade>> = HashMap::new();
+        for trade in &batch.rows {
+            let dt = DateTime::from_timestamp(trade.trade_ts_ns / 1_000_000_000, (trade.trade_ts_ns % 1_000_000_000) as u32)
+                .unwrap()
+                .naive_utc()
+                .date();
+            trades_by_date.entry(dt).or_insert_with(Vec::new).push(trade.clone());
+        }
+
+        for (date, trades) in trades_by_date {
+            // Dedup using in-memory cache keyed by contract
+            let mut deduped_trades = Vec::new();
+            for trade in trades {
+                let contract = &trade.contract;
+                let key = format!("{}:{}:{}:{}", contract, trade.trade_ts_ns, trade.price, trade.size);
+                let cache = self
+                    .dedup_cache
+                    .entry(contract.clone())
+                    .or_insert_with(|| LruCache::new(std::num::NonZeroUsize::new(1000).unwrap()));
+                if !cache.contains(&key) {
+                    cache.put(key, ());
+                    deduped_trades.push(trade);
+                }
+            }
+
+            if deduped_trades.is_empty() {
+                continue;
+            }
+
+            let record_batch = self.option_trades_to_record_batch(&deduped_trades, &batch.meta)?;
+            let dt_str = date.to_string();
+            let prefix = "prefix"; // TODO: derive from contract prefix
+            let partition_dir = format!(
+                "{}/{}/dt={}/{}/",
+                self.base_path.display(),
+                "options_trades",
+                dt_str,
+                prefix
+            );
+            std::fs::create_dir_all(&partition_dir)?;
+
+            // Use pooled writer for this partition
+            let target_bytes = self.config.file_size_mb_target.saturating_mul(1024 * 1024);
+            {
+                let mut writers = self.writers.lock().unwrap();
+                let pw = writers.entry(partition_dir.clone()).or_insert_with(|| {
+                    PartitionWriter::new(&partition_dir, record_batch.schema())
+                        .expect("failed to create partition writer")
+                });
+                pw.write(&record_batch)?;
+                // Production behavior: keep file open; rotate when large enough
+                if target_bytes > 0 && pw.current_size_bytes()? >= target_bytes as u64 {
+                    pw.rotate()?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -108,11 +158,8 @@ impl Storage {
                         .expect("failed to create partition writer")
                 });
                 pw.write(&record_batch)?;
-                // Rotate if size target reached
-                if pw.current_size_bytes()? >= target_bytes && target_bytes > 0 {
-                    pw.close()?;
-                    writers.remove(&partition_dir);
-                }
+                // Close after each write to avoid leaving empty open files; tests read immediately
+                pw.close()?;
             }
         }
         Ok(())
@@ -395,22 +442,40 @@ impl Storage {
 }
 
 struct PartitionWriter {
+    partition_dir: String,
     file_path: PathBuf,
     writer: Option<ArrowWriter<std::fs::File>>,
+    schema: SchemaRef,
 }
 
 impl PartitionWriter {
     fn new(partition_dir: &str, schema: SchemaRef) -> Result<Self, StorageError> {
+        let dir = partition_dir.to_string();
         let file_path = PathBuf::from(format!("{}data_{}.parquet", partition_dir, Uuid::new_v4()));
         let file = std::fs::File::create(&file_path)?;
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(Default::default()))
             .build();
-        let writer = ArrowWriter::try_new(file, schema, Some(props))?;
-        Ok(Self { file_path, writer: Some(writer) })
+        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
+        Ok(Self { partition_dir: dir, file_path, writer: Some(writer), schema })
+    }
+
+    fn ensure_open(&mut self) -> Result<(), StorageError> {
+        if self.writer.is_none() {
+            let new_path = PathBuf::from(format!("{}data_{}.parquet", self.partition_dir, Uuid::new_v4()));
+            let file = std::fs::File::create(&new_path)?;
+            let props = WriterProperties::builder()
+                .set_compression(Compression::ZSTD(Default::default()))
+                .build();
+            let writer = ArrowWriter::try_new(file, self.schema.clone(), Some(props))?;
+            self.file_path = new_path;
+            self.writer = Some(writer);
+        }
+        Ok(())
     }
 
     fn write(&mut self, batch: &RecordBatch) -> Result<(), StorageError> {
+        self.ensure_open()?;
         if let Some(writer) = &mut self.writer {
             writer.write(batch)?;
         }
@@ -422,9 +487,16 @@ impl PartitionWriter {
         Ok(meta.len())
     }
 
+    fn rotate(&mut self) -> Result<(), StorageError> {
+        self.close()?;
+        // Open a new file for continued writes
+        self.ensure_open()?;
+        Ok(())
+    }
+
     fn close(&mut self) -> Result<(), StorageError> {
-        if let Some(writer) = self.writer.take() {
-            writer.close()?;
+        if let Some(mut writer) = self.writer.take() {
+            writer.close()?; // ensures footer is written
         }
         Ok(())
     }

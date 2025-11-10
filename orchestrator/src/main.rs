@@ -4,6 +4,7 @@
 
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use classifier::Classifier;
+mod greeks_mod { pub use classifier::greeks::*; }
 use core_types::config::AppConfig;
 use flatfile_source::FlatfileSource;
 use flatfile_source::SourceTrait;
@@ -11,6 +12,7 @@ use futures::StreamExt;
 use log::info;
 use metrics::Metrics;
 use nbbo_cache::NbboStore;
+use tokio::sync::RwLock as TokioRwLock;
 use simplelog::*;
 use std::fs::File;
 use std::path::PathBuf;
@@ -55,8 +57,11 @@ async fn main() {
     )
     .await;
     let flatfile_source_clone = flatfile_source.clone();
-    let nbbo_store = NbboStore::new();
+    let nbbo_flatfile = Arc::new(TokioRwLock::new(NbboStore::new()));
+    let nbbo_realtime = Arc::new(TokioRwLock::new(NbboStore::new()));
     let classifier = Classifier::new();
+    let greeks_engine_flat = greeks_mod::GreeksEngine::new(config.greeks.clone(), nbbo_flatfile.clone(), 1_000_000);
+    let greeks_engine_rt = greeks_mod::GreeksEngine::new(config.greeks.clone(), nbbo_realtime.clone(), 1_000_000);
     let storage = Arc::new(Mutex::new(Storage::new(config.storage)));
 
     let mut planned_days: u64 = 0;
@@ -161,7 +166,7 @@ async fn main() {
         }
     });
 
-    // Ingestion loop for equity trades
+    // Ingestion loop for equity and option trades
     let semaphore = Arc::new(Semaphore::new(config.ingest.concurrent_days)); // Configurable concurrent days
     for range in &config.flatfile.date_ranges {
         let start_ts_ns = range.start_ts_ns().unwrap_or(0);
@@ -195,8 +200,8 @@ async fn main() {
                 current_date.format("%Y-%m-%d")
             );
             let permit = semaphore.clone().acquire_owned().await.unwrap();
-            let storage = storage.clone();
-            let metrics = metrics.clone();
+            let storage_eq = storage.clone();
+            let metrics_eq = metrics.clone();
             let flatfile_source_for_task = flatfile_source_clone.clone();
             let day_start_ns = current_date
                 .and_hms_opt(0, 0, 0)
@@ -226,25 +231,73 @@ async fn main() {
                 let mut stream = flatfile_source_for_task.get_equity_trades(scope).await;
                 let mut batch_count = 0u64;
                 let mut row_count = 0u64;
-                while let Some(batch) = stream.next().await {
+                while let Some(mut batch) = stream.next().await {
                     batch_count += 1;
                     row_count += batch.rows.len() as u64;
-                    metrics.inc_batches(1);
-                    metrics.inc_rows(batch.rows.len() as u64);
-                    if let Err(e) = storage.lock().unwrap().write_equity_trades(&batch) {
+                    metrics_eq.inc_batches(1);
+                    metrics_eq.inc_rows(batch.rows.len() as u64);
+                    // No greeks for equities
+                    if let Err(e) = storage_eq.lock().unwrap().write_equity_trades(&batch) {
                         eprintln!("Failed to write equity trades batch: {}", e);
                     }
                 }
-                metrics.inc_completed_day();
+                metrics_eq.inc_completed_day();
                 let status_msg = format!(
                     "Ingested day: {} ({} batches, {} rows)",
                     current_date.format("%Y-%m-%d"),
                     batch_count,
                     row_count
                 );
-                metrics.set_flatfile_status(status_msg.clone());
+                metrics_eq.set_flatfile_status(status_msg.clone());
                 info!("{}", status_msg);
                 drop(permit);
+            });
+
+            // Also spawn flatfile NBBO + options ingestion for the same day
+            let permit_opt = semaphore.clone().acquire_owned().await.unwrap();
+            let storage_opt = storage.clone();
+            let metrics_opt = metrics.clone();
+            let flatfile_source_for_options = flatfile_source_clone.clone();
+            let nbbo_flatfile_clone = nbbo_flatfile.clone();
+            let greeks_engine_flat_clone = greeks_engine_flat.clone();
+            let scope_opt = core_types::types::QueryScope {
+                instruments: vec![],
+                time_range: (day_start_ns, day_end_ns),
+                mode: "Historical".to_string(),
+                quality_target: core_types::types::Quality::Prelim,
+            };
+            tokio::spawn(async move {
+                info!("Seeding NBBO for day: {}", current_date.format("%Y-%m-%d"));
+                // Seed NBBO cache from flatfile equities quotes for the day
+                let mut nbbo_stream = flatfile_source_for_options.get_nbbo(scope_opt.clone()).await;
+                while let Some(batch) = nbbo_stream.next().await {
+                    let mut guard = nbbo_flatfile_clone.write().await;
+                    for q in batch.rows { guard.put(&q); }
+                }
+                info!("Processing options (OPRA) day: {}", current_date.format("%Y-%m-%d"));
+                let mut stream = flatfile_source_for_options.get_option_trades(scope_opt).await;
+                let mut batch_count = 0u64;
+                let mut row_count = 0u64;
+                while let Some(mut batch) = stream.next().await {
+                    batch_count += 1;
+                    row_count += batch.rows.len() as u64;
+                    metrics_opt.inc_batches(1);
+                    metrics_opt.inc_rows(batch.rows.len() as u64);
+                    greeks_engine_flat_clone.enrich_batch(&mut batch.rows).await;
+                    if let Err(e) = storage_opt.lock().unwrap().write_option_trades(&batch) {
+                        eprintln!("Failed to write option trades batch: {}", e);
+                    }
+                }
+                metrics_opt.inc_completed_day();
+                let status_msg = format!(
+                    "Ingested options day: {} ({} batches, {} rows)",
+                    current_date.format("%Y-%m-%d"),
+                    batch_count,
+                    row_count
+                );
+                metrics_opt.set_flatfile_status(status_msg.clone());
+                info!("{}", status_msg);
+                drop(permit_opt);
             });
             current_date = current_date.succ_opt().unwrap();
         }

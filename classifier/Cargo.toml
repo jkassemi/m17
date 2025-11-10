@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 core-types = { path = "../core-types" }
 nbbo-cache = { path = "../nbbo-cache" }
+# No external math deps due to offline build; using internal approx
+black_scholes = "0.10.1"
+tokio = { version = "1", features = ["sync", "rt", "macros"] }

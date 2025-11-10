@@ -8,8 +8,11 @@ use core_types::config::AppConfig;
 use flatfile_source::FlatfileSource;
 use flatfile_source::SourceTrait;
 use futures::StreamExt;
+use log::info;
 use metrics::Metrics;
 use nbbo_cache::NbboStore;
+use simplelog::*;
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -23,6 +26,14 @@ use tui::Tui;
 
 #[tokio::main]
 async fn main() {
+    // Initialize file-based logging
+    WriteLogger::init(
+        LevelFilter::Info,
+        Config::default(),
+        File::create("orchestrator.log").unwrap(),
+    )
+    .unwrap();
+
     let config = AppConfig::load().expect("Failed to load config: required environment variables POLYGONIO_KEY, POLYGONIO_ACCESS_KEY_ID, POLYGONIO_SECRET_ACCESS_KEY must be set");
     let flatfile_config = config.flatfile.clone();
     let flatfile_source = FlatfileSource::new(Arc::new(flatfile_config)).await;
@@ -100,10 +111,11 @@ async fn main() {
     let semaphore = Arc::new(Semaphore::new(2)); // Limit to 2 concurrent days
     for range in &config.flatfile.date_ranges {
         let start_ts_ns = range.start_ts_ns().unwrap_or(0);
-        let end_ts_ns = range
-            .end_ts_ns()
-            .unwrap_or(Some(i64::MAX))
-            .unwrap_or(i64::MAX);
+        let end_ts_ns = if let Some(end) = range.end_ts_ns().ok().flatten() {
+            end
+        } else {
+            Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX)
+        };
         let start_date = if let Some(dt) = DateTime::<Utc>::from_timestamp(
             start_ts_ns / 1_000_000_000,
             (start_ts_ns % 1_000_000_000) as u32,
@@ -153,12 +165,16 @@ async fn main() {
             };
             tokio::spawn(async move {
                 let mut stream = flatfile_source_for_task.get_equity_trades(scope).await;
+                let mut batch_count = 0;
                 while let Some(batch) = stream.next().await {
+                    batch_count += 1;
                     if let Err(e) = storage.lock().unwrap().write_equity_trades(&batch) {
                         eprintln!("Failed to write equity trades batch: {}", e);
                     }
                 }
-                metrics.set_flatfile_status(format!("Ingested day: {}", current_date));
+                let status_msg = format!("Ingested day: {} ({} batches)", current_date.format("%Y-%m-%d"), batch_count);
+                metrics.set_flatfile_status(status_msg.clone());
+                info!("{}", status_msg);
                 drop(permit);
             });
             current_date = current_date.succ_opt().unwrap();

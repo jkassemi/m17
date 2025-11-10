@@ -412,12 +412,9 @@ async fn process_equity_trades_stream<S: SourceTrait>(
             let reader = StreamReader::new(stream);
             let counting = CountingReader::new(reader, bytes_read.clone());
             let buf = BufReader::new(counting);
-            let inner: Box<dyn AsyncRead + Unpin + Send> = if path.ends_with(".gz") {
-                Box::new(GzipDecoder::new(buf))
-            } else {
-                Box::new(buf)
-            };
-            let mut csv_reader = AsyncReaderBuilder::new().create_reader(inner);
+            // Streams returned by `get_stream` are already appropriately decoded
+            // based on file extension. Avoid double-decompression here.
+            let mut csv_reader = AsyncReaderBuilder::new().create_reader(buf);
             let mut records = csv_reader.records();
             let instruments = scope.instruments.clone();
             let mut batch = Vec::with_capacity(batch_size);

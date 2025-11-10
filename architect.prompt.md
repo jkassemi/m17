@@ -129,24 +129,6 @@ Lower-priority or follow-on gaps
 
 3) Concrete, small steps to completion
 
-- A2. Expand EquityTrade and schema
-  - Add optional fields: trade_id, seq, participant_ts_ns, tape, correction, trf_id, trf_ts_ns.
-  - Add Arrow schema for equity trades with all fields (including List<Int32> for conditions).
-  - Bump schema_version.
-  - Acceptance: cargo build passes; a unit test can serialize an EquityTrade to an Arrow RecordBatch via storage helper.
-
-- A3. Storage.equity_trades_to_record_batch + partitioning
-  - Implement conversion for all fields; partition by trade_ts_ns date (group rows by day; write one file per day group per call).
-  - Dedup placeholder: in-memory HashSet<Lru> on (symbol, trade_id) if present else fallback key.
-  - Acceptance: a test writes two batches for same day (one duplicate) and total rows on disk reflect dedup.
-
-- A4. FlatfileSource: object store adapters
-  - Define ObjectStore trait: head, list, get_stream.
-  - Implement local file adapter for dev; stub S3 (signature and config only).
-  - Acceptance: flatfile reader can open local gz CSV and stream bytes.
-    - tests/fixtures/stock_quotes_sample.csv.gz
-    - tests/fixtures/stock_trades_sample.csv.gz
-
 - A5. FlatfileSource: CSV gz reader/parser -> DataBatch<EquityTrade>
   - Stream parse with bounded buffers, spawn_blocking for CSV decode; batch every N rows; set DataBatchMeta.
   - Acceptance: unit test with a small sample file yields expected EquityTrade rows; conditions parsed; timestamps correct.

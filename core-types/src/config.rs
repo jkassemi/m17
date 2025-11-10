@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 /// Config structure with key knobs from spec.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
+    pub polygonio_key: String,
+    pub polygonio_access_key_id: String,
+    pub polygonio_secret_access_key: String,
     pub ws: WsConfig,
     pub staleness: StalenessConfig,
     pub classifier: ClassifierConfig,
@@ -154,7 +157,18 @@ impl AppConfig {
         let settings = Config::builder()
             .add_source(config::File::with_name("config.toml").required(false))
             .add_source(config::Environment::with_prefix("APP"))
+            .add_source(config::Environment::default())
             .build()?;
-        settings.try_deserialize()
+        let config: Self = settings.try_deserialize()?;
+        if config.polygonio_key.is_empty() {
+            return Err(ConfigError::Message("POLYGONIO_KEY is required".to_string()));
+        }
+        if config.polygonio_access_key_id.is_empty() {
+            return Err(ConfigError::Message("POLYGONIO_ACCESS_KEY_ID is required".to_string()));
+        }
+        if config.polygonio_secret_access_key.is_empty() {
+            return Err(ConfigError::Message("POLYGONIO_SECRET_ACCESS_KEY is required".to_string()));
+        }
+        Ok(config)
     }
 }

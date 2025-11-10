@@ -1,5 +1,5 @@
 [flatfile]
 date_ranges = [
-    { start_ts = "2024-01-01T00:00:00Z", end_ts = "2024-01-02T00:00:00Z" },  # Example: Jan 1, 2024 to Jan 2, 2024
-    { start_ts = "2024-01-03T00:00:00Z" },  # Example: Jan 3, 2024 ongoing
+  { start_ts = "2025-11-01T00:00:00Z", end_ts = "2025-11-05T00:00:00Z" },
+  { start_ts = "2025-11-05T00:00:00Z" },
 ]

@@ -157,7 +157,7 @@ impl SourceTrait for FlatfileSource {
         &self,
         path: &str,
     ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send>>,
+        Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let local_dir = std::path::PathBuf::from("data");
@@ -167,7 +167,7 @@ impl SourceTrait for FlatfileSource {
             let reader = BufReader::new(file);
             let stream: Pin<
                 Box<
-                    dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>
+                    dyn Stream<Item = Result<Bytes, std::io::Error>>
                         + Send,
                 >,
             >;
@@ -190,7 +190,7 @@ impl SourceTrait for FlatfileSource {
             let reader = body.into_async_read();
             let stream: Pin<
                 Box<
-                    dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>
+                    dyn Stream<Item = Result<Bytes, std::io::Error>>
                         + Send,
                 >,
             >;

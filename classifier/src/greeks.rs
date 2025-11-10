@@ -1,6 +1,6 @@
 use black_scholes::*;
 use core_types::config::GreeksConfig;
-use core_types::types::{OptionTrade, TradeLike};
+use core_types::types::OptionTrade;
 use nbbo_cache::NbboStore;
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ pub struct GreeksEngine {
     pool: Arc<Semaphore>,
     nbbo: Arc<RwLock<NbboStore>>,
     staleness_us: u32,
-    treasury_curve: Option<Arc<TreasuryCurve>>,
+    treasury_curve: Arc<RwLock<Option<Arc<TreasuryCurve>>>>,
 }
 
 impl GreeksEngine {
@@ -25,7 +25,7 @@ impl GreeksEngine {
         cfg: GreeksConfig,
         nbbo: Arc<RwLock<NbboStore>>,
         staleness_us: u32,
-        treasury_curve: Option<Arc<TreasuryCurve>>,
+        treasury_curve: Arc<RwLock<Option<Arc<TreasuryCurve>>>>,
     ) -> Self {
         let pool = Arc::new(Semaphore::new(std::cmp::max(1, cfg.pool_size)));
         Self {
@@ -38,8 +38,12 @@ impl GreeksEngine {
     }
 
     pub async fn enrich_batch(&self, trades: &mut [OptionTrade]) {
-        let permits = self.pool.clone();
-        let q = self.cfg.dividend_yield;
+        let _permits = self.pool.clone();
+        let _q = self.cfg.dividend_yield;
+        let curve = {
+            let guard = self.treasury_curve.read().await;
+            guard.clone()
+        };
         // simple sequential for now; hook pool for heavy work like IV root-finding in future
         for t in trades.iter_mut() {
             let mut flags = 0u32;
@@ -70,8 +74,7 @@ impl GreeksEngine {
             if t_years <= 0.0 {
                 flags |= FLAG_TIME_EXPIRED;
             }
-            let r = self
-                .treasury_curve
+            let r = curve
                 .as_ref()
                 .map(|curve| curve.rate_for(t_years))
                 .unwrap_or(self.cfg.risk_free_rate);
@@ -197,7 +200,8 @@ mod tests {
             let mut w = store.write().await;
             w.put(&mk_nbbo("SPY", 1_000_000_000, 400.0, 400.1));
         }
-        let engine = GreeksEngine::new(cfg.clone(), store.clone(), 1_000_000, None);
+        let curve_state = Arc::new(RwLock::new(None));
+        let engine = GreeksEngine::new(cfg.clone(), store.clone(), 1_000_000, curve_state);
         let mut trades = vec![OptionTrade {
             contract: "O:SPY250101C00400000".to_string(),
             contract_direction: 'C',

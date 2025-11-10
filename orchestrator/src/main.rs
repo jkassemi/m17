@@ -21,6 +21,7 @@ use nbbo_cache::NbboStore;
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use simplelog::*;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::mem;
@@ -33,9 +34,14 @@ use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::{mpsc, Semaphore};
-use tokio::time::sleep;
+use tokio::time::{interval, sleep};
 use tui::Tui;
 use ws_source::worker::{ResourceKind, SubscriptionSource, WsMessage, WsWorker};
+
+const TREASURY_REFRESH_INTERVAL_SECS: u64 = 86_400;
+type TreasuryCurveCache =
+    Arc<TokioRwLock<HashMap<NaiveDate, Arc<greeks_mod::TreasuryCurve>>>>;
+type TreasuryCurveState = Arc<TokioRwLock<Option<Arc<greeks_mod::TreasuryCurve>>>>;
 
 #[tokio::main]
 async fn main() {
@@ -48,25 +54,92 @@ async fn main() {
     .unwrap();
 
     let config = AppConfig::load().expect("Failed to load config: required environment variables POLYGONIO_KEY, POLYGONIO_ACCESS_KEY_ID, POLYGONIO_SECRET_ACCESS_KEY must be set");
-    let treasury_curve = if let Some(api_key) = config.ws.api_key.clone() {
-        match fetch_latest_treasury_curve(&Client::new(), &config.ws.rest_base_url, &api_key).await
-        {
-            Ok(Some(curve)) => {
-                info!("loaded Massive treasury yields for risk-free interpolation");
-                Some(Arc::new(curve))
+    let mut ingest_min_date: Option<NaiveDate> = None;
+    let mut ingest_max_date: Option<NaiveDate> = None;
+    for range in &config.flatfile.date_ranges {
+        let start_ts_ns = range.start_ts_ns().unwrap_or(0);
+        if let Some(start_dt) = DateTime::<Utc>::from_timestamp(
+            start_ts_ns / 1_000_000_000,
+            (start_ts_ns % 1_000_000_000) as u32,
+        ) {
+            let start_date = start_dt.naive_utc().date();
+            ingest_min_date = Some(match ingest_min_date {
+                Some(existing) => existing.min(start_date),
+                None => start_date,
+            });
+        }
+        let end_ts_ns = if let Some(end) = range.end_ts_ns().ok().flatten() {
+            end
+        } else {
+            Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX)
+        };
+        if let Some(end_dt) = DateTime::<Utc>::from_timestamp(
+            end_ts_ns / 1_000_000_000,
+            (end_ts_ns % 1_000_000_000) as u32,
+        ) {
+            let end_date = end_dt.naive_utc().date();
+            ingest_max_date = Some(match ingest_max_date {
+                Some(existing) => existing.max(end_date),
+                None => end_date,
+            });
+        }
+    }
+    let treasury_curve_cache: TreasuryCurveCache =
+        Arc::new(TokioRwLock::new(HashMap::new()));
+    let realtime_curve_state: TreasuryCurveState = Arc::new(TokioRwLock::new(None));
+    if let Some(api_key) = config.ws.api_key.clone() {
+        let rest_client = Client::new();
+        if let (Some(start_date), Some(end_date)) = (ingest_min_date, ingest_max_date) {
+            match fetch_treasury_curve_range(
+                &rest_client,
+                &config.ws.rest_base_url,
+                &api_key,
+                start_date,
+                end_date,
+            )
+            .await
+            {
+                Ok(curves) => {
+                    let mut cache = treasury_curve_cache.write().await;
+                    for (date, curve) in curves {
+                        cache.insert(date, Arc::new(curve));
+                    }
+                    info!(
+                        "Prefetched Massive treasury yields for {} through {}",
+                        start_date, end_date
+                    );
+                }
+                Err(err) => eprintln!("failed to prefetch treasury yields: {}", err),
+            }
+        }
+        match fetch_latest_treasury_curve(&rest_client, &config.ws.rest_base_url, &api_key).await {
+            Ok(Some((date, curve))) => {
+                info!(
+                    "loaded Massive treasury yields for latest trading day {}",
+                    date
+                );
+                let arc_curve = Arc::new(curve);
+                treasury_curve_cache
+                    .write()
+                    .await
+                    .insert(date, arc_curve.clone());
+                *realtime_curve_state.write().await = Some(arc_curve);
             }
             Ok(None) => {
                 eprintln!("treasury yields endpoint returned no usable data; using config risk_free_rate fallback");
-                None
             }
             Err(err) => {
                 eprintln!("failed to fetch treasury yields: {}", err);
-                None
             }
         }
-    } else {
-        None
-    };
+        tokio::spawn(run_treasury_curve_refresh_loop(
+            rest_client.clone(),
+            config.ws.rest_base_url.clone(),
+            api_key.clone(),
+            realtime_curve_state.clone(),
+            treasury_curve_cache.clone(),
+        ));
+    }
     info!(
         "Loaded config with {} flatfile date ranges",
         config.flatfile.date_ranges.len()
@@ -90,17 +163,11 @@ async fn main() {
     let nbbo_flatfile = Arc::new(TokioRwLock::new(NbboStore::new()));
     let nbbo_realtime = Arc::new(TokioRwLock::new(NbboStore::new()));
     let classifier = Classifier::new();
-    let greeks_engine_flat = greeks_mod::GreeksEngine::new(
-        config.greeks.clone(),
-        nbbo_flatfile.clone(),
-        config.greeks.flatfile_underlying_staleness_us,
-        treasury_curve.clone(),
-    );
     let greeks_engine_rt = greeks_mod::GreeksEngine::new(
         config.greeks.clone(),
         nbbo_realtime.clone(),
         config.greeks.realtime_underlying_staleness_us,
-        treasury_curve.clone(),
+        realtime_curve_state.clone(),
     );
     let storage = Arc::new(Mutex::new(Storage::new(config.storage)));
 
@@ -342,13 +409,15 @@ async fn main() {
             let metrics_opt = metrics.clone();
             let flatfile_source_for_options = flatfile_source_clone.clone();
             let nbbo_flatfile_clone = nbbo_flatfile.clone();
-            let greeks_engine_flat_clone = greeks_engine_flat.clone();
             let scope_opt = core_types::types::QueryScope {
                 instruments: vec![],
                 time_range: (day_start_ns, day_end_ns),
                 mode: "Historical".to_string(),
                 quality_target: core_types::types::Quality::Prelim,
             };
+            let treasury_cache_for_day = treasury_curve_cache.clone();
+            let greeks_cfg = config.greeks.clone();
+            let flatfile_staleness = config.greeks.flatfile_underlying_staleness_us;
             tokio::spawn(async move {
                 info!("Seeding NBBO for day: {}", current_date.format("%Y-%m-%d"));
                 // Seed NBBO cache from flatfile equities quotes for the day
@@ -372,6 +441,24 @@ async fn main() {
                     "Processing options (OPRA) day: {}",
                     current_date.format("%Y-%m-%d")
                 );
+                let day_curve = {
+                    let cache = treasury_cache_for_day.read().await;
+                    cache.get(&current_date).cloned()
+                };
+                if day_curve.is_none() {
+                    eprintln!(
+                        "missing treasury curve for {}; using config risk_free_rate fallback",
+                        current_date
+                    );
+                }
+                let day_curve_state: TreasuryCurveState =
+                    Arc::new(TokioRwLock::new(day_curve));
+                let greeks_engine_flat = greeks_mod::GreeksEngine::new(
+                    greeks_cfg.clone(),
+                    nbbo_flatfile_clone.clone(),
+                    flatfile_staleness,
+                    day_curve_state.clone(),
+                );
                 let mut stream = flatfile_source_for_options
                     .get_option_trades(scope_opt)
                     .await;
@@ -382,7 +469,7 @@ async fn main() {
                     row_count += batch.rows.len() as u64;
                     metrics_opt.inc_batches(1);
                     metrics_opt.inc_rows(batch.rows.len() as u64);
-                    greeks_engine_flat_clone.enrich_batch(&mut batch.rows).await;
+                    greeks_engine_flat.enrich_batch(&mut batch.rows).await;
                     if let Err(e) = storage_opt.lock().unwrap().write_option_trades(&batch) {
                         eprintln!("Failed to write option trades batch: {}", e);
                     }
@@ -576,7 +663,7 @@ async fn fetch_latest_treasury_curve(
     client: &Client,
     rest_base_url: &str,
     api_key: &str,
-) -> Result<Option<greeks_mod::TreasuryCurve>, BoxError> {
+) -> Result<Option<(NaiveDate, greeks_mod::TreasuryCurve)>, BoxError> {
     let mut url = Url::parse(rest_base_url)?;
     url.set_path("/fed/v1/treasury-yields");
     url.query_pairs_mut()
@@ -594,6 +681,84 @@ async fn fetch_latest_treasury_curve(
         }
     }
     Ok(None)
+}
+
+async fn fetch_treasury_curve_range(
+    client: &Client,
+    rest_base_url: &str,
+    api_key: &str,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+) -> Result<Vec<(NaiveDate, greeks_mod::TreasuryCurve)>, BoxError> {
+    let mut url = Url::parse(rest_base_url)?;
+    url.set_path("/fed/v1/treasury-yields");
+    url.query_pairs_mut()
+        .append_pair("limit", "5000")
+        .append_pair("sort", "date.asc")
+        .append_pair("date_gte", &start_date.to_string())
+        .append_pair("date_lte", &end_date.to_string())
+        .append_pair("apiKey", api_key);
+    let mut curves = Vec::new();
+    let mut next = Some(url);
+    while let Some(current) = next {
+        let resp = client.get(current.clone()).send().await?;
+        if !resp.status().is_success() {
+            return Err(format!("treasury yields status {}", resp.status()).into());
+        }
+        let parsed: TreasuryYieldsResponse = resp.json().await?;
+        if let Some(results) = parsed.results {
+            for record in results {
+                if let Some((date, curve)) = build_curve_from_record(record) {
+                    curves.push((date, curve));
+                }
+            }
+        }
+        next = if let Some(next_url) = parsed.next_url {
+            let mut next_parsed = match Url::parse(&next_url) {
+                Ok(u) => u,
+                Err(_) => {
+                    let mut base = Url::parse(rest_base_url)?;
+                    base.set_path(&next_url);
+                    base
+                }
+            };
+            if !next_parsed.query_pairs().any(|(k, _)| k == "apiKey") {
+                next_parsed.query_pairs_mut().append_pair("apiKey", api_key);
+            }
+            Some(next_parsed)
+        } else {
+            None
+        };
+    }
+    Ok(curves)
+}
+
+async fn run_treasury_curve_refresh_loop(
+    client: Client,
+    rest_base_url: String,
+    api_key: String,
+    state: TreasuryCurveState,
+    cache: TreasuryCurveCache,
+) {
+    let mut ticker = interval(Duration::from_secs(TREASURY_REFRESH_INTERVAL_SECS));
+    ticker.tick().await; // consume immediate tick so we wait full interval next
+    loop {
+        ticker.tick().await;
+        match fetch_latest_treasury_curve(&client, &rest_base_url, &api_key).await {
+            Ok(Some((date, curve))) => {
+                let arc_curve = Arc::new(curve);
+                cache.write().await.insert(date, arc_curve.clone());
+                *state.write().await = Some(arc_curve);
+                info!("refreshed Massive treasury yields for {}", date);
+            }
+            Ok(None) => {
+                eprintln!("treasury yields refresh returned no data");
+            }
+            Err(err) => {
+                eprintln!("treasury yields refresh failed: {}", err);
+            }
+        }
+    }
 }
 
 fn spawn_options_subscription_task(
@@ -720,6 +885,7 @@ struct DetailsItem {
 
 #[derive(Debug, Deserialize)]
 struct TreasuryYieldsResponse {
+    next_url: Option<String>,
     results: Option<Vec<TreasuryYieldRecord>>,
 }
 
@@ -751,7 +917,13 @@ struct TreasuryYieldRecord {
     yield_30_year: Option<f64>,
 }
 
-fn build_curve_from_record(record: TreasuryYieldRecord) -> Option<greeks_mod::TreasuryCurve> {
+fn build_curve_from_record(
+    record: TreasuryYieldRecord,
+) -> Option<(NaiveDate, greeks_mod::TreasuryCurve)> {
+    let date = record
+        .date
+        .as_ref()
+        .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())?;
     let mut points = Vec::new();
     if let Some(v) = record.yield_1_month {
         points.push((1.0 / 12.0, v / 100.0));
@@ -786,5 +958,5 @@ fn build_curve_from_record(record: TreasuryYieldRecord) -> Option<greeks_mod::Tr
     if let Some(v) = record.yield_30_year {
         points.push((30.0, v / 100.0));
     }
-    greeks_mod::TreasuryCurve::from_pairs(points)
+    greeks_mod::TreasuryCurve::from_pairs(points).map(|curve| (date, curve))
 }

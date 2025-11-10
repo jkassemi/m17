@@ -1,0 +1,15 @@
+[package]
+name = "diptest"
+version = "0.1.0"
+edition = "2021"
+description = "Rust implementation of Hartigan's dip test for unimodality"
+license = "GPL-3.0-or-later"
+authors = ["diptest contributors"]
+repository = "https://github.com/RUrlus/diptest"
+keywords = ["statistics", "unimodality", "dip test"]
+categories = ["science", "mathematics"]
+
+[dependencies]
+rand = { version = "0.8", features = ["std"] }
+rand_pcg = "0.3"
+rayon = "1.9"

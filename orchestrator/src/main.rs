@@ -5,6 +5,7 @@
 use classifier::Classifier;
 use core_types::config::AppConfig;
 use data_client::DataClientRouter;
+use flatfile_source::FlatfileSource;
 use metrics::Metrics;
 use nbbo_cache::NbboStore;
 use storage::Storage;
@@ -31,6 +32,14 @@ async fn main() {
     // Stub WS worker
     let ws_worker = WsWorker::new("ws://example.com"); // Placeholder URL
     let _stream = ws_worker.run().await;
+
+    // Launch flatfile source
+    let flatfile_source = FlatfileSource::new();
+    let flatfile_config = config.flatfile.clone();
+    let metrics_clone_for_flatfile = metrics.clone();
+    tokio::spawn(async move {
+        flatfile_source.run(flatfile_config).await;
+    });
 
     // Stub metrics server
     let listener = TcpListener::bind("127.0.0.1:9090").await.unwrap();

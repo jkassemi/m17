@@ -1,5 +1,3 @@
-// Copyright (c) James Kassemi, SC, US. All rights reserved.
-
 use config::{Config, ConfigError};
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +11,7 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     pub rest: RestConfig,
     pub scheduler: SchedulerConfig,
+    pub flatfile: FlatfileConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -117,6 +116,18 @@ fn default_rebalance_interval_s() -> u64 {
 
 fn default_hysteresis() -> f64 {
     0.05
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FlatfileConfig {
+    #[serde(default)]
+    pub date_ranges: Vec<DateRange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DateRange {
+    pub start_ts_ns: i64,
+    pub end_ts_ns: Option<i64>,
 }
 
 impl AppConfig {

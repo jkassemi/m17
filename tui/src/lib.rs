@@ -98,14 +98,19 @@ impl Tui {
             None => "Last request: Never".to_string(),
         };
 
+        // Get flatfile status
+        let flatfile_status = self.metrics.flatfile_status();
+
         // Format the last request string with newline
         let last_request_formatted = format!("{}\n", last_request_str);
+        let flatfile_formatted = format!("{}\n", flatfile_status);
 
         // Display component statuses
         let status_spans = vec![
             Span::styled("Component Status Dashboard\n\n", Style::default().fg(Color::Cyan)),
             Span::styled("Metrics Server: Running on 127.0.0.1:9090\n", Style::default().fg(Color::Green)),
             Span::styled(&last_request_formatted, Style::default().fg(Color::Yellow)),
+            Span::styled(&flatfile_formatted, Style::default().fg(Color::Blue)),
             Span::styled("\nPress 'q' to quit.", Style::default().fg(Color::White)),
         ];
         let status_text = Text::from(vec![Line::from(status_spans)]);

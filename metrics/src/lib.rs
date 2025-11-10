@@ -17,6 +17,7 @@ pub struct Metrics {
     classify_unknown_rate: IntCounter,
     nbbo_age_us: Histogram,
     last_request_ts_ns: Arc<Mutex<Option<i64>>>,
+    flatfile_status: Arc<Mutex<String>>,
 }
 
 impl Metrics {
@@ -27,11 +28,20 @@ impl Metrics {
             nbbo_age_us: Histogram::with_opts(HistogramOpts::new("nbbo_age_us", "NBBO age"))
                 .unwrap(),
             last_request_ts_ns: Arc::new(Mutex::new(None)),
+            flatfile_status: Arc::new(Mutex::new("Not started".to_string())),
         }
     }
 
     pub fn last_request_ts_ns(&self) -> Option<i64> {
         *self.last_request_ts_ns.lock().unwrap()
+    }
+
+    pub fn flatfile_status(&self) -> String {
+        self.flatfile_status.lock().unwrap().clone()
+    }
+
+    pub fn set_flatfile_status(&self, status: String) {
+        *self.flatfile_status.lock().unwrap() = status;
     }
 
     async fn handle_metrics(

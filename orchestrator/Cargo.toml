@@ -12,4 +12,5 @@ classifier = { path = "../classifier" }
 storage = { path = "../storage" }
 metrics = { path = "../metrics" }
 tui = { path = "../tui" }
+flatfile-source = { path = "../flatfile-source" }
 tokio = { version = "1.0", features = ["full"] }

@@ -5,7 +5,7 @@
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use classifier::Classifier;
 use core_types::config::AppConfig;
-use flatfile_source::{FlatfileSource, LocalFileStore};
+use flatfile_source::FlatfileSource;
 use futures::StreamExt;
 use metrics::Metrics;
 use nbbo_cache::NbboStore;
@@ -23,7 +23,7 @@ use tui::Tui;
 #[tokio::main]
 async fn main() {
     let config = AppConfig::load().expect("Failed to load config: required environment variables POLYGONIO_KEY, POLYGONIO_ACCESS_KEY_ID, POLYGONIO_SECRET_ACCESS_KEY must be set");
-    let flatfile_source = FlatfileSource::new(Arc::new(local_store));
+    let flatfile_source = FlatfileSource::new(Arc::new(config.flatfile));
     let nbbo_store = NbboStore::new();
     let classifier = Classifier::new();
     let storage = Arc::new(Mutex::new(Storage::new(config.storage)));
@@ -40,7 +40,7 @@ async fn main() {
     let flatfile_config = config.flatfile.clone();
     let metrics_clone_for_flatfile = metrics.clone();
     tokio::spawn(async move {
-        flatfile_source.run(flatfile_config).await;
+        flatfile_source.run().await;
     });
 
     // Stub metrics server
@@ -122,7 +122,6 @@ async fn main() {
         let mut current_date = start_date;
         while current_date <= end_date {
             let permit = semaphore.clone().acquire_owned().await.unwrap();
-            let data_client = data_client.clone();
             let storage = storage.clone();
             let metrics = metrics.clone();
             let day_start_ns = current_date
@@ -149,7 +148,7 @@ async fn main() {
                 quality_target: core_types::types::Quality::Prelim,
             };
             tokio::spawn(async move {
-                let mut stream = data_client.get_equity_trades(scope).await;
+                let mut stream = flatfile_source.get_equity_trades(scope).await;
                 while let Some(batch) = stream.next().await {
                     if let Err(e) = storage.lock().unwrap().write_equity_trades(&batch) {
                         eprintln!("Failed to write equity trades batch: {}", e);

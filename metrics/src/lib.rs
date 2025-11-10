@@ -3,7 +3,7 @@
 //! Prometheus metrics.
 
 use hyper::{Body, Request, Response, Server};
-use prometheus::{Encoder, Gauge, Histogram, IntCounter, TextEncoder};
+use prometheus::{Encoder, Gauge, Histogram, HistogramOpts, IntCounter, TextEncoder};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
@@ -16,7 +16,7 @@ impl Metrics {
     pub fn new() -> Self {
         Self {
             classify_unknown_rate: IntCounter::new("classify_unknown_rate", "Unknown rate").unwrap(),
-            nbbo_age_us: Histogram::new("nbbo_age_us", "NBBO age").unwrap(),
+            nbbo_age_us: Histogram::with_opts(HistogramOpts::new("nbbo_age_us", "NBBO age")).unwrap(),
         }
     }
 

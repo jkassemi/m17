@@ -18,7 +18,6 @@ use core_types::types::{
 };
 use csv::Reader;
 use futures::Stream;
-use futures::StreamExt;
 use futures::TryStreamExt;
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -180,8 +179,7 @@ impl SourceTrait for FlatfileSource {
                 .send()
                 .await?;
             let body: ByteStream = resp.body;
-            let stream_err_mapped = body.map(|res| res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
-
+            let reader = body.into_async_read();
             let stream: Pin<
                 Box<
                     dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>
@@ -189,15 +187,18 @@ impl SourceTrait for FlatfileSource {
                 >,
             >;
             if path.ends_with(".gz") {
-                let stream_reader = StreamReader::new(stream_err_mapped);
-                let buf_reader = BufReader::new(stream_reader);
+                let buf_reader = BufReader::new(reader);
                 let decoder = GzipDecoder::new(buf_reader);
                 stream = Box::pin(
                     ReaderStream::new(decoder)
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
                 );
             } else {
-                stream = Box::pin(stream_err_mapped.map(|res| res.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)));
+                let buf_reader = BufReader::new(reader);
+                stream = Box::pin(
+                    ReaderStream::new(buf_reader)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+                );
             }
             Ok(stream)
         }

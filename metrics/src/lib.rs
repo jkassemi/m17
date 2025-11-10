@@ -1,4 +1,4 @@
-// Copyright (c) James Kassemi,// Copyright (c) James Kassemi, SC, US. All rights reserved.
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 //! Prometheus metrics. hyper v1.+
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming}; // Removed 'Body' from import
@@ -9,10 +9,14 @@ use hyper::Response;
 use hyper_util::rt::TokioIo;
 use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, TextEncoder};
 use std::error::Error;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
+
 pub struct Metrics {
     classify_unknown_rate: IntCounter,
     nbbo_age_us: Histogram,
+    last_request_ts_ns: Arc<Mutex<Option<i64>>>,
 }
 
 impl Metrics {
@@ -22,13 +26,25 @@ impl Metrics {
                 .unwrap(),
             nbbo_age_us: Histogram::with_opts(HistogramOpts::new("nbbo_age_us", "NBBO age"))
                 .unwrap(),
+            last_request_ts_ns: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn last_request_ts_ns(&self) -> Option<i64> {
+        *self.last_request_ts_ns.lock().unwrap()
     }
 
     async fn handle_metrics(
         &self,
         _req: Request<Incoming>,
     ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+        // Update last request timestamp
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        *self.last_request_ts_ns.lock().unwrap() = Some(now);
+
         let encoder = TextEncoder::new();
         let metric_families = prometheus::gather();
         let mut buffer = Vec::new();

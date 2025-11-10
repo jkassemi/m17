@@ -9,7 +9,9 @@ use metrics::Metrics;
 use nbbo_cache::NbboStore;
 use storage::Storage;
 use tokio::net::TcpListener;
+use tui::Tui;
 use ws_source::worker::WsWorker;
+use tokio::sync::oneshot;
 
 #[tokio::main]
 async fn main() {
@@ -23,6 +25,9 @@ async fn main() {
     let storage = Storage::new(config.storage);
     let metrics = std::sync::Arc::new(Metrics::new());  // Wrap in Arc to match the serve method signature
 
+    // Create shutdown channel
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
     // Stub WS worker
     let ws_worker = WsWorker::new("ws://example.com"); // Placeholder URL
     let _stream = ws_worker.run().await;
@@ -34,6 +39,17 @@ async fn main() {
         metrics_clone.serve(listener).await;  // Use the cloned Arc
     });
 
-    // Stub: Run forever
-    tokio::signal::ctrl_c().await.unwrap();
+    // Launch TUI dashboard
+    let mut tui = Tui::new(metrics.clone(), shutdown_tx);
+    tokio::spawn(async move {
+        if let Err(e) = tui.run().await {
+            eprintln!("TUI error: {}", e);
+        }
+    });
+
+    // Wait for shutdown signal or ctrl_c
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = shutdown_rx => {},
+    }
 }

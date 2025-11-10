@@ -11,4 +11,5 @@ nbbo-cache = { path = "../nbbo-cache" }
 classifier = { path = "../classifier" }
 storage = { path = "../storage" }
 metrics = { path = "../metrics" }
+tui = { path = "../tui" }
 tokio = { version = "1.0", features = ["full"] }

@@ -6,14 +6,20 @@ edition = "2021"
 [dependencies]
 async-compression = { version = "0.4", features = ["gzip", "tokio"] }
 async-trait = "0.1"
-aws-sdk-s3 = { version = "1.0", features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1.112", features = ["rt-tokio", "rustls"] }
 bytes = "1"
 chrono = "0.4"
 core-types = { path = "../core-types" }
 csv = "1.1"
 flate2 = "1"
 futures = "0.3"
+hyper-rustls = "0.27.7"
+log = "0.4.28"
+rustls = "0.23.35"
+rustls-native-certs = "0.8.2"
+rustls-pki-types = "1.13.0"
 tokio = { version = "1", features = ["fs", "io-util", "sync", "time"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 trading-calendar = "0.2.3"
+aws-smithy-runtime = { version = "1.9.4" }

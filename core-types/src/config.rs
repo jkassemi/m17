@@ -123,9 +123,12 @@ fn default_hysteresis() -> f64 {
 pub struct FlatfileConfig {
     #[serde(default)]
     pub date_ranges: Vec<DateRange>,
-    pub polygonio_key: String,
-    pub polygonio_access_key_id: String,
-    pub polygonio_secret_access_key: String,
+    pub massive_key: String,
+    pub massive_access_key_id: String,
+    pub massive_secret_access_key: String,
+    pub massive_flatfiles_endpoint: String,
+    pub massive_flatfiles_region: String,
+    pub massive_flatfiles_bucket: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

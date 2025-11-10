@@ -9,6 +9,7 @@ use hyper::Response;
 use hyper_util::rt::TokioIo;
 use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, TextEncoder};
 use std::error::Error;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -19,6 +20,10 @@ pub struct Metrics {
     last_request_ts_ns: Arc<Mutex<Option<i64>>>,
     flatfile_status: Arc<Mutex<String>>,
     last_config_reload_ts_ns: Arc<Mutex<Option<i64>>>,
+    planned_days: AtomicU64,
+    completed_days: AtomicU64,
+    ingested_batches: AtomicU64,
+    ingested_rows: AtomicU64,
 }
 
 impl Metrics {
@@ -31,6 +36,10 @@ impl Metrics {
             last_request_ts_ns: Arc::new(Mutex::new(None)),
             flatfile_status: Arc::new(Mutex::new("Not started".to_string())),
             last_config_reload_ts_ns: Arc::new(Mutex::new(None)),
+            planned_days: AtomicU64::new(0),
+            completed_days: AtomicU64::new(0),
+            ingested_batches: AtomicU64::new(0),
+            ingested_rows: AtomicU64::new(0),
         }
     }
 
@@ -52,6 +61,34 @@ impl Metrics {
 
     pub fn set_last_config_reload_ts_ns(&self, ts: i64) {
         *self.last_config_reload_ts_ns.lock().unwrap() = Some(ts);
+    }
+
+    // planned/completed days
+    pub fn add_planned_days(&self, n: u64) {
+        self.planned_days.fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn inc_completed_day(&self) {
+        self.completed_days.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn planned_days(&self) -> u64 {
+        self.planned_days.load(Ordering::Relaxed)
+    }
+    pub fn completed_days(&self) -> u64 {
+        self.completed_days.load(Ordering::Relaxed)
+    }
+
+    // ingestion progress
+    pub fn inc_batches(&self, n: u64) {
+        self.ingested_batches.fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn inc_rows(&self, n: u64) {
+        self.ingested_rows.fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn ingested_batches(&self) -> u64 {
+        self.ingested_batches.load(Ordering::Relaxed)
+    }
+    pub fn ingested_rows(&self) -> u64 {
+        self.ingested_rows.load(Ordering::Relaxed)
     }
 
     async fn handle_metrics(

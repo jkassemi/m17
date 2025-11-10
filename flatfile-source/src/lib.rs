@@ -2,9 +2,7 @@ use async_compression::tokio::bufread::GzipDecoder;
 use async_trait::async_trait;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::{
-    Client,
-};
+use aws_sdk_s3::Client;
 use bytes::Bytes;
 use chrono::{DateTime, Datelike, TimeDelta, Utc};
 use core_types::config::FlatfileConfig;
@@ -74,13 +72,17 @@ impl FlatfileSource {
             None,
             "flatfile",
         );
+
         let s3_config = aws_sdk_s3::Config::builder()
-            .endpoint_url(config.massive_endpoint.clone())
-            .region(Region::new("us-east-1"))
+            .endpoint_url(config.massive_flatfiles_endpoint.clone())
+            .region(Region::new("custom"))
             .credentials_provider(credentials)
             .behavior_version(BehaviorVersion::latest())
+            .force_path_style(true)
             .build();
+
         let client = Client::from_conf(s3_config);
+
         Self {
             status: Arc::new(Mutex::new("Initializing".to_string())),
             config,
@@ -98,7 +100,7 @@ impl FlatfileSource {
         let resp = self
             .client
             .get_object()
-            .bucket("flatfiles")
+            .bucket(self.config.massive_flatfiles_bucket.clone())
             .key(path)
             .send()
             .await?;
@@ -172,7 +174,7 @@ impl SourceTrait for FlatfileSource {
             let resp = self
                 .client
                 .get_object()
-                .bucket("flatfiles")
+                .bucket(self.config.massive_flatfiles_bucket.clone())
                 .key(path)
                 .send()
                 .await?;
@@ -212,7 +214,8 @@ impl SourceTrait for FlatfileSource {
                 let end_ts_opt = range
                     .end_ts_ns()
                     .unwrap_or_else(|_| Some(Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX)));
-                let end_ts = end_ts_opt.unwrap_or(Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX));
+                let end_ts =
+                    end_ts_opt.unwrap_or(Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX));
                 let start_dt: DateTime<Utc> = DateTime::from_timestamp(
                     start_ts / 1_000_000_000,
                     (start_ts % 1_000_000_000) as u32,
@@ -238,7 +241,7 @@ impl SourceTrait for FlatfileSource {
                         let exists = self
                             .client
                             .head_object()
-                            .bucket("flatfiles")
+                            .bucket(self.config.massive_flatfiles_bucket.clone())
                             .key(&path)
                             .send()
                             .await
@@ -421,27 +424,30 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                             source: Source::Flatfile,
                             quality: Quality::Prelim,
                             watermark: Watermark {
-                                        watermark_ts_ns: 0, // Placeholder
-                                        completeness: Completeness::Complete,
-                                        hints: None,
-                                    },
-                                    schema_version: 1,
-                                };
-                                let _ = tx_clone.try_send(DataBatch { rows: batch, meta });
-                            }
-                            info!("Processed {} records into {} batches for path: {}", record_count, batch_count, path_owned);
-                        })
-                        .await
-                        .unwrap();
-                    } else {
-                        info!("Failed to collect bytes for path: {}", path);
+                                watermark_ts_ns: 0, // Placeholder
+                                completeness: Completeness::Complete,
+                                hints: None,
+                            },
+                            schema_version: 1,
+                        };
+                        let _ = tx_clone.try_send(DataBatch { rows: batch, meta });
                     }
-                }
-                Err(e) => {
-                    info!("Failed to get stream for path: {}: {:?}", path, e);
-                }
+                    info!(
+                        "Processed {} records into {} batches for path: {}",
+                        record_count, batch_count, path_owned
+                    );
+                })
+                .await
+                .unwrap();
+            } else {
+                info!("Failed to collect bytes for path: {}", path);
             }
         }
+        Err(e) => {
+            info!("Failed to get stream for path: {}: {:?}", path, e);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

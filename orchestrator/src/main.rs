@@ -35,9 +35,15 @@ async fn main() {
     .unwrap();
 
     let config = AppConfig::load().expect("Failed to load config: required environment variables POLYGONIO_KEY, POLYGONIO_ACCESS_KEY_ID, POLYGONIO_SECRET_ACCESS_KEY must be set");
-    info!("Loaded config with {} flatfile date ranges", config.flatfile.date_ranges.len());
+    info!(
+        "Loaded config with {} flatfile date ranges",
+        config.flatfile.date_ranges.len()
+    );
     for (i, range) in config.flatfile.date_ranges.iter().enumerate() {
-        info!("Range {}: start_ts={}, end_ts={:?}", i, range.start_ts, range.end_ts);
+        info!(
+            "Range {}: start_ts={}, end_ts={:?}",
+            i, range.start_ts, range.end_ts
+        );
     }
     let flatfile_config = config.flatfile.clone();
     let flatfile_source = FlatfileSource::new(Arc::new(flatfile_config)).await;
@@ -46,6 +52,34 @@ async fn main() {
     let classifier = Classifier::new();
     let storage = Arc::new(Mutex::new(Storage::new(config.storage)));
     let metrics = Arc::new(Metrics::new()); // Wrap in Arc to match the serve method signature
+
+    let mut planned_days: u64 = 0;
+    for range in &config.flatfile.date_ranges {
+        let start_ts_ns = range.start_ts_ns().unwrap_or(0);
+        let end_ts_ns = if let Some(end) = range.end_ts_ns().ok().flatten() {
+            end
+        } else {
+            Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX)
+        };
+        if let (Some(start_dt), Some(end_dt)) = (
+            DateTime::<Utc>::from_timestamp(
+                start_ts_ns / 1_000_000_000,
+                (start_ts_ns % 1_000_000_000) as u32,
+            ),
+            DateTime::<Utc>::from_timestamp(
+                end_ts_ns / 1_000_000_000,
+                (end_ts_ns % 1_000_000_000) as u32,
+            ),
+        ) {
+            let mut d = start_dt.naive_utc().date();
+            let end_d = end_dt.naive_utc().date();
+            while d <= end_d {
+                planned_days += 1;
+                d = d.succ_opt().unwrap();
+            }
+        }
+    }
+    metrics.add_planned_days(planned_days);
 
     // Set initial config reload timestamp
     let now = SystemTime::now()
@@ -90,9 +124,15 @@ async fn main() {
                                 .unwrap()
                                 .as_nanos() as i64;
                             metrics_clone_for_reload.set_last_config_reload_ts_ns(now);
-                            info!("Config reloaded with {} flatfile date ranges", new_config.flatfile.date_ranges.len());
+                            info!(
+                                "Config reloaded with {} flatfile date ranges",
+                                new_config.flatfile.date_ranges.len()
+                            );
                             for (i, range) in new_config.flatfile.date_ranges.iter().enumerate() {
-                                info!("Reloaded range {}: start_ts={}, end_ts={:?}", i, range.start_ts, range.end_ts);
+                                info!(
+                                    "Reloaded range {}: start_ts={}, end_ts={:?}",
+                                    i, range.start_ts, range.end_ts
+                                );
                             }
                             // Note: In a real implementation, you might need to update other components with new_config
                         }
@@ -144,7 +184,10 @@ async fn main() {
         };
         let mut current_date = start_date;
         while current_date <= end_date {
-            info!("Starting ingestion task for day: {}", current_date.format("%Y-%m-%d"));
+            info!(
+                "Starting ingestion task for day: {}",
+                current_date.format("%Y-%m-%d")
+            );
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let storage = storage.clone();
             let metrics = metrics.clone();
@@ -175,14 +218,24 @@ async fn main() {
             tokio::spawn(async move {
                 info!("Processing day: {}", current_date.format("%Y-%m-%d"));
                 let mut stream = flatfile_source_for_task.get_equity_trades(scope).await;
-                let mut batch_count = 0;
+                let mut batch_count = 0u64;
+                let mut row_count = 0u64;
                 while let Some(batch) = stream.next().await {
                     batch_count += 1;
+                    row_count += batch.rows.len() as u64;
+                    metrics.inc_batches(1);
+                    metrics.inc_rows(batch.rows.len() as u64);
                     if let Err(e) = storage.lock().unwrap().write_equity_trades(&batch) {
                         eprintln!("Failed to write equity trades batch: {}", e);
                     }
                 }
-                let status_msg = format!("Ingested day: {} ({} batches)", current_date.format("%Y-%m-%d"), batch_count);
+                metrics.inc_completed_day();
+                let status_msg = format!(
+                    "Ingested day: {} ({} batches, {} rows)",
+                    current_date.format("%Y-%m-%d"),
+                    batch_count,
+                    row_count
+                );
                 metrics.set_flatfile_status(status_msg.clone());
                 info!("{}", status_msg);
                 drop(permit);

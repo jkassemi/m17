@@ -2,20 +2,19 @@
 
 //! Parquet writer/reader with partitioning, compaction, and deduplication.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array};
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use core_types::config::StorageConfig;
+use chrono::{DateTime, Utc};
 use core_types::schema::{equity_trade_schema, nbbo_schema, option_trade_schema};
-use core_types::types::{AggressorSide, ClassMethod, Completeness, DataBatch, DataBatchMeta, EquityTrade, Nbbo, NbboState, OptionTrade, Quality, Source, TickSizeMethod, Watermark};
+use core_types::types::{DataBatch, DataBatchMeta, EquityTrade, Nbbo, OptionTrade};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Error, Debug)]
 pub enum StorageError {
@@ -31,12 +30,12 @@ pub enum StorageError {
 
 /// Storage handles Parquet I/O with partitioning and deduplication.
 pub struct Storage {
-    config: StorageConfig,
+    config: core_types::config::StorageConfig,
     base_path: PathBuf,
 }
 
 impl Storage {
-    pub fn new(config: StorageConfig) -> Self {
+    pub fn new(config: core_types::config::StorageConfig) -> Self {
         Self {
             base_path: PathBuf::from(&config.paths.get("base").unwrap_or(&"data".to_string())),
             config,
@@ -45,7 +44,7 @@ impl Storage {
 
     /// Write a batch of option trades to Parquet, deduping and partitioning.
     pub fn write_option_trades(&self, batch: &DataBatch<OptionTrade>) -> Result<(), StorageError> {
-        let schema = option_trade_schema();
+        let _schema = option_trade_schema();
         let record_batch = self.option_trades_to_record_batch(&batch.rows, &batch.meta)?;
         self.write_partitioned("options_trades", &record_batch, &batch.meta)?;
         Ok(())
@@ -53,7 +52,7 @@ impl Storage {
 
     /// Write a batch of equity trades to Parquet.
     pub fn write_equity_trades(&self, batch: &DataBatch<EquityTrade>) -> Result<(), StorageError> {
-        let schema = equity_trade_schema();
+        let _schema = equity_trade_schema();
         let record_batch = self.equity_trades_to_record_batch(&batch.rows, &batch.meta)?;
         self.write_partitioned("equity_trades", &record_batch, &batch.meta)?;
         Ok(())
@@ -61,14 +60,14 @@ impl Storage {
 
     /// Write a batch of NBBO to Parquet (deltas only if configured).
     pub fn write_nbbo(&self, batch: &DataBatch<Nbbo>) -> Result<(), StorageError> {
-        let schema = nbbo_schema();
+        let _schema = nbbo_schema();
         let record_batch = self.nbbo_to_record_batch(&batch.rows, &batch.meta)?;
         self.write_partitioned("nbbo", &record_batch, &batch.meta)?;
         Ok(())
     }
 
     /// Finalize aggressor fields for option trades (column patch: read, update, rewrite).
-    pub fn finalize_option_trades(&self, instrument: &str, dt: &str) -> Result<(), StorageError> {
+    pub fn finalize_option_trades(&self, _instrument: &str, _dt: &str) -> Result<(), StorageError> {
         // Stub: Read existing file, update aggressor fields, write new version.
         // In practice, this would involve reading the Parquet, applying updates from a delta file or in-memory,
         // and rewriting with new quality=Final.
@@ -77,27 +76,28 @@ impl Storage {
     }
 
     /// Finalize aggressor fields for equity trades.
-    pub fn finalize_equity_trades(&self, instrument: &str, dt: &str) -> Result<(), StorageError> {
+    pub fn finalize_equity_trades(&self, _instrument: &str, _dt: &str) -> Result<(), StorageError> {
         // Similar to above.
         Ok(())
     }
 
     /// Compact partitions (merge small files).
-    pub fn compact(&self, partition: &str) -> Result<(), StorageError> {
+    pub fn compact(&self, _partition: &str) -> Result<(), StorageError> {
         // Stub: List files in partition, merge if below target size.
         Ok(())
     }
 
     /// Offload old data to S3 (stub).
-    pub fn offload_to_s3(&self, dt: &str) -> Result<(), StorageError> {
+    pub fn offload_to_s3(&self, _dt: &str) -> Result<(), StorageError> {
         // Stub: Move files older than retention_weeks to S3.
         Ok(())
     }
 
     fn write_partitioned(&self, table: &str, record_batch: &RecordBatch, meta: &DataBatchMeta) -> Result<(), StorageError> {
         // Determine partition path: dt=YYYY-MM-DD, instrument_type, prefix
-        let dt = chrono::NaiveDateTime::from_timestamp_opt(meta.watermark.watermark_ts_ns / 1_000_000_000, 0)
+        let dt = DateTime::from_timestamp(meta.watermark.watermark_ts_ns / 1_000_000_000, (meta.watermark.watermark_ts_ns % 1_000_000_000) as u32)
             .unwrap()
+            .naive_utc()
             .date()
             .to_string();
         let instrument_type = match table {
@@ -105,16 +105,15 @@ impl Storage {
             "equity_trades" => "equity",
             _ => "unknown",
         };
-        let prefix = "A"; // Stub: derive from instrument_id prefix
-        let partition_path = self.base_path.join(format!("raw/{}/dt={}/instrument_type={}/prefix={}", table, dt, instrument_type, prefix));
-
+        let prefix = "prefix"; // Placeholder: derive from instrument_id prefix
+        let partition_path = format!("{}/{}/dt={}/{}/", self.base_path.display(), table, dt, prefix);
         std::fs::create_dir_all(&partition_path)?;
-
-        let file_path = partition_path.join(format!("{}.parquet", uuid::Uuid::new_v4()));
-        let file = std::fs::File::create(file_path)?;
+    
+        // Write Parquet with ZSTD compression
+        let file_path = format!("{}data_{}.parquet", partition_path, Uuid::new_v4());
+        let file = std::fs::File::create(&file_path)?;
         let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD)
-            .set_max_row_group_size(self.config.row_group_target)
+            .set_compression(Compression::ZSTD(Default::default()))
             .build();
         let mut writer = ArrowWriter::try_new(file, record_batch.schema(), Some(props))?;
         writer.write(record_batch)?;
@@ -189,7 +188,7 @@ impl Storage {
             watermark_ts_ns.push(meta.watermark.watermark_ts_ns);
         }
 
-        let schema = option_trade_schema();
+        let schema: SchemaRef = Arc::new(option_trade_schema());
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(contract)),
             Arc::new(StringArray::from(contract_direction)),
@@ -224,22 +223,22 @@ impl Storage {
             Arc::new(Int64Array::from(watermark_ts_ns)),
         ];
 
-        RecordBatch::try_new(schema, arrays).map_err(Into::into)
+        Ok(RecordBatch::try_new(schema, arrays).map_err(Into::into)?)
     }
 
     fn equity_trades_to_record_batch(&self, trades: &[EquityTrade], meta: &DataBatchMeta) -> Result<RecordBatch, StorageError> {
         // Similar to option_trades, but with equity fields.
         // Omitted for brevity; implement analogously.
-        let schema = equity_trade_schema();
+        let schema: SchemaRef = Arc::new(equity_trade_schema());
         // Build arrays...
         // For now, return empty batch.
-        RecordBatch::new_empty(schema)
+        Ok(RecordBatch::new_empty(schema))
     }
 
     fn nbbo_to_record_batch(&self, nbbos: &[Nbbo], meta: &DataBatchMeta) -> Result<RecordBatch, StorageError> {
         // Similar implementation.
-        let schema = nbbo_schema();
+        let schema: SchemaRef = Arc::new(nbbo_schema());
         // Build arrays...
-        RecordBatch::new_empty(schema)
+        Ok(RecordBatch::new_empty(schema))
     }
 }

@@ -9,6 +9,7 @@ members = [
   "data-client",
   "flatfile-source",
   "aggregations",
+  "diptest",
   "metrics",
   "nbbo-cache",
   "orchestrator",

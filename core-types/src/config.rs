@@ -81,6 +81,8 @@ pub struct AggregationsConfig {
     pub risk_free_rate: f64,
     #[serde(default = "default_agg_dividend")]
     pub dividend_yield: f64,
+    #[serde(default = "default_diptest_draws")]
+    pub diptest_bootstrap_draws: usize,
 }
 
 fn default_agg_windows() -> Vec<String> {
@@ -106,6 +108,10 @@ fn default_agg_rfr() -> f64 {
 
 fn default_agg_dividend() -> f64 {
     0.0
+}
+
+fn default_diptest_draws() -> usize {
+    2000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

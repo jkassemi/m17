@@ -4,6 +4,9 @@
 
 use core_types::config::AggregationsConfig;
 use core_types::types::{AggregationRow, EquityTrade, OptionTrade};
+use diptest::{
+    diptest_with_options, BootstrapConfig, DipStatOptions, DipTestOptions, PValueMethod,
+};
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::f64::consts::PI;
@@ -36,6 +39,7 @@ pub struct AggregationsEngine {
     // retain recent underlying prices for backfilling option trades when needed
     recent_underlyings: VecDeque<(i64, f64)>,
     max_window_ns: i64,
+    diptest_draws: usize,
 }
 
 impl AggregationsEngine {
@@ -59,6 +63,7 @@ impl AggregationsEngine {
             last_underlying_price: None,
             recent_underlyings: VecDeque::new(),
             max_window_ns,
+            diptest_draws: cfg.diptest_bootstrap_draws,
         })
     }
 
@@ -93,6 +98,7 @@ impl AggregationsEngine {
                 self.contract_size,
                 self.last_underlying_price,
                 &self.recent_underlyings,
+                self.diptest_draws,
             ));
         }
         output
@@ -150,6 +156,7 @@ impl WindowAggregator {
         contract_size: f64,
         last_under_price: Option<f64>,
         price_history: &VecDeque<(i64, f64)>,
+        diptest_draws: usize,
     ) -> Vec<AggregationRow> {
         let ts_ns = event.timestamp_ns();
         let mut rows = Vec::new();
@@ -160,6 +167,7 @@ impl WindowAggregator {
                 aligned + self.duration_ns,
                 self.label.clone(),
                 self.symbol.clone(),
+                diptest_draws,
             ));
         }
         while self
@@ -176,6 +184,7 @@ impl WindowAggregator {
                 next_start + self.duration_ns,
                 self.label.clone(),
                 self.symbol.clone(),
+                diptest_draws,
             ));
         }
         if let Some(state) = self.state.as_mut() {
@@ -210,10 +219,17 @@ struct WindowState {
     puts_gadvv: Vec<f64>,
     calls_dadvv: Vec<f64>,
     calls_gadvv: Vec<f64>,
+    diptest_draws: usize,
 }
 
 impl WindowState {
-    fn new(start_ns: i64, end_ns: i64, label: String, symbol: String) -> Self {
+    fn new(
+        start_ns: i64,
+        end_ns: i64,
+        label: String,
+        symbol: String,
+        diptest_draws: usize,
+    ) -> Self {
         Self {
             symbol,
             window_label: label,
@@ -234,6 +250,7 @@ impl WindowState {
             puts_gadvv: Vec::new(),
             calls_dadvv: Vec::new(),
             calls_gadvv: Vec::new(),
+            diptest_draws,
         }
     }
 
@@ -316,11 +333,11 @@ impl WindowState {
         {
             return None;
         }
-        let underline_stats = compute_stats(&self.underlying_dv);
-        let puts_dadvv_stats = compute_stats(&self.puts_dadvv);
-        let puts_gadvv_stats = compute_stats(&self.puts_gadvv);
-        let calls_dadvv_stats = compute_stats(&self.calls_dadvv);
-        let calls_gadvv_stats = compute_stats(&self.calls_gadvv);
+        let underline_stats = compute_stats(&self.underlying_dv, self.diptest_draws);
+        let puts_dadvv_stats = compute_stats(&self.puts_dadvv, self.diptest_draws);
+        let puts_gadvv_stats = compute_stats(&self.puts_gadvv, self.diptest_draws);
+        let calls_dadvv_stats = compute_stats(&self.calls_dadvv, self.diptest_draws);
+        let calls_gadvv_stats = compute_stats(&self.calls_gadvv, self.diptest_draws);
 
         Some(AggregationRow {
             symbol: self.symbol.clone(),
@@ -456,7 +473,7 @@ struct StatsSummary {
     kde_peaks: Option<f64>,
 }
 
-fn compute_stats(values: &[f64]) -> StatsSummary {
+fn compute_stats(values: &[f64], diptest_draws: usize) -> StatsSummary {
     if values.is_empty() {
         return StatsSummary::default();
     }
@@ -524,7 +541,23 @@ fn compute_stats(values: &[f64]) -> StatsSummary {
     }
     summary.mode = estimate_mode(&sorted, summary.iqr, summary.stddev);
     summary.kde_peaks = estimate_kde_peaks(&sorted, summary.stddev);
-    summary.dip_pval = None; // TODO: Hartigan dip test implementation
+    if sorted.len() >= 3 && diptest_draws > 0 {
+        let options = DipTestOptions {
+            stat: DipStatOptions {
+                sort_data: false,
+                allow_zero: true,
+                full_output: false,
+            },
+            p_value_method: PValueMethod::Bootstrap(BootstrapConfig {
+                draws: diptest_draws,
+                seed: None,
+                threads: None,
+            }),
+        };
+        if let Ok(res) = diptest_with_options(&sorted, options) {
+            summary.dip_pval = Some(res.p_value);
+        }
+    }
     summary
 }
 

@@ -2,7 +2,9 @@
 
 //! Prometheus metrics.
 
-use hyper::{body::Body, Request, Response, Server};
+use hyper::server::Server;
+use hyper::{Request, Response};
+use hyper::body::{Body, Incoming};
 use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, TextEncoder};
 use tokio::net::TcpListener;
 
@@ -22,7 +24,7 @@ impl Metrics {
     pub async fn serve(&self, listener: TcpListener) {
         // Stub: Basic HTTP server for /metrics
         let encoder = TextEncoder::new();
-        let service = hyper::service::service_fn(move |_req: Request<Body>| async move {
+        let service = hyper::service::service_fn(move |_req: Request<Incoming>| async move {
             let mut buffer = Vec::new();
             encoder.encode(&prometheus::gather(), &mut buffer).unwrap();
             Ok::<_, hyper::Error>(Response::new(Body::from(buffer)))

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, StringArray, UInt32Array};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use core_types::schema::{equity_trade_schema, nbbo_schema, option_trade_schema};
 use core_types::types::{DataBatch, DataBatchMeta, EquityTrade, Nbbo, OptionTrade};
 use parquet::arrow::ArrowWriter;
@@ -100,7 +100,7 @@ impl Storage {
             .naive_utc()
             .date()
             .to_string();
-        let instrument_type = match table {
+        let _instrument_type = match table {
             "options_trades" | "nbbo" if table.contains("options") => "option",
             "equity_trades" => "equity",
             _ => "unknown",
@@ -223,10 +223,10 @@ impl Storage {
             Arc::new(Int64Array::from(watermark_ts_ns)),
         ];
 
-        Ok(RecordBatch::try_new(schema, arrays).map_err(Into::into)?)
+        Ok(RecordBatch::try_new(schema, arrays)?)
     }
 
-    fn equity_trades_to_record_batch(&self, trades: &[EquityTrade], meta: &DataBatchMeta) -> Result<RecordBatch, StorageError> {
+    fn equity_trades_to_record_batch(&self, _trades: &[EquityTrade], _meta: &DataBatchMeta) -> Result<RecordBatch, StorageError> {
         // Similar to option_trades, but with equity fields.
         // Omitted for brevity; implement analogously.
         let schema: SchemaRef = Arc::new(equity_trade_schema());
@@ -235,7 +235,7 @@ impl Storage {
         Ok(RecordBatch::new_empty(schema))
     }
 
-    fn nbbo_to_record_batch(&self, nbbos: &[Nbbo], meta: &DataBatchMeta) -> Result<RecordBatch, StorageError> {
+    fn nbbo_to_record_batch(&self, _nbbos: &[Nbbo], _meta: &DataBatchMeta) -> Result<RecordBatch, StorageError> {
         // Similar implementation.
         let schema: SchemaRef = Arc::new(nbbo_schema());
         // Build arrays...

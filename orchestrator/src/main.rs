@@ -18,7 +18,7 @@ async fn main() {
     let nbbo_store = NbboStore::new();
     let classifier = Classifier::new();
     let storage = Storage::new(config.storage);
-    let metrics = Metrics::new();
+    let metrics = std::sync::Arc::new(Metrics::new());  // Wrap in Arc to match the serve method signature
 
     // Stub WS worker
     let ws_worker = WsWorker::new("ws://example.com"); // Placeholder URL
@@ -26,8 +26,9 @@ async fn main() {
 
     // Stub metrics server
     let listener = TcpListener::bind("127.0.0.1:9090").await.unwrap();
+    let metrics_clone = metrics.clone();  // Clone the Arc for the spawned task
     tokio::spawn(async move {
-        metrics.serve(listener).await;
+        metrics_clone.serve(listener).await;  // Use the cloned Arc
     });
 
     // Stub: Run forever

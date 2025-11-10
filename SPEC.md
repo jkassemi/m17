@@ -3,16 +3,19 @@
 **Copyright (c) James Kassemi, SC, US. All rights reserved.**
 
 ## License notice
+
 - This software and all derived products must be licensed with James Kassemi, currently of SC, US.
 - Include this header in all source files:
   - Copyright (c) James Kassemi, SC, US. All rights reserved.
 
 ## Goals
+
 - Capture every trade with the closest valid NBBO snapshot using SIP event-time, classify aggressor with explicit, defensible rules.
 - Real-time first; T-1 and historical paths fill and finalize; never fabricate data.
 - Single binary, Tokio runtime; resilient to drops and rate limits; observable; idempotent updates.
 
 ## Summary of goals and constraints
+
 - Capture each trade with the closest valid NBBO snapshot; classify aggressor only with defensible rules; never fabricate.
 - Modes: real-time (WS), T-1 gap (REST throttled/sampled), historical (flatfiles).
 - Single binary, local SSD (1 TB) for a few months retention.
@@ -23,6 +26,7 @@
 - We can compute per-trade in real time; batched processing used only where it helps I/O.
 
 ## Teams
+
 - core-types: All shared schemas, enums, error types, feature flags.
 - data-client: DataClient trait and router; implementations for:
   - flatfile-source: S3-compatible bucket reader for Parquet/Arrow datasets.
@@ -37,6 +41,7 @@
 - replayer (optional): Offline replay of flatfiles through the RT pipeline for testing.
 
 ## Top-level architecture (single binary, modular crates)
+
 - core-types
   - Shared structs/enums, schema versions, error types, feature flags.
   - Normalized row schemas for trades and NBBO; row-level source/quality/watermark.
@@ -64,7 +69,9 @@
   - Live control and status; select symbols; adjust policies; show metrics.
 
 ## Normalization and schemas
+
 Common enums
+
 - Source: Flatfile, Rest, Ws
 - Quality: Prelim, Enriched, Final
 - Completeness: Complete, Partial, Unknown
@@ -75,10 +82,12 @@ Common enums
 - TickSizeMethod: FromRules, InferredFromQuotes, DefaultFallback
 
 ### Shared metadata
+
 - Watermark: watermark_ts_ns (i64), completeness (Completeness), hints (String optional)
 - Schema version: u16 stored in Arrow schema metadata, mirrored in files
 
 ### Option trade row
+
 - contract (OPRA string)
 - contract_direction (‘C’ or ‘P’)
 - strike_price (f64)
@@ -103,6 +112,7 @@ Common enums
 - source (Source), quality (Quality), watermark_ts_ns (i64)
 
 ### Equity trade row
+
 - symbol (string)
 - trade_ts_ns (i64, SIP event-time)
 - price (f64)
@@ -113,6 +123,7 @@ Common enums
 - source, quality, watermark_ts_ns
 
 ### NBBO row (derived from consolidated stream)
+
 - instrument_id (OPRA or symbol)
 - quote_ts_ns (i64, SIP)
 - bid, ask (f64)
@@ -123,6 +134,7 @@ Common enums
 - source, quality, watermark_ts_ns
 
 ## Key invariants
+
 - All classification uses SIP event-time only.
 - No classification when NBBO state is Locked or Crossed unless a specific policy is configured; default is Unknown.
 - No “closest side” heuristics; only touch or at/beyond, else Unknown or TickRule if explicitly allowed.
@@ -130,6 +142,7 @@ Common enums
 - Deduplication by unique keys; idempotent upserts.
 
 ## Interfaces (shared)
+
 - DataClient
   - async fn get_option_trades(scope: QueryScope) -> Stream<DataBatch<OptionTrade>>
   - async fn get_equity_trades(scope: QueryScope) -> Stream<DataBatch<EquityTrade>>
@@ -153,6 +166,7 @@ Common enums
   - allowed_lateness_ms (u32) for event-time finalization; used by orchestrator
 
 ## NBBO ground truth policy
+
 - Compute NBBO from consolidated quote stream per instrument.
 - Maintain best bid/ask across venues; mark state: Normal/Locked/Crossed.
 - Classification is allowed only when:
@@ -170,16 +184,19 @@ Common enums
   - Finalize classifications once global watermark passes; pending trades within lateness window can be upgraded if earlier quotes arrive.
 
 ## Locked/crossed handling
+
 - If NBBO state is Locked or Crossed at the chosen quote, do not classify; mark Unknown and nbbo_state accordingly.
 - Optionally defer classification within allowed lateness to await resolution; if resolved, classify; else Unknown.
 
 ## Tick-size correctness
+
 - Maintain per-class tick rules (Penny Pilot/thresholds). Prefer definitive rules from contract metadata or exchange class if available.
 - Fallback inference: estimate from recent quote increments; mark tick_size_method = InferredFromQuotes.
 - As a last resort, use a conservative default and mark DefaultFallback; never use inferred sizes without marking.
 - tick_size_used persisted with each classified trade.
 
 ## Aggressor classification rules (deterministic)
+
 - Find NBBO where quote_ts <= trade_ts and age <= max_staleness_us; state must be Normal.
 - If price >= ask − epsilon_price → Buyer (NbboTouch or NbboAtOrBeyond if price > ask).
 - If price <= bid + epsilon_price → Seller (NbboTouch or NbboAtOrBeyond if price < bid).
@@ -191,6 +208,7 @@ Common enums
 - Never revise raw trade fields; only aggressor and derived columns may be updated by a finalizer.
 
 ## WebSocket strategy
+
 - Connections
   - Resource types: options_quotes, options_trades, equity_quotes, equity_trades.
   - Sharded design: support N connections per type, each up to 1,000 option contracts (quotes) or implementation-specific limits for trades.
@@ -204,16 +222,19 @@ Common enums
   - Backpressure: if incoming rate exceeds processing, increase flush frequency and consider shedding low-priority instruments; never exceed classification staleness limits.
 
 ## T-1 gap policy (REST)
+
 - Options: trades-only by default; quotes sampled for diagnostics only.
 - Underlyings: trades + quotes allowed due to small universe.
 - Classification: Unknown (or tick-rule if explicitly on).
 - Overnight finalizer reclassifies with flatfile quotes; upgrades aggressor and dependent metrics; marks quality Final.
 
 ## Historical (flatfiles)
+
 - S3-compatible flatfiles; fail-fast if a market day is missing (use embedded NYSE calendar with overrides).
 - Process in event-time order; compute NBBO and classify or mark Unknown if policy requires; produce Final quality.
 
 ## Event-time fields and deduplication
+
 - Use SIP timestamps for alignment. Record participant_ts and arrival_ts separately for diagnostics; not used for classification.
 - Dedup keys:
   - If trade_id present: (instrument, trade_id).
@@ -221,6 +242,7 @@ Common enums
 - Dedup at ingestion (in-memory LRU Bloom or hash set per instrument) and on write (stable sort + unique by key).
 
 ## Storage and retention
+
 - Format: Parquet with Arrow schemas; zstd compression.
 - Raw zone (append-only):
   - options_trades, options_nbbo, equity_trades, equity_nbbo
@@ -229,23 +251,26 @@ Common enums
   - Row group: 128–256k rows; target files 64–256 MB.
 - Derived zone:
   - Same rows with aggressor fields; later: add frames/aggregations.
-  - Finalizer writes column patch files affecting only aggressor_* and greeks_*, quality.
+  - Finalizer writes column patch files affecting only aggressor_*and greeks_*, quality.
 - Volume budget:
   - Quotes dominate. Persist only NBBO deltas (state or price/size changes) to reduce footprint.
   - Retention: keep raw trades and NBBO deltas for recent weeks; offload older to S3; optional deletion of raw quotes after finalization.
 
 ## Greeks budget
+
 - Compute per trade only when:
   - |log_moneyness| < threshold (configurable) or notional above threshold; else defer.
 - Use bounded CPU pool; backpressure when queue exceeds budget; persist greeks_flags for exceptions (below intrinsic, above max).
 
 ## Watermarks and finalization
+
 - Per-instrument HWM by event-time for trades and quotes; global watermark = min(HWM − allowed_lateness).
 - WS: emit heartbeats to advance HWM when idle.
 - Finalize all trades with trade_ts <= global watermark; re-open if late data arrives only via explicit reprocess.
 - T+1 finalizer: reclassify using flatfile NBBO; produce upgrades; idempotent (same input → identical output).
 
 ## Observability and alerts
+
 - Prometheus metrics (examples)
   - classify_unknown_rate{instrument_type}
   - nbbo_age_us histogram
@@ -265,11 +290,13 @@ Common enums
   - Finalizer backlog > 1 day
 
 ## Resilience and rate limits
+
 - Token-bucket rate limiter per host; inspect 429 and Retry-After; exponential backoff with jitter.
 - Coalesce duplicate requests; cache empty responses with TTL.
 - Persist deltas frequently (per minute) to survive retries without refetch.
 
 ## Configuration
+
 - Single TOML/ENV config; hot-reload where safe.
 - Key knobs:
   - ws.shards.{options_quotes, options_trades, equity_quotes, equity_trades}
@@ -281,6 +308,7 @@ Common enums
   - scheduler.top_n, exploration_fraction, rebalance_interval_s, hysteresis
 
 ## Coding standards and best practices
+
 - Rust 2021 stable. Enforce rustfmt and clippy (pedantic) in CI; deny warnings in CI gates.
 - Error handling: thiserror + anyhow; no unwrap/expect in production code; propagate context with anyhow::Context.
 - Concurrency: Tokio; prefer async channels (tokio::mpsc) with bounded capacity; avoid blocking in async.
@@ -291,6 +319,7 @@ Common enums
 - Config-driven behavior; sensible defaults checked into repo.
 
 ## Testing requirements
+
 - Unit tests
   - Classifier decision table coverage: touch, at/beyond, inside, locked, crossed, tick-rule, epsilon boundaries.
   - NBBO cache: order, staleness selection, state transitions, adaptive staleness updates.
@@ -324,14 +353,6 @@ Common enums
 - Retention policy
   - Keep trades and NBBO deltas for N weeks locally; offload older data to S3; drop old raw quotes after finalization.
 
-## Delivery milestones
-- M1: core-types, storage, metrics, orchestrator skeleton, config, calendar, license headers in repo.
-- M2: ws-source for equities (trades + NBBO), nbbo-cache, classifier, parquet persistence, Prometheus exporter, TUI minimal.
-- M3: ws-source for options with shard abstraction, scheduler, adaptive staleness, locked/crossed handling, tick-size rules.
-- M4: rest-source for T-1 trades, sampled quotes diagnostics, per-instrument watermarks, retries/backoff.
-- M5: flatfile-source and finalizer; column patch writes; idempotent upgrades; retention and compaction jobs.
-- M6: performance and soak tests; polish metrics and alerts; optional DuckDB for ad-hoc queries.
-
 ## Appendix: exemplar Rust signatures (abbreviated)
 
 - Enums and structs
@@ -354,7 +375,7 @@ Common enums
   - trait DedupKey { fn key(&self) -> DedupKeyHash; }
 
 ## Operational notes
+
 - Never halt the entire pipeline on partial data; mark completeness=Partial, continue, and alert.
 - Emit reason codes in metadata hints when degrading to Unknown (e.g., stale_nbbo, locked_book).
 - Keep an explicit “policy_id” string in config; write it to parquet metadata per run for auditability.
-

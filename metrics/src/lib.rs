@@ -2,11 +2,14 @@
 
 //! Prometheus metrics. hyper v1.+
 
-use hyper::{Body, Request, Response};
+use hyper::body::Body;
+use hyper::Request;
+use hyper::Response;
 use hyper::body::Incoming;
-use hyper::server::Server;
+use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, TextEncoder};
+use std::error::Error;
 use std::convert::Infallible;
 use tokio::net::TcpListener;
 
@@ -25,7 +28,7 @@ impl Metrics {
         }
     }
 
-    async fn handle_metrics(&self, _req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
+    async fn handle_metrics(&self, _req: Request<Incoming>) -> Result<Response<Body>, std::convert::Infallible> {
         let encoder = TextEncoder::new();
         let metric_families = prometheus::gather();
         let mut buffer = Vec::new();
@@ -33,11 +36,22 @@ impl Metrics {
         Ok(Response::new(Body::from(buffer)))
     }
 
-    pub async fn serve(self: &std::sync::Arc<Self>, listener: TcpListener) -> hyper::Result<()> {
-        let service = service_fn(move |req| {
+    pub async fn serve(self: &std::sync::Arc<Self>, listener: TcpListener) -> Result<(), Box<dyn Error + Send + Sync>> {
+        loop {
+            let (socket, _) = listener.accept().await?;
             let metrics = self.clone();
-            async move { metrics.handle_metrics(req).await }
-        });
-        Server::builder(listener).serve(service).await
+            let service = service_fn(move |req| {
+                let metrics = metrics.clone();
+                async move { metrics.handle_metrics(req).await }
+            });
+            tokio::spawn(async move {
+                if let Err(err) = http1::Builder::new()
+                    .serve_connection(socket, service)
+                    .await
+                {
+                    eprintln!("Error serving connection: {:?}", err);
+                }
+            });
+        }
     }
 }

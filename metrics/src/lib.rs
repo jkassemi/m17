@@ -18,6 +18,7 @@ pub struct Metrics {
     nbbo_age_us: Histogram,
     last_request_ts_ns: Arc<Mutex<Option<i64>>>,
     flatfile_status: Arc<Mutex<String>>,
+    last_config_reload_ts_ns: Arc<Mutex<Option<i64>>>,
 }
 
 impl Metrics {
@@ -29,6 +30,7 @@ impl Metrics {
                 .unwrap(),
             last_request_ts_ns: Arc::new(Mutex::new(None)),
             flatfile_status: Arc::new(Mutex::new("Not started".to_string())),
+            last_config_reload_ts_ns: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -42,6 +44,14 @@ impl Metrics {
 
     pub fn set_flatfile_status(&self, status: String) {
         *self.flatfile_status.lock().unwrap() = status;
+    }
+
+    pub fn last_config_reload_ts_ns(&self) -> Option<i64> {
+        *self.last_config_reload_ts_ns.lock().unwrap()
+    }
+
+    pub fn set_last_config_reload_ts_ns(&self, ts: i64) {
+        *self.last_config_reload_ts_ns.lock().unwrap() = Some(ts);
     }
 
     async fn handle_metrics(

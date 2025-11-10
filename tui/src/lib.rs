@@ -101,9 +101,24 @@ impl Tui {
         // Get flatfile status
         let flatfile_status = self.metrics.flatfile_status();
 
-        // Format the last request string with newline
+        // Get last config reload timestamp
+        let last_reload = self.metrics.last_config_reload_ts_ns();
+        let last_reload_str = match last_reload {
+            Some(ts) => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as i64;
+                let age_ms = (now - ts) / 1_000_000;
+                format!("Last config reload: {} ms ago", age_ms)
+            }
+            None => "Last config reload: Never".to_string(),
+        };
+
+        // Format the strings with newline
         let last_request_formatted = format!("{}\n", last_request_str);
         let flatfile_formatted = format!("{}\n", flatfile_status);
+        let last_reload_formatted = format!("{}\n", last_reload_str);
 
         // Display component statuses
         let status_spans = vec![
@@ -111,6 +126,7 @@ impl Tui {
             Span::styled("Metrics Server: Running on 127.0.0.1:9090\n", Style::default().fg(Color::Green)),
             Span::styled(&last_request_formatted, Style::default().fg(Color::Yellow)),
             Span::styled(&flatfile_formatted, Style::default().fg(Color::Blue)),
+            Span::styled(&last_reload_formatted, Style::default().fg(Color::Magenta)),
             Span::styled("\nPress 'q' to quit.", Style::default().fg(Color::White)),
         ];
         let status_text = Text::from(vec![Line::from(status_spans)]);

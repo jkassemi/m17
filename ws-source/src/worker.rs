@@ -2,11 +2,10 @@
 
 //! Stub WS worker for equities trades/NBBO.
 
-use core_types::types::{DataBatch, DataBatchMeta, EquityTrade, Nbbo, Quality, Source, Watermark};
+use core_types::types::{DataBatch, EquityTrade};
 use futures::Stream;
 use std::pin::Pin;
-use tokio::net::TcpStream;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::connect_async;
 use url::Url;
 
 /// Stub WS worker.
@@ -24,7 +23,7 @@ impl WsWorker {
     /// Stub: Connect and emit empty batches.
     pub async fn run(&self) -> Pin<Box<dyn Stream<Item = DataBatch<EquityTrade>> + Send>> {
         // Placeholder connection (doesn't connect to real endpoint yet)
-        let (_ws_stream, _) = connect_async(&self.url).await.unwrap();
+        let (_ws_stream, _) = connect_async(self.url.as_str()).await.unwrap();
         // Stub: Return empty stream
         Box::pin(futures::stream::empty())
     }

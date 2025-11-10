@@ -398,9 +398,50 @@ impl SourceTrait for FlatfileSource {
 
     async fn get_nbbo(
         &self,
-        _scope: QueryScope,
+        scope: QueryScope,
     ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>> {
-        Box::pin(futures::stream::empty())
+        let (tx, rx) = mpsc::channel(100);
+        let self_clone = self.clone();
+        let scope_clone = scope.clone();
+        tokio::spawn(async move {
+            let calendar = TradingCalendar::new(Market::NYSE).unwrap();
+            let start_ts = scope_clone.time_range.0;
+            let end_ts = scope_clone.time_range.1;
+            let start_dt: DateTime<Utc> = DateTime::from_timestamp(
+                start_ts / 1_000_000_000,
+                (start_ts % 1_000_000_000) as u32,
+            )
+            .unwrap_or(Utc::now());
+            let end_dt: DateTime<Utc> =
+                DateTime::from_timestamp(end_ts / 1_000_000_000, (end_ts % 1_000_000_000) as u32)
+                    .unwrap_or(Utc::now());
+            let mut current_date = start_dt.date_naive();
+            let end_date = end_dt.date_naive();
+            while current_date <= end_date {
+                if calendar.is_trading_day(current_date).unwrap_or(false) {
+                    let year = current_date.year();
+                    let month = current_date.month();
+                    let day = current_date.day();
+                    let path = format!(
+                        "us_stocks_sip/quotes_v1/{}/{:02}/{}-{:02}-{:02}.csv.gz",
+                        year, month, year, month, day
+                    );
+                    info!("Checking path for equity quotes: {}", path);
+                    process_nbbo_stream(
+                        &self_clone,
+                        &path,
+                        &scope_clone,
+                        tx.clone(),
+                        self_clone.ingest_batch_size,
+                        self_clone.progress_update_ms,
+                        self_clone.metrics.clone(),
+                    )
+                    .await;
+                }
+                current_date += TimeDelta::try_days(1).unwrap();
+            }
+        });
+        Box::pin(ReceiverStream::new(rx))
     }
 }
 
@@ -578,6 +619,127 @@ async fn process_equity_trades_stream<S: SourceTrait>(
     }
 }
 
+async fn process_nbbo_stream<S: SourceTrait>(
+    source: &S,
+    path: &str,
+    scope: &QueryScope,
+    tx: mpsc::Sender<DataBatch<Nbbo>>,
+    batch_size: usize,
+    progress_update_ms: u64,
+    metrics: Option<Arc<Metrics>>,
+) {
+    info!("Attempting to get stream for path: {}", path);
+    match source.get_stream(path).await {
+        Ok(stream) => {
+            let total_len = source.object_len(path).await;
+            if let Some(m) = metrics.as_ref() {
+                m.set_current_file(path.to_string(), total_len.unwrap_or(0));
+            }
+            let bytes_read = Arc::new(AtomicU64::new(0));
+            let reader = StreamReader::new(stream);
+            let counting = CountingReader::new(reader, bytes_read.clone());
+            let buf = BufReader::new(counting);
+            let mut csv_reader = AsyncReaderBuilder::new().create_reader(buf);
+            let mut records = csv_reader.records();
+            let instruments = scope.instruments.clone();
+            let mut batch: Vec<Nbbo> = Vec::with_capacity(batch_size);
+            let mut last_update = Instant::now();
+
+            while let Some(rec) = records.next().await {
+                if let Ok(record) = rec {
+                    // Ticker,ask_exchange,ask_price,ask_size,bid_exchange,bid_price,bid_size,conditions,indicators,participant_timestamp,sequence_number,sip_timestamp,tape,trf_timestamp
+                    let symbol = record[0].to_string();
+                    if !instruments.is_empty() && !instruments.contains(&symbol) {
+                        if let Some(m) = metrics.as_ref() {
+                            if last_update.elapsed() >= Duration::from_millis(progress_update_ms) {
+                                m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
+                                last_update = Instant::now();
+                            }
+                        }
+                        continue;
+                    }
+
+                    let ask_ex: i32 = record[1].parse().unwrap_or(0);
+                    let ask: f64 = record[2].parse().unwrap_or(0.0);
+                    let ask_sz: u32 = record[3].parse().unwrap_or(0);
+                    let bid_ex: i32 = record[4].parse().unwrap_or(0);
+                    let bid: f64 = record[5].parse().unwrap_or(0.0);
+                    let bid_sz: u32 = record[6].parse().unwrap_or(0);
+                    let cond_opt: Option<i32> = record
+                        .get(7)
+                        .and_then(|s| if s.is_empty() { None } else { s.parse().ok() });
+                    let sip_ts: i64 = record[11].parse().unwrap_or(0);
+                    // Infer state
+                    let state = if ask > 0.0 {
+                        if bid > ask {
+                            core_types::types::NbboState::Crossed
+                        } else if (bid - ask).abs() < f64::EPSILON {
+                            core_types::types::NbboState::Locked
+                        } else {
+                            core_types::types::NbboState::Normal
+                        }
+                    } else {
+                        core_types::types::NbboState::Normal
+                    };
+
+                    let nbbo = Nbbo {
+                        instrument_id: symbol,
+                        quote_ts_ns: sip_ts,
+                        bid,
+                        ask,
+                        bid_sz,
+                        ask_sz,
+                        state,
+                        condition: cond_opt,
+                        best_bid_venue: Some(bid_ex),
+                        best_ask_venue: Some(ask_ex),
+                        source: Source::Flatfile,
+                        quality: Quality::Prelim,
+                        watermark_ts_ns: 0,
+                    };
+                    batch.push(nbbo);
+                    if batch.len() >= batch_size {
+                        let meta = DataBatchMeta {
+                            source: Source::Flatfile,
+                            quality: Quality::Prelim,
+                            watermark: Watermark { watermark_ts_ns: 0, completeness: Completeness::Complete, hints: None },
+                            schema_version: 1,
+                        };
+                        let _ = tx.try_send(DataBatch { rows: std::mem::take(&mut batch), meta });
+                    }
+                }
+                if let Some(m) = metrics.as_ref() {
+                    if last_update.elapsed() >= Duration::from_millis(progress_update_ms) {
+                        m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
+                        last_update = Instant::now();
+                    }
+                }
+            }
+
+            if !batch.is_empty() {
+                let meta = DataBatchMeta {
+                    source: Source::Flatfile,
+                    quality: Quality::Prelim,
+                    watermark: Watermark { watermark_ts_ns: 0, completeness: Completeness::Complete, hints: None },
+                    schema_version: 1,
+                };
+                let _ = tx.try_send(DataBatch { rows: batch, meta });
+            }
+
+            if let Some(m) = metrics.as_ref() {
+                if let Some(total) = total_len {
+                    let read = bytes_read.load(Ordering::Relaxed);
+                    if read < total { m.set_current_file_read(total); } else { m.set_current_file_read(read); }
+                } else {
+                    m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to get stream for {}: {}", path, e);
+        }
+    }
+}
 async fn process_option_trades_stream<S: SourceTrait>(
     source: &S,
     path: &str,

@@ -77,3 +77,84 @@ impl GreeksEngine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_types::types::{Nbbo, NbboState, Quality, Source};
+
+    fn mk_nbbo(sym: &str, ts_ns: i64, bid: f64, ask: f64) -> Nbbo {
+        Nbbo {
+            instrument_id: sym.to_string(),
+            quote_ts_ns: ts_ns,
+            bid,
+            ask,
+            bid_sz: 1,
+            ask_sz: 1,
+            state: NbboState::Normal,
+            condition: None,
+            best_bid_venue: Some(12),
+            best_ask_venue: Some(11),
+            source: Source::Flatfile,
+            quality: Quality::Prelim,
+            watermark_ts_ns: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_enrich_batch_populates_greeks_and_snapshots() {
+        let cfg = GreeksConfig {
+            pool_size: 2,
+            risk_free_rate: 0.02,
+            dividend_yield: 0.0,
+            flatfile_underlying_staleness_us: 1_000_000,
+            realtime_underlying_staleness_us: 1_000_000,
+            ..Default::default()
+        };
+        let store = Arc::new(RwLock::new(NbboStore::new()));
+        {
+            let mut w = store.write().await;
+            w.put(&mk_nbbo("SPY", 1_000_000_000, 400.0, 400.1));
+        }
+        let engine = GreeksEngine::new(cfg.clone(), store.clone(), 1_000_000);
+        let mut trades = vec![OptionTrade {
+            contract: "O:SPY250101C00400000".to_string(),
+            contract_direction: 'C',
+            strike_price: 400.0,
+            underlying: "SPY".to_string(),
+            trade_ts_ns: 1_000_100_000, // 100us later
+            price: 1.0,
+            size: 1,
+            conditions: vec![],
+            exchange: 11,
+            expiry_ts_ns: 1_000_000_000 + 31_536_000_000, // +1 year
+            aggressor_side: core_types::types::AggressorSide::Unknown,
+            class_method: core_types::types::ClassMethod::Unknown,
+            aggressor_offset_mid_bp: None,
+            aggressor_offset_touch_ticks: None,
+            nbbo_bid: None,
+            nbbo_ask: None,
+            nbbo_bid_sz: None,
+            nbbo_ask_sz: None,
+            nbbo_ts_ns: None,
+            nbbo_age_us: None,
+            nbbo_state: None,
+            tick_size_used: None,
+            delta: None,
+            gamma: None,
+            vega: None,
+            theta: None,
+            iv: Some(0.3),
+            greeks_flags: 0,
+            source: Source::Flatfile,
+            quality: Quality::Prelim,
+            watermark_ts_ns: 0,
+        }];
+        engine.enrich_batch(&mut trades).await;
+        let t = &trades[0];
+        assert!(t.nbbo_bid.is_some() && t.nbbo_ask.is_some());
+        assert!(t.nbbo_age_us.unwrap() <= 1_000_000);
+        assert!(t.delta.is_some() && t.gamma.is_some() && t.vega.is_some() && t.theta.is_some());
+        assert_eq!(t.greeks_flags, 0);
+    }
+}

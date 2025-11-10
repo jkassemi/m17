@@ -19,3 +19,4 @@ storage = { path = "../storage" }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tui = { path = "../tui" }
+ws-source = { path = "../ws-source" }

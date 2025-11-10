@@ -2,6 +2,8 @@
 pool_size = 4
 risk_free_rate = 0.02
 dividend_yield = 0.0
+flatfile_underlying_staleness_us = 1_000_000
+realtime_underlying_staleness_us = 1_000_000
 
 [ingest]
 batch_size = 20000
@@ -27,7 +29,7 @@ end_ts = "2023-03-27T23:59:59Z"
 
 # Greeks staleness settings (microseconds)
 # Use up to 1s old underlying NBBO bid for S when computing greeks
-[greeks_staleness]
-flatfile_underlying_staleness_us = 1_000_000
-realtime_underlying_staleness_us = 1_000_000
-
+## deprecated: see [greeks]
+# [greeks_staleness]
+# flatfile_underlying_staleness_us = 1_000_000
+# realtime_underlying_staleness_us = 1_000_000

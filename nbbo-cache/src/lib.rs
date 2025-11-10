@@ -28,7 +28,11 @@ impl NbboStore {
             .data
             .entry(quote.instrument_id.clone())
             .or_insert_with(Vec::new);
-        if buf.last().map(|q| q.quote_ts_ns <= quote.quote_ts_ns).unwrap_or(true) {
+        if buf
+            .last()
+            .map(|q| q.quote_ts_ns <= quote.quote_ts_ns)
+            .unwrap_or(true)
+        {
             buf.push(quote.clone());
         } else {
             // Fallback: insert keeping order (rare for out-of-order)
@@ -45,11 +49,17 @@ impl NbboStore {
         // binary search last index with quote_ts_ns <= ts_ns
         let mut lo = 0i64;
         let mut hi = (buf.len() as i64) - 1;
-        if hi < 0 { return None; }
+        if hi < 0 {
+            return None;
+        }
         if buf[hi as usize].quote_ts_ns <= ts_ns {
             let q = &buf[hi as usize];
             let a = age_us(ts_ns, q.quote_ts_ns);
-            return if a <= max_staleness_us { Some(q.clone()) } else { None };
+            return if a <= max_staleness_us {
+                Some(q.clone())
+            } else {
+                None
+            };
         }
         let mut res: Option<usize> = None;
         while lo <= hi {
@@ -65,7 +75,11 @@ impl NbboStore {
         res.and_then(|idx| {
             let q = &buf[idx];
             let a = age_us(ts_ns, q.quote_ts_ns);
-            if a <= max_staleness_us { Some(q.clone()) } else { None }
+            if a <= max_staleness_us {
+                Some(q.clone())
+            } else {
+                None
+            }
         })
     }
 
@@ -80,5 +94,87 @@ impl NbboStore {
         StalenessParams {
             max_staleness_us: 100_000, // 100ms default
         }
+    }
+
+    /// Drop quotes strictly before cutoff for all instruments.
+    pub fn prune_before(&mut self, cutoff_ts_ns: i64) {
+        for (_sym, buf) in self.data.iter_mut() {
+            if buf.is_empty() {
+                continue;
+            }
+            // find first index with ts >= cutoff
+            let idx = match buf.binary_search_by_key(&cutoff_ts_ns, |q| q.quote_ts_ns) {
+                Ok(i) => i,                  // exact match; keep from i
+                Err(insert_pt) => insert_pt, // insert point of cutoff
+            };
+            if idx > 0 {
+                buf.drain(0..idx);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_nbbo(sym: &str, ts_ns: i64, bid: f64, ask: f64) -> Nbbo {
+        Nbbo {
+            instrument_id: sym.to_string(),
+            quote_ts_ns: ts_ns,
+            bid,
+            ask,
+            bid_sz: 1,
+            ask_sz: 1,
+            state: NbboState::Normal,
+            condition: None,
+            best_bid_venue: Some(12),
+            best_ask_venue: Some(11),
+            source: core_types::types::Source::Flatfile,
+            quality: core_types::types::Quality::Prelim,
+            watermark_ts_ns: 0,
+        }
+    }
+
+    #[test]
+    fn test_get_best_before_within_staleness() {
+        let mut store = NbboStore::new();
+        let t0 = 1_000_000_000i64; // 1.0s
+        let t1 = 1_400_000_000i64; // 1.4s
+        store.put(&mk_nbbo("MSFT", t0, 275.0, 276.0));
+        store.put(&mk_nbbo("MSFT", t1, 275.3, 276.1));
+        let trade_ts = 1_500_000_000i64; // 1.5s
+                                         // staleness 1s => 1_000_000 us; age is 100ms (100_000us), within window
+        let q = store.get_best_before("MSFT", trade_ts, 1_000_000).unwrap();
+        assert_eq!(q.quote_ts_ns, t1);
+        assert!((q.bid - 275.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_get_best_before_stale_returns_none() {
+        let mut store = NbboStore::new();
+        let t0 = 1_000_000_000i64; // 1.0s
+        store.put(&mk_nbbo("MSFT", t0, 275.0, 276.0));
+        let trade_ts = 3_500_000_000i64; // 3.5s
+                                         // staleness 1s -> age 2.5s is too old
+        assert!(store.get_best_before("MSFT", trade_ts, 1_000_000).is_none());
+    }
+
+    #[test]
+    fn test_prune_before_drops_old() {
+        let mut store = NbboStore::new();
+        for i in 0..5 {
+            store.put(&mk_nbbo(
+                "MSFT",
+                1_000_000_000 + i * 100_000_000,
+                270.0 + i as f64,
+                271.0,
+            ));
+        }
+        // cutoff at 1.2s -> drop entries < 1.2s (first two)
+        store.prune_before(1_200_000_000);
+        let buf = store.data.get("MSFT").unwrap();
+        assert_eq!(buf.len(), 3);
+        assert_eq!(buf.first().unwrap().quote_ts_ns, 1_200_000_000);
     }
 }

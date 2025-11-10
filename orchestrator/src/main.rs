@@ -25,6 +25,7 @@ use tokio::sync::oneshot;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tui::Tui;
+use ws_source::worker::WsWorker;
 
 #[tokio::main]
 async fn main() {
@@ -60,8 +61,16 @@ async fn main() {
     let nbbo_flatfile = Arc::new(TokioRwLock::new(NbboStore::new()));
     let nbbo_realtime = Arc::new(TokioRwLock::new(NbboStore::new()));
     let classifier = Classifier::new();
-    let greeks_engine_flat = greeks_mod::GreeksEngine::new(config.greeks.clone(), nbbo_flatfile.clone(), 1_000_000);
-    let greeks_engine_rt = greeks_mod::GreeksEngine::new(config.greeks.clone(), nbbo_realtime.clone(), 1_000_000);
+    let greeks_engine_flat = greeks_mod::GreeksEngine::new(
+        config.greeks.clone(),
+        nbbo_flatfile.clone(),
+        config.greeks.flatfile_underlying_staleness_us,
+    );
+    let greeks_engine_rt = greeks_mod::GreeksEngine::new(
+        config.greeks.clone(),
+        nbbo_realtime.clone(),
+        config.greeks.realtime_underlying_staleness_us,
+    );
     let storage = Arc::new(Mutex::new(Storage::new(config.storage)));
 
     let mut planned_days: u64 = 0;
@@ -270,9 +279,12 @@ async fn main() {
                 info!("Seeding NBBO for day: {}", current_date.format("%Y-%m-%d"));
                 // Seed NBBO cache from flatfile equities quotes for the day
                 let mut nbbo_stream = flatfile_source_for_options.get_nbbo(scope_opt.clone()).await;
+                let mut last_ts = None;
                 while let Some(batch) = nbbo_stream.next().await {
                     let mut guard = nbbo_flatfile_clone.write().await;
-                    for q in batch.rows { guard.put(&q); }
+                    for q in batch.rows.iter() { guard.put(q); }
+                    if let Some(q) = batch.rows.last() { last_ts = Some(q.quote_ts_ns); }
+                    if let Some(ts) = last_ts { guard.prune_before(ts.saturating_sub(2_000_000_000)); } // keep ~2s tail
                 }
                 info!("Processing options (OPRA) day: {}", current_date.format("%Y-%m-%d"));
                 let mut stream = flatfile_source_for_options.get_option_trades(scope_opt).await;
@@ -301,6 +313,31 @@ async fn main() {
             });
             current_date = current_date.succ_opt().unwrap();
         }
+    }
+
+    // Realtime websockets (quotes -> nbbo_realtime, options trades -> greeks + persist)
+    // Note: URLs and auth expected via config (extend as needed)
+    {
+        let ws_quotes_url = "wss://socket.massive.com/stocks".to_string();
+        let ws_options_url = "wss://socket.massive.com/options".to_string();
+        let storage_rt = storage.clone();
+        let metrics_rt = metrics.clone();
+        let nbbo_rt = nbbo_realtime.clone();
+        let greeks_rt = greeks_engine_rt.clone();
+        tokio::spawn(async move {
+            // Quotes: feed nbbo_realtime (placeholder: implement actual subscribe/parse)
+            let _quotes = WsWorker::new(&ws_quotes_url);
+            // TODO: connect, authenticate, subscribe, parse messages into Nbbo rows, then:
+            // let mut w = nbbo_rt.write().await; for q in parsed { w.put(&q); w.prune_before(q.quote_ts_ns - 2_000_000_000); }
+        });
+        tokio::spawn(async move {
+            // Options trades: enrich and persist (placeholder for actual WS parsing)
+            let _options = WsWorker::new(&ws_options_url);
+            // TODO: connect, authenticate, subscribe (top contracts), parse to OptionTrade rows, then per batch:
+            // greeks_rt.enrich_batch(&mut batch.rows).await;
+            // if let Err(e) = storage_rt.lock().unwrap().write_option_trades(&batch) { eprintln!("ws write error: {}", e); }
+            // metrics_rt.inc_batches(1); metrics_rt.inc_rows(batch.rows.len() as u64);
+        });
     }
 
     // Wait for shutdown signal or ctrl_c

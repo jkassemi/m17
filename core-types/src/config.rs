@@ -59,6 +59,10 @@ pub struct GreeksConfig {
     pub risk_free_rate: f64,
     #[serde(default = "default_dividend_yield")]
     pub dividend_yield: f64,
+    #[serde(default = "default_flatfile_underlying_staleness_us")]
+    pub flatfile_underlying_staleness_us: u32,
+    #[serde(default = "default_realtime_underlying_staleness_us")]
+    pub realtime_underlying_staleness_us: u32,
 }
 
 fn default_moneyness_threshold() -> f64 {
@@ -80,6 +84,9 @@ fn default_risk_free_rate() -> f64 {
 fn default_dividend_yield() -> f64 {
     0.0
 }
+
+fn default_flatfile_underlying_staleness_us() -> u32 { 1_000_000 }
+fn default_realtime_underlying_staleness_us() -> u32 { 1_000_000 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StorageConfig {

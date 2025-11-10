@@ -349,6 +349,7 @@ async fn process_equity_trades_stream<S: SourceTrait>(
             info!("Collected {} bytes for path: {}", bytes.len(), path);
             let instruments = scope.instruments.clone();
             let tx_clone = tx.clone();
+            let path_owned = path.to_string();
             tokio::task::spawn_blocking(move || {
                 let cursor = std::io::Cursor::new(bytes);
                 let mut rdr = Reader::from_reader(cursor);
@@ -430,7 +431,7 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                     };
                     let _ = tx_clone.try_send(DataBatch { rows: batch, meta });
                 }
-                info!("Processed {} records into {} batches for path: {}", record_count, batch_count, path);
+                info!("Processed {} records into {} batches for path: {}", record_count, batch_count, path_owned);
             })
             .await
             .unwrap();

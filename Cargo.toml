@@ -1,4 +1,12 @@
 [workspace]
+name = "m17"
+version = "0.1.0"
+authors = ["James Kassemi <james@kassemi.org>"]
+edition = "2025"
+description = "Trade Capture M17: A system for capturing trades, classifying aggressors, and more"
+license = "PRIVATE"
+repository = "https://github.com/jkassemi/m17"
+
 members = [
   "classifier",
   "core-types",

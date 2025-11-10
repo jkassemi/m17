@@ -6,4 +6,4 @@ edition = "2021"
 [dependencies]
 core-types = { path = "../core-types" }
 tokio = { version = "1.0", features = ["full"] }
-parquet = { version = "40.0", features = ["arrow"] }
+parquet = { version = "57.0", features = ["arrow"] }

@@ -1,0 +1,24 @@
+[package]
+name = "classifier"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core-types = { path = "../core-types" }
+nbbo-cache = { path = "../nbbo-cache" }
+
+[workspace]
+members = [
+  "classifier",
+  "core-types",
+  "data-client",
+  "flatfile-source",
+  "metrics",
+  "nbbo-cache",
+  "orchestrator",
+  "replayer",
+  "rest-source",
+  "storage",
+  "tui",
+  "ws-source"
+]

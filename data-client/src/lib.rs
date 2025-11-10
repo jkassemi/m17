@@ -3,10 +3,8 @@
 //! DataClient trait and router (stub).
 
 use core_types::types::{DataBatch, EquityTrade, Nbbo, OptionTrade, QueryScope};
-use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
-use tokio_stream::StreamExt;
 
 /// DataClient trait as per spec.
 #[async_trait::async_trait]

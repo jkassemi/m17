@@ -21,7 +21,6 @@ use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use std::collections::HashSet;
-use std::io::BufRead;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::fs::{self, File, OpenOptions};
@@ -181,8 +180,7 @@ impl SourceTrait for FlatfileSource {
                 .send()
                 .await?;
             let body: ByteStream = resp.body;
-            let stream_err_mapped =
-                body.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+            let stream_err_mapped = body.map(|res| res.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>));
 
             let stream: Pin<
                 Box<
@@ -215,9 +213,10 @@ impl SourceTrait for FlatfileSource {
             let mut processed = self.load_processed().await.unwrap_or_default();
             for range in self.config.date_ranges.iter() {
                 let start_ts = range.start_ts_ns().unwrap_or(0);
-                let end_ts = range
+                let end_ts_opt = range
                     .end_ts_ns()
-                    .unwrap_or_else(|| Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX));
+                    .unwrap_or_else(|_| Some(Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX)));
+                let end_ts = end_ts_opt.unwrap_or(Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX));
                 let start_dt: DateTime<Utc> = DateTime::from_timestamp(
                     start_ts / 1_000_000_000,
                     (start_ts % 1_000_000_000) as u32,

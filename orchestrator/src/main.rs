@@ -13,7 +13,10 @@ use ws_source::worker::WsWorker;
 
 #[tokio::main]
 async fn main() {
-    let config = AppConfig::load().unwrap();
+    let config = AppConfig::load().unwrap_or_else(|e| {
+        eprintln!("Failed to load config, using defaults: {}", e);
+        AppConfig::default()
+    });
     let data_client = DataClientRouter::new();
     let nbbo_store = NbboStore::new();
     let classifier = Classifier::new();

@@ -4,7 +4,7 @@ use config::{Config, ConfigError};
 use serde::{Deserialize, Serialize};
 
 /// Config structure with key knobs from spec.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     pub ws: WsConfig,
     pub staleness: StalenessConfig,
@@ -15,48 +15,108 @@ pub struct AppConfig {
     pub scheduler: SchedulerConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WsConfig {
+    #[serde(default)]
     pub shards: std::collections::HashMap<String, u32>, // e.g., "options_quotes" => 1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StalenessConfig {
+    #[serde(default)]
     pub bounds: std::collections::HashMap<String, (u32, u32)>, // e.g., "options" => (10, 150)
+    #[serde(default = "default_quantile")]
     pub quantile: String, // "p99"
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn default_quantile() -> String {
+    "p99".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClassifierConfig {
+    #[serde(default)]
     pub use_tick_rule_rt: bool,
+    #[serde(default = "default_tick_rule_t1")]
     pub use_tick_rule_t1: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn default_tick_rule_t1() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GreeksConfig {
+    #[serde(default = "default_moneyness_threshold")]
     pub moneyness_threshold: f64,
+    #[serde(default = "default_notional_threshold")]
     pub notional_threshold: f64,
+    #[serde(default = "default_pool_size")]
     pub pool_size: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn default_moneyness_threshold() -> f64 {
+    0.1
+}
+
+fn default_notional_threshold() -> f64 {
+    1000.0
+}
+
+fn default_pool_size() -> usize {
+    4
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StorageConfig {
+    #[serde(default)]
     pub paths: std::collections::HashMap<String, String>,
+    #[serde(default = "default_row_group_target")]
     pub row_group_target: usize,
+    #[serde(default = "default_retention_weeks")]
     pub retention_weeks: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn default_row_group_target() -> usize {
+    128000
+}
+
+fn default_retention_weeks() -> u32 {
+    4
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RestConfig {
+    #[serde(default)]
     pub rate_limits: std::collections::HashMap<String, u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SchedulerConfig {
+    #[serde(default = "default_top_n")]
     pub top_n: usize,
+    #[serde(default = "default_exploration_fraction")]
     pub exploration_fraction: f64,
+    #[serde(default = "default_rebalance_interval_s")]
     pub rebalance_interval_s: u64,
+    #[serde(default = "default_hysteresis")]
     pub hysteresis: f64,
+}
+
+fn default_top_n() -> usize {
+    100
+}
+
+fn default_exploration_fraction() -> f64 {
+    0.1
+}
+
+fn default_rebalance_interval_s() -> u64 {
+    300
+}
+
+fn default_hysteresis() -> f64 {
+    0.05
 }
 
 impl AppConfig {

@@ -2,7 +2,7 @@
 
 //! Parquet writer/reader (stub).
 
-use core_types::{EquityTrade, Nbbo, OptionTrade};
+use core_types::types::{EquityTrade, Nbbo, OptionTrade};
 
 /// Stub storage.
 pub struct Storage;

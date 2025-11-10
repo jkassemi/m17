@@ -10,7 +10,7 @@ use aws_sdk_s3::{
     Client,
 };
 use bytes::Bytes;
-use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
+use chrono::{DateTime, Datelike, TimeDelta, Utc};
 use core_types::config::FlatfileConfig;
 use core_types::types::{
     AggressorSide, ClassMethod, Completeness, DataBatch, DataBatchMeta, EquityTrade, Nbbo,
@@ -22,11 +22,10 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use std::collections::HashSet;
 use std::io::BufRead;
-use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use tokio_stream::wrappers::ReceiverStream;
@@ -74,8 +73,8 @@ pub struct FlatfileSource {
 impl FlatfileSource {
     pub async fn new(config: Arc<FlatfileConfig>) -> Self {
         let credentials = Credentials::new(
-            config.access_key(),
-            config.secret_key(),
+            config.polygonio_access_key_id.clone(),
+            config.polygonio_secret_access_key.clone(),
             None,
             None,
             "flatfile",
@@ -97,7 +96,7 @@ impl FlatfileSource {
         &self,
         path: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let local_dir = self.config.local_dir();
+        let local_dir = std::path::PathBuf::from("data");
         let local_path = local_dir.join(path);
         fs::create_dir_all(local_path.parent().unwrap()).await?;
         let resp = self
@@ -108,14 +107,14 @@ impl FlatfileSource {
             .send()
             .await?;
         let data = resp.body.collect().await?;
-        fs::write(&local_path, data.payload()).await?;
+        fs::write(&local_path, data.into_bytes()).await?;
         Ok(())
     }
 
     async fn load_processed(
         &self,
     ) -> Result<HashSet<String>, Box<dyn std::error::Error + Send + Sync>> {
-        let state_path = self.config.flatfile_state_path();
+        let state_path = std::path::PathBuf::from("flatfile_state.txt");
         if !fs::try_exists(&state_path).await? {
             fs::write(&state_path, b"").await?;
         }
@@ -133,7 +132,7 @@ impl FlatfileSource {
         &self,
         path: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let state_path = self.config.flatfile_state_path();
+        let state_path = std::path::PathBuf::from("flatfile_state.txt");
         let mut file = OpenOptions::new().append(true).open(&state_path).await?;
         file.write_all((path.to_string() + "\n").as_bytes()).await?;
         Ok(())
@@ -149,7 +148,7 @@ impl SourceTrait for FlatfileSource {
         Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send>>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let local_dir = self.config.local_dir();
+        let local_dir = std::path::PathBuf::from("data");
         let local_path = local_dir.join(path);
         if fs::try_exists(&local_path).await? {
             let file = File::open(&local_path).await?;
@@ -214,7 +213,7 @@ impl SourceTrait for FlatfileSource {
             let mut status_parts = Vec::new();
             let calendar = TradingCalendar::new(Market::NYSE).unwrap();
             let mut processed = self.load_processed().await.unwrap_or_default();
-            for range in self.config.date_ranges() {
+            for range in self.config.date_ranges.iter() {
                 let start_ts = range.start_ts_ns().unwrap_or(0);
                 let end_ts = range
                     .end_ts_ns()

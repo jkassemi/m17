@@ -1,7 +1,7 @@
 // Copyright (c) James Kassemi, SC, US. All rights reserved.
 
+use core_types::types::{Nbbo, NbboState, StalenessParams};
 use std::collections::HashMap;
-use core_types::{Nbbo, NbboState, StalenessParams};
 
 /// Stub for in-memory NBBO store with per-instrument ring buffers.
 /// Tracks quote states (Normal/Locked/Crossed) and adaptive staleness.
@@ -20,7 +20,10 @@ impl NbboStore {
     /// Put a new NBBO quote into the store.
     pub fn put(&mut self, quote: &Nbbo) {
         // Stub: Insert into per-instrument buffer (no-op for now)
-        self.data.entry(quote.instrument_id.clone()).or_insert_with(Vec::new).push(quote.clone());
+        self.data
+            .entry(quote.instrument_id.clone())
+            .or_insert_with(Vec::new)
+            .push(quote.clone());
     }
 
     /// Get the best NBBO before the given timestamp within max staleness.

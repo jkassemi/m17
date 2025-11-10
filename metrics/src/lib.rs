@@ -2,15 +2,13 @@
 
 //! Prometheus metrics. hyper v1.+
 
-use hyper::body::{Body, Incoming};
-use hyper::server::conn::http1;
+use hyper::{Body, Request, Response};
+use hyper::body::Incoming;
+use hyper::server::Server;
 use hyper::service::service_fn;
-use hyper::{Request, Response};
 use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, TextEncoder};
 use std::convert::Infallible;
-use std::net::SocketAddr;
 use tokio::net::TcpListener;
-use tokio::task;
 
 pub struct Metrics {
     classify_unknown_rate: IntCounter,
@@ -36,39 +34,10 @@ impl Metrics {
     }
 
     pub async fn serve(self: &std::sync::Arc<Self>, listener: TcpListener) -> hyper::Result<()> {
-        loop {
-            let (stream, _addr) = listener.accept().await?;
+        let service = service_fn(move |req| {
             let metrics = self.clone();
-
-            // Spawn per-connection task
-            task::spawn(async move {
-                if let Err(err) = http1::Builder::new()
-                    .serve_connection(
-                        stream,
-                        service_fn(move |req| {
-                            let metrics = metrics.clone();
-                            async move { metrics.handle_metrics(req).await }
-                        }),
-                    )
-                    .await
-                {
-                    eprintln!("metrics server connection error: {err}");
-                }
-            });
-        }
+            async move { metrics.handle_metrics(req).await }
+        });
+        Server::builder(listener).serve(service).await
     }
 }
-
-/*
-use std::sync::Arc;
-use tokio::net::TcpListener;
-
-#[tokio::main]
-async fn main() -> hyper::Result<()> {
-    let addr: SocketAddr = "127.0.0.1:9090".parse().unwrap();
-    let listener = TcpListener::bind(addr).await.unwrap();
-
-    let metrics = Arc::new(Metrics::new());
-    metrics.serve(listener).await
-}
-*/

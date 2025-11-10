@@ -30,12 +30,12 @@ def main():
                     relative_name = file_path.relative_to(cwd)
                     print("```")
                     print(f"# {relative_name}")
-                    print("```")
                 except ValueError:
                     print(f"# {file_path.name}") # Fallback to just name
                 
                 # Print the exact content without an extra trailing newline
                 print(content, end="")
+                print("```")
                 
                 file_found_previously = True
             

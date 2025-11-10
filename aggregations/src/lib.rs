@@ -13,6 +13,11 @@ use std::f64::consts::PI;
 use thiserror::Error;
 
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
+const BOX_COX_EPSILON: f64 = 1e-6;
+const BOX_COX_LAMBDAS: [f64; 17] = [
+    -2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5,
+    1.75, 2.0,
+];
 
 /// Input event for streaming aggregation.
 #[derive(Debug, Clone)]
@@ -534,11 +539,7 @@ fn compute_stats(values: &[f64], diptest_draws: usize) -> StatsSummary {
         deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
         summary.mad = Some(quantile(&deviations, 0.5));
     }
-    if let (Some(skew), Some(kurt)) = (summary.skew, summary.kurtosis) {
-        if kurt.abs() > f64::EPSILON {
-            summary.bc = Some((skew * skew + 1.0) / kurt);
-        }
-    }
+    summary.bc = estimate_box_cox_lambda(values);
     summary.mode = estimate_mode(&sorted, summary.iqr, summary.stddev);
     summary.kde_peaks = estimate_kde_peaks(&sorted, summary.stddev);
     if sorted.len() >= 3 && diptest_draws > 0 {
@@ -559,6 +560,53 @@ fn compute_stats(values: &[f64], diptest_draws: usize) -> StatsSummary {
         }
     }
     summary
+}
+
+fn estimate_box_cox_lambda(values: &[f64]) -> Option<f64> {
+    if values.len() < 2 {
+        return None;
+    }
+    if values.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return None;
+    }
+    let log_values: Vec<f64> = values.iter().map(|v| v.ln()).collect();
+    let sum_logs: f64 = log_values.iter().sum();
+    let n = values.len() as f64;
+    let mut best_lambda = None;
+    let mut best_ll = f64::NEG_INFINITY;
+    'grid: for &lambda in BOX_COX_LAMBDAS.iter() {
+        let mut mean = 0.0;
+        let mut m2 = 0.0;
+        let mut count = 0.0;
+        for &log_x in &log_values {
+            let y = if lambda.abs() < BOX_COX_EPSILON {
+                log_x
+            } else {
+                let exp_term = (lambda * log_x).exp();
+                if !exp_term.is_finite() {
+                    continue 'grid;
+                }
+                (exp_term - 1.0) / lambda
+            };
+            count += 1.0;
+            let delta = y - mean;
+            mean += delta / count;
+            m2 += delta * (y - mean);
+        }
+        if count < 2.0 {
+            continue;
+        }
+        let variance = m2 / count;
+        if variance <= 0.0 || !variance.is_finite() {
+            continue;
+        }
+        let ll = (lambda - 1.0) * sum_logs - 0.5 * n * variance.ln();
+        if ll > best_ll {
+            best_ll = ll;
+            best_lambda = Some(lambda);
+        }
+    }
+    best_lambda
 }
 
 fn quantile(sorted: &[f64], q: f64) -> f64 {

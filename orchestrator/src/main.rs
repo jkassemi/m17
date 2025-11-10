@@ -48,6 +48,25 @@ async fn main() {
     .unwrap();
 
     let config = AppConfig::load().expect("Failed to load config: required environment variables POLYGONIO_KEY, POLYGONIO_ACCESS_KEY_ID, POLYGONIO_SECRET_ACCESS_KEY must be set");
+    let treasury_curve = if let Some(api_key) = config.ws.api_key.clone() {
+        match fetch_latest_treasury_curve(&Client::new(), &config.ws.rest_base_url, &api_key).await
+        {
+            Ok(Some(curve)) => {
+                info!("loaded Massive treasury yields for risk-free interpolation");
+                Some(Arc::new(curve))
+            }
+            Ok(None) => {
+                eprintln!("treasury yields endpoint returned no usable data; using config risk_free_rate fallback");
+                None
+            }
+            Err(err) => {
+                eprintln!("failed to fetch treasury yields: {}", err);
+                None
+            }
+        }
+    } else {
+        None
+    };
     info!(
         "Loaded config with {} flatfile date ranges",
         config.flatfile.date_ranges.len()
@@ -75,11 +94,13 @@ async fn main() {
         config.greeks.clone(),
         nbbo_flatfile.clone(),
         config.greeks.flatfile_underlying_staleness_us,
+        treasury_curve.clone(),
     );
     let greeks_engine_rt = greeks_mod::GreeksEngine::new(
         config.greeks.clone(),
         nbbo_realtime.clone(),
         config.greeks.realtime_underlying_staleness_us,
+        treasury_curve.clone(),
     );
     let storage = Arc::new(Mutex::new(Storage::new(config.storage)));
 
@@ -551,6 +572,30 @@ async fn persist_realtime_options(
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
+async fn fetch_latest_treasury_curve(
+    client: &Client,
+    rest_base_url: &str,
+    api_key: &str,
+) -> Result<Option<greeks_mod::TreasuryCurve>, BoxError> {
+    let mut url = Url::parse(rest_base_url)?;
+    url.set_path("/fed/v1/treasury-yields");
+    url.query_pairs_mut()
+        .append_pair("limit", "1")
+        .append_pair("sort", "date.desc")
+        .append_pair("apiKey", api_key);
+    let resp = client.get(url.clone()).send().await?;
+    if !resp.status().is_success() {
+        return Err(format!("treasury yields status {}", resp.status()).into());
+    }
+    let parsed: TreasuryYieldsResponse = resp.json().await?;
+    if let Some(mut results) = parsed.results {
+        if let Some(record) = results.pop() {
+            return Ok(build_curve_from_record(record));
+        }
+    }
+    Ok(None)
+}
+
 fn spawn_options_subscription_task(
     cfg: core_types::config::WsConfig,
 ) -> Option<watch::Receiver<Vec<String>>> {
@@ -671,4 +716,75 @@ struct DayItem {
 #[derive(Debug, Deserialize)]
 struct DetailsItem {
     ticker: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TreasuryYieldsResponse {
+    results: Option<Vec<TreasuryYieldRecord>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TreasuryYieldRecord {
+    #[allow(dead_code)]
+    date: Option<String>,
+    #[serde(rename = "yield_1_month")]
+    yield_1_month: Option<f64>,
+    #[serde(rename = "yield_3_month")]
+    yield_3_month: Option<f64>,
+    #[serde(rename = "yield_6_month")]
+    yield_6_month: Option<f64>,
+    #[serde(rename = "yield_1_year")]
+    yield_1_year: Option<f64>,
+    #[serde(rename = "yield_2_year")]
+    yield_2_year: Option<f64>,
+    #[serde(rename = "yield_3_year")]
+    yield_3_year: Option<f64>,
+    #[serde(rename = "yield_5_year")]
+    yield_5_year: Option<f64>,
+    #[serde(rename = "yield_7_year")]
+    yield_7_year: Option<f64>,
+    #[serde(rename = "yield_10_year")]
+    yield_10_year: Option<f64>,
+    #[serde(rename = "yield_20_year")]
+    yield_20_year: Option<f64>,
+    #[serde(rename = "yield_30_year")]
+    yield_30_year: Option<f64>,
+}
+
+fn build_curve_from_record(record: TreasuryYieldRecord) -> Option<greeks_mod::TreasuryCurve> {
+    let mut points = Vec::new();
+    if let Some(v) = record.yield_1_month {
+        points.push((1.0 / 12.0, v / 100.0));
+    }
+    if let Some(v) = record.yield_3_month {
+        points.push((0.25, v / 100.0));
+    }
+    if let Some(v) = record.yield_6_month {
+        points.push((0.5, v / 100.0));
+    }
+    if let Some(v) = record.yield_1_year {
+        points.push((1.0, v / 100.0));
+    }
+    if let Some(v) = record.yield_2_year {
+        points.push((2.0, v / 100.0));
+    }
+    if let Some(v) = record.yield_3_year {
+        points.push((3.0, v / 100.0));
+    }
+    if let Some(v) = record.yield_5_year {
+        points.push((5.0, v / 100.0));
+    }
+    if let Some(v) = record.yield_7_year {
+        points.push((7.0, v / 100.0));
+    }
+    if let Some(v) = record.yield_10_year {
+        points.push((10.0, v / 100.0));
+    }
+    if let Some(v) = record.yield_20_year {
+        points.push((20.0, v / 100.0));
+    }
+    if let Some(v) = record.yield_30_year {
+        points.push((30.0, v / 100.0));
+    }
+    greeks_mod::TreasuryCurve::from_pairs(points)
 }

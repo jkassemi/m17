@@ -2,6 +2,7 @@ use black_scholes::*;
 use core_types::config::GreeksConfig;
 use core_types::types::{OptionTrade, TradeLike};
 use nbbo_cache::NbboStore;
+use std::cmp::Ordering;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
 
@@ -16,22 +17,28 @@ pub struct GreeksEngine {
     pool: Arc<Semaphore>,
     nbbo: Arc<RwLock<NbboStore>>,
     staleness_us: u32,
+    treasury_curve: Option<Arc<TreasuryCurve>>,
 }
 
 impl GreeksEngine {
-    pub fn new(cfg: GreeksConfig, nbbo: Arc<RwLock<NbboStore>>, staleness_us: u32) -> Self {
+    pub fn new(
+        cfg: GreeksConfig,
+        nbbo: Arc<RwLock<NbboStore>>,
+        staleness_us: u32,
+        treasury_curve: Option<Arc<TreasuryCurve>>,
+    ) -> Self {
         let pool = Arc::new(Semaphore::new(std::cmp::max(1, cfg.pool_size)));
         Self {
             cfg,
             pool,
             nbbo,
             staleness_us,
+            treasury_curve,
         }
     }
 
     pub async fn enrich_batch(&self, trades: &mut [OptionTrade]) {
         let permits = self.pool.clone();
-        let r = self.cfg.risk_free_rate;
         let q = self.cfg.dividend_yield;
         // simple sequential for now; hook pool for heavy work like IV root-finding in future
         for t in trades.iter_mut() {
@@ -63,6 +70,11 @@ impl GreeksEngine {
             if t_years <= 0.0 {
                 flags |= FLAG_TIME_EXPIRED;
             }
+            let r = self
+                .treasury_curve
+                .as_ref()
+                .map(|curve| curve.rate_for(t_years))
+                .unwrap_or(self.cfg.risk_free_rate);
 
             // Sigma (IV) optional; if None, skip for now
             let sigma = t.iv;
@@ -100,6 +112,50 @@ impl GreeksEngine {
             t.theta = Some(theta);
             t.greeks_flags |= flags;
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TreasuryCurve {
+    points: Vec<(f64, f64)>,
+}
+
+impl TreasuryCurve {
+    /// Builds a curve from tenor/rate pairs (rates expressed in decimal form, e.g. 0.03 for 3%).
+    pub fn from_pairs<I>(pairs: I) -> Option<Self>
+    where
+        I: IntoIterator<Item = (f64, f64)>,
+    {
+        let mut points: Vec<(f64, f64)> = pairs
+            .into_iter()
+            .filter(|(tenor, rate)| *tenor >= 0.0 && rate.is_finite())
+            .collect();
+        if points.is_empty() {
+            return None;
+        }
+        points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        Some(Self { points })
+    }
+
+    /// Returns an interpolated rate for the requested tenor in years.
+    pub fn rate_for(&self, target_years: f64) -> f64 {
+        if self.points.is_empty() {
+            return 0.0;
+        }
+        let target = target_years.max(0.0);
+        if target <= self.points[0].0 {
+            return self.points[0].1;
+        }
+        for window in self.points.windows(2) {
+            let (t0, r0) = window[0];
+            let (t1, r1) = window[1];
+            if target <= t1 {
+                let span = (t1 - t0).max(f64::EPSILON);
+                let w = (target - t0) / span;
+                return r0 + (r1 - r0) * w;
+            }
+        }
+        self.points.last().map(|(_, rate)| *rate).unwrap_or(0.0)
     }
 }
 
@@ -141,7 +197,7 @@ mod tests {
             let mut w = store.write().await;
             w.put(&mk_nbbo("SPY", 1_000_000_000, 400.0, 400.1));
         }
-        let engine = GreeksEngine::new(cfg.clone(), store.clone(), 1_000_000);
+        let engine = GreeksEngine::new(cfg.clone(), store.clone(), 1_000_000, None);
         let mut trades = vec![OptionTrade {
             contract: "O:SPY250101C00400000".to_string(),
             contract_direction: 'C',
@@ -181,5 +237,18 @@ mod tests {
         assert!(t.nbbo_age_us.unwrap() <= 1_000_000);
         assert!(t.delta.is_some() && t.gamma.is_some() && t.vega.is_some() && t.theta.is_some());
         assert_eq!(t.greeks_flags, 0);
+    }
+
+    #[test]
+    fn test_treasury_curve_interpolates() {
+        let curve = TreasuryCurve::from_pairs(vec![(0.5, 0.01), (1.0, 0.02), (2.0, 0.03)]).unwrap();
+        assert!((curve.rate_for(0.25) - 0.01).abs() < 1e-9);
+        assert!((curve.rate_for(0.75) - 0.015).abs() < 1e-9);
+        assert!((curve.rate_for(5.0) - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_treasury_curve_handles_empty_pairs() {
+        assert!(TreasuryCurve::from_pairs(Vec::<(f64, f64)>::new()).is_none());
     }
 }

@@ -156,7 +156,6 @@ impl AppConfig {
     pub fn load() -> Result<Self, ConfigError> {
         let settings = Config::builder()
             .add_source(config::File::with_name("config.toml").required(false))
-            .add_source(config::Environment::with_prefix("APP"))
             .add_source(config::Environment::default())
             .build()?;
         let config: Self = settings.try_deserialize()?;

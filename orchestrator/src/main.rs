@@ -19,10 +19,7 @@ use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() {
-    let config = AppConfig::load().unwrap_or_else(|e| {
-        eprintln!("Failed to load config, using defaults: {}", e);
-        AppConfig::default()
-    });
+    let config = AppConfig::load().expect("Failed to load config: required environment variables POLYGONIO_KEY, POLYGONIO_ACCESS_KEY_ID, POLYGONIO_SECRET_ACCESS_KEY must be set");
     let data_client = DataClientRouter::new();
     let nbbo_store = NbboStore::new();
     let classifier = Classifier::new();

@@ -27,19 +27,19 @@ impl NbboStore {
     }
 
     /// Get the best NBBO before the given timestamp within max staleness.
-    pub fn get_best_before(&self, id: &str, ts_ns: i64, max_staleness_us: u32) -> Option<Nbbo> {
+    pub fn get_best_before(&self, id: &str, _ts_ns: i64, _max_staleness_us: u32) -> Option<Nbbo> {
         // Stub: Return the most recent quote if within staleness (no-op for now)
         self.data.get(id)?.last().cloned()
     }
 
     /// Get the NBBO state before the given timestamp.
-    pub fn get_state_before(&self, id: &str, ts_ns: i64) -> Option<NbboState> {
+    pub fn get_state_before(&self, id: &str, _ts_ns: i64) -> Option<NbboState> {
         // Stub: Return state from the most recent quote (no-op for now)
         self.data.get(id)?.last().map(|q| q.state.clone())
     }
 
     /// Get adaptive staleness parameters for an instrument.
-    pub fn adaptive_params(&self, id: &str) -> StalenessParams {
+    pub fn adaptive_params(&self, _id: &str) -> StalenessParams {
         // Stub: Return default params (no adaptive logic yet)
         StalenessParams {
             max_staleness_us: 100_000, // 100ms default

@@ -2,7 +2,8 @@
 
 //! Main runtime with Tokio.
 
-use core_types::AppConfig;
+use classifier::Classifier;
+use core_types::config::AppConfig;
 use data_client::DataClientRouter;
 use metrics::Metrics;
 use nbbo_cache::NbboStore;
@@ -12,11 +13,11 @@ use ws_source::worker::WsWorker;
 
 #[tokio::main]
 async fn main() {
-    let config = AppConfig::load().unwrap_or_default();
+    let config = AppConfig::load().unwrap();
     let data_client = DataClientRouter::new();
     let nbbo_store = NbboStore::new();
     let classifier = Classifier::new();
-    let storage = Storage::new();
+    let storage = Storage::new(config.storage);
     let metrics = Metrics::new();
 
     // Stub WS worker

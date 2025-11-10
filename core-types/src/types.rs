@@ -184,3 +184,41 @@ pub struct ClassParams {
 pub struct StalenessParams {
     pub max_staleness_us: u32,
 }
+
+/// Trait for trade-like objects that can be classified.
+pub trait TradeLike {
+    fn instrument_id(&self) -> &str;
+    fn trade_ts_ns(&self) -> i64;
+    fn price(&self) -> f64;
+    fn set_aggressor_side(&mut self, side: AggressorSide);
+    fn set_class_method(&mut self, method: ClassMethod);
+    fn set_aggressor_offset_mid_bp(&mut self, offset: Option<i32>);
+    fn set_nbbo_snapshot(&mut self, bid: Option<f64>, ask: Option<f64>, bid_sz: Option<u32>, ask_sz: Option<u32>, ts_ns: Option<i64>, age_us: Option<u32>, state: Option<NbboState>);
+    fn set_tick_size_used(&mut self, size: Option<f64>);
+}
+
+impl TradeLike for OptionTrade {
+    fn instrument_id(&self) -> &str { &self.contract }
+    fn trade_ts_ns(&self) -> i64 { self.trade_ts_ns }
+    fn price(&self) -> f64 { self.price }
+    fn set_aggressor_side(&mut self, side: AggressorSide) { self.aggressor_side = side; }
+    fn set_class_method(&mut self, method: ClassMethod) { self.class_method = method; }
+    fn set_aggressor_offset_mid_bp(&mut self, offset: Option<i32>) { self.aggressor_offset_mid_bp = offset; }
+    fn set_nbbo_snapshot(&mut self, bid: Option<f64>, ask: Option<f64>, bid_sz: Option<u32>, ask_sz: Option<u32>, ts_ns: Option<i64>, age_us: Option<u32>, state: Option<NbboState>) {
+        self.nbbo_bid = bid; self.nbbo_ask = ask; self.nbbo_bid_sz = bid_sz; self.nbbo_ask_sz = ask_sz; self.nbbo_ts_ns = ts_ns; self.nbbo_age_us = age_us; self.nbbo_state = state;
+    }
+    fn set_tick_size_used(&mut self, size: Option<f64>) { self.tick_size_used = size; }
+}
+
+impl TradeLike for EquityTrade {
+    fn instrument_id(&self) -> &str { &self.symbol }
+    fn trade_ts_ns(&self) -> i64 { self.trade_ts_ns }
+    fn price(&self) -> f64 { self.price }
+    fn set_aggressor_side(&mut self, side: AggressorSide) { self.aggressor_side = side; }
+    fn set_class_method(&mut self, method: ClassMethod) { self.class_method = method; }
+    fn set_aggressor_offset_mid_bp(&mut self, offset: Option<i32>) { self.aggressor_offset_mid_bp = offset; }
+    fn set_nbbo_snapshot(&mut self, bid: Option<f64>, ask: Option<f64>, bid_sz: Option<u32>, ask_sz: Option<u32>, ts_ns: Option<i64>, age_us: Option<u32>, state: Option<NbboState>) {
+        self.nbbo_bid = bid; self.nbbo_ask = ask; self.nbbo_bid_sz = bid_sz; self.nbbo_ask_sz = ask_sz; self.nbbo_ts_ns = ts_ns; self.nbbo_age_us = age_us; self.nbbo_state = state;
+    }
+    fn set_tick_size_used(&mut self, size: Option<f64>) { self.tick_size_used = size; }
+}

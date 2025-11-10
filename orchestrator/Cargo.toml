@@ -20,3 +20,5 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tui = { path = "../tui" }
 ws-source = { path = "../ws-source" }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }

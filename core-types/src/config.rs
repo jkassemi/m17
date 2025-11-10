@@ -19,8 +19,52 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WsConfig {
+    #[serde(default = "default_stocks_ws_url")]
+    pub stocks_ws_url: String,
+    #[serde(default = "default_options_ws_url")]
+    pub options_ws_url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_underlying_symbol")]
+    pub underlying_symbol: String,
+    #[serde(default = "default_rest_base_url")]
+    pub rest_base_url: String,
+    #[serde(default = "default_options_contract_limit")]
+    pub options_contract_limit: usize,
+    #[serde(default = "default_options_refresh_interval_s")]
+    pub options_refresh_interval_s: u64,
+    #[serde(default = "default_ws_batch_size")]
+    pub batch_size: usize,
     #[serde(default)]
     pub shards: std::collections::HashMap<String, u32>, // e.g., "options_quotes" => 1
+}
+
+fn default_stocks_ws_url() -> String {
+    "wss://socket.massive.com/stocks".to_string()
+}
+
+fn default_options_ws_url() -> String {
+    "wss://socket.massive.com/options".to_string()
+}
+
+fn default_underlying_symbol() -> String {
+    String::new()
+}
+
+fn default_rest_base_url() -> String {
+    "https://api.massive.com".to_string()
+}
+
+fn default_options_contract_limit() -> usize {
+    1000
+}
+
+fn default_options_refresh_interval_s() -> u64 {
+    900
+}
+
+fn default_ws_batch_size() -> usize {
+    1000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

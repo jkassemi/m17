@@ -5,6 +5,16 @@ dividend_yield = 0.0
 flatfile_underlying_staleness_us = 1_000_000
 realtime_underlying_staleness_us = 1_000_000
 
+[ws]
+api_key = "YOUR_WS_API_KEY"
+stocks_ws_url = "wss://socket.massive.com/stocks"
+options_ws_url = "wss://socket.massive.com/options"
+rest_base_url = "https://api.massive.com"
+underlying_symbol = "SPY"
+options_contract_limit = 800
+options_refresh_interval_s = 900
+batch_size = 512
+
 [ingest]
 batch_size = 20000
 concurrent_days = 4

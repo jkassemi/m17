@@ -6,6 +6,7 @@ use aws_sdk_s3::Client;
 use bytes::Bytes;
 use chrono::{DateTime, Datelike, TimeDelta, Utc};
 use core_types::config::FlatfileConfig;
+use core_types::opra::parse_opra_contract;
 use core_types::types::{
     AggressorSide, ClassMethod, Completeness, DataBatch, DataBatchMeta, EquityTrade, Nbbo,
     OptionTrade, Quality, QueryScope, Source, Watermark,
@@ -871,32 +872,6 @@ async fn process_option_trades_stream<S: SourceTrait>(
     }
 }
 
-fn parse_opra_contract(contract: &str, ts_ns_hint: Option<i64>) -> (char, f64, i64, String) {
-    // Parse OPRA: O:<UNDERLYING><YYMMDD><C|P><STRIKE 8 digits>
-    let mut dir = 'C';
-    let mut strike = 0.0f64;
-    let mut expiry_ts_ns = ts_ns_hint.unwrap_or(0);
-    let mut underlying = String::new();
-    if let Some(sym) = contract.strip_prefix("O:") {
-        if sym.len() >= 15 {
-            let len = sym.len();
-            let date_start = len - 15; // 6 date + 1 dir + 8 strike
-            underlying = sym[..date_start].to_string();
-            let (y, m, d) = (&sym[date_start..date_start+2], &sym[date_start+2..date_start+4], &sym[date_start+4..date_start+6]);
-            if let (Ok(yy), Ok(mm), Ok(dd)) = (y.parse::<u32>(), m.parse::<u32>(), d.parse::<u32>()) {
-                let year = 2000 + yy as i32;
-                if let Some(date) = chrono::NaiveDate::from_ymd_opt(year, mm, dd) {
-                    expiry_ts_ns = date.and_hms_opt(0,0,0).unwrap().and_utc().timestamp_nanos_opt().unwrap_or(expiry_ts_ns);
-                }
-            }
-            dir = sym.chars().nth(len - 9).unwrap_or('C');
-            let strike_raw = &sym[len - 8..];
-            if let Ok(v) = strike_raw.parse::<u32>() { strike = (v as f64) / 1000.0; }
-        }
-    }
-    (dir, strike, expiry_ts_ns, underlying)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,18 +1059,6 @@ mod tests {
         assert_eq!(first.underlying, "SPY");
     }
 
-    #[test]
-    fn test_parse_opra_contract() {
-        let (dir, strike, expiry, underlying) = parse_opra_contract("O:SPY241220P00720000", None);
-        assert_eq!(dir, 'P');
-        assert!((strike - 720.0).abs() < 1e-6);
-        assert_eq!(underlying, "SPY");
-        assert!(expiry > 0);
-        let (dir2, strike2, _exp2, und2) = parse_opra_contract("O:TSLA251219C00650000", None);
-        assert_eq!(dir2, 'C');
-        assert!((strike2 - 650.0).abs() < 1e-6);
-        assert_eq!(und2, "TSLA");
-    }
     async fn test_local_file_source_get_equity_trades() {
         let source = LocalFileSource::new(PathBuf::from("fixtures"));
         let scope = QueryScope {

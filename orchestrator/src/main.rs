@@ -2,30 +2,35 @@
 
 //! Main runtime with Tokio.
 
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use classifier::Classifier;
 mod greeks_mod { pub use classifier::greeks::*; }
 use core_types::config::AppConfig;
+use core_types::types::{Completeness, DataBatch, DataBatchMeta, OptionTrade, Quality, Source, Watermark};
 use flatfile_source::FlatfileSource;
 use flatfile_source::SourceTrait;
 use futures::StreamExt;
 use log::info;
 use metrics::Metrics;
 use nbbo_cache::NbboStore;
-use tokio::sync::RwLock as TokioRwLock;
+use reqwest::{Client, Url};
+use serde::Deserialize;
 use simplelog::*;
+use std::error::Error;
 use std::fs::File;
-use std::path::PathBuf;
+use std::mem;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage::Storage;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
+use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tui::Tui;
-use ws_source::worker::WsWorker;
+use ws_source::worker::{ResourceKind, SubscriptionSource, WsMessage, WsWorker};
 
 #[tokio::main]
 async fn main() {
@@ -119,7 +124,9 @@ async fn main() {
     let listener = TcpListener::bind("127.0.0.1:9090").await.unwrap();
     let metrics_clone = metrics.clone(); // Clone the Arc for the spawned task
     tokio::spawn(async move {
-        metrics_clone.serve(listener).await; // Use the cloned Arc
+        if let Err(e) = metrics_clone.serve(listener).await {
+            eprintln!("metrics server error: {}", e);
+        }
     });
 
     // Launch config reload watcher
@@ -316,28 +323,74 @@ async fn main() {
     }
 
     // Realtime websockets (quotes -> nbbo_realtime, options trades -> greeks + persist)
-    // Note: URLs and auth expected via config (extend as needed)
     {
-        let ws_quotes_url = "wss://socket.massive.com/stocks".to_string();
-        let ws_options_url = "wss://socket.massive.com/options".to_string();
-        let storage_rt = storage.clone();
-        let metrics_rt = metrics.clone();
-        let nbbo_rt = nbbo_realtime.clone();
-        let greeks_rt = greeks_engine_rt.clone();
-        tokio::spawn(async move {
-            // Quotes: feed nbbo_realtime (placeholder: implement actual subscribe/parse)
-            let _quotes = WsWorker::new(&ws_quotes_url);
-            // TODO: connect, authenticate, subscribe, parse messages into Nbbo rows, then:
-            // let mut w = nbbo_rt.write().await; for q in parsed { w.put(&q); w.prune_before(q.quote_ts_ns - 2_000_000_000); }
-        });
-        tokio::spawn(async move {
-            // Options trades: enrich and persist (placeholder for actual WS parsing)
-            let _options = WsWorker::new(&ws_options_url);
-            // TODO: connect, authenticate, subscribe (top contracts), parse to OptionTrade rows, then per batch:
-            // greeks_rt.enrich_batch(&mut batch.rows).await;
-            // if let Err(e) = storage_rt.lock().unwrap().write_option_trades(&batch) { eprintln!("ws write error: {}", e); }
-            // metrics_rt.inc_batches(1); metrics_rt.inc_rows(batch.rows.len() as u64);
-        });
+        let ws_cfg = config.ws.clone();
+        let underlying = ws_cfg.underlying_symbol.trim().to_string();
+        if underlying.is_empty() {
+            eprintln!("ws underlying_symbol is empty; skipping realtime feeds");
+        } else {
+            let quote_topic = format!("Q.{}", underlying);
+            let quotes_worker = WsWorker::new(
+                &ws_cfg.stocks_ws_url,
+                ResourceKind::EquityQuotes,
+                ws_cfg.api_key.clone(),
+                SubscriptionSource::Static(vec![quote_topic]),
+            );
+            let nbbo_rt = nbbo_realtime.clone();
+            tokio::spawn(async move {
+                match quotes_worker.stream().await {
+                    Ok(mut stream) => {
+                        while let Some(msg) = stream.next().await {
+                            if let WsMessage::Nbbo(nbbo) = msg {
+                                let mut guard = nbbo_rt.write().await;
+                                guard.put(&nbbo);
+                                guard.prune_before(nbbo.quote_ts_ns.saturating_sub(2_000_000_000));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("ws quotes stream error: {}", err);
+                    }
+                }
+            });
+        }
+
+        let options_sub_rx = spawn_options_subscription_task(ws_cfg.clone());
+        if let Some(options_rx) = options_sub_rx {
+            let options_worker = WsWorker::new(
+                &ws_cfg.options_ws_url,
+                ResourceKind::OptionsTrades,
+                ws_cfg.api_key.clone(),
+                SubscriptionSource::Dynamic(options_rx),
+            );
+            let storage_rt = storage.clone();
+            let metrics_rt = metrics.clone();
+            let greeks_rt = greeks_engine_rt.clone();
+            let batch_cap = std::cmp::max(1, ws_cfg.batch_size);
+            tokio::spawn(async move {
+                match options_worker.stream().await {
+                    Ok(mut stream) => {
+                        let mut pending: Vec<OptionTrade> = Vec::with_capacity(batch_cap);
+                        while let Some(msg) = stream.next().await {
+                            if let WsMessage::OptionTrade(trade) = msg {
+                                pending.push(trade);
+                                if pending.len() >= batch_cap {
+                                    persist_realtime_options(&mut pending, &greeks_rt, &storage_rt, &metrics_rt).await;
+                                }
+                            }
+                        }
+                        if !pending.is_empty() {
+                            persist_realtime_options(&mut pending, &greeks_rt, &storage_rt, &metrics_rt).await;
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("ws options stream error: {}", err);
+                    }
+                }
+            });
+        } else {
+            eprintln!("ws options subscription task not started; skipping options stream");
+        }
     }
 
     // Wait for shutdown signal or ctrl_c
@@ -345,4 +398,168 @@ async fn main() {
         _ = tokio::signal::ctrl_c() => {},
         _ = shutdown_rx => {},
     }
+}
+
+async fn persist_realtime_options(
+    rows: &mut Vec<OptionTrade>,
+    greeks: &greeks_mod::GreeksEngine,
+    storage: &Arc<Mutex<Storage>>,
+    metrics: &Arc<Metrics>,
+) {
+    if rows.is_empty() {
+        return;
+    }
+    greeks.enrich_batch(rows).await;
+    let watermark = rows.last().map(|t| t.trade_ts_ns).unwrap_or(0);
+    let meta = DataBatchMeta {
+        source: Source::Ws,
+        quality: Quality::Prelim,
+        watermark: Watermark {
+            watermark_ts_ns: watermark,
+            completeness: Completeness::Unknown,
+            hints: None,
+        },
+        schema_version: 1,
+    };
+    let batch = DataBatch {
+        rows: mem::take(rows),
+        meta,
+    };
+    metrics.inc_batches(1);
+    metrics.inc_rows(batch.rows.len() as u64);
+    if let Err(e) = storage.lock().unwrap().write_option_trades(&batch) {
+        eprintln!("Failed to write realtime option trades: {}", e);
+    }
+}
+
+type BoxError = Box<dyn Error + Send + Sync>;
+
+fn spawn_options_subscription_task(
+    cfg: core_types::config::WsConfig,
+) -> Option<watch::Receiver<Vec<String>>> {
+    let api_key = cfg.api_key.clone()?;
+    let symbol = cfg.underlying_symbol.trim().to_string();
+    if symbol.is_empty() {
+        return None;
+    }
+    let rest_base = cfg.rest_base_url.clone();
+    let limit = cfg.options_contract_limit.min(1_000);
+    let interval = std::cmp::max(60, cfg.options_refresh_interval_s);
+    let (tx, rx) = watch::channel(Vec::new());
+    tokio::spawn(async move {
+        let client = Client::new();
+        let mut first = true;
+        loop {
+            if !first {
+                sleep(Duration::from_secs(interval)).await;
+            } else {
+                first = false;
+            }
+            match fetch_top_options_contracts(
+                &client,
+                &rest_base,
+                &api_key,
+                &symbol,
+                limit,
+            )
+            .await
+            {
+                Ok(contracts) => {
+                    let subs: Vec<String> =
+                        contracts.into_iter().map(|c| format!("T.{}", c)).collect();
+                    if tx.send(subs).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("options subscription refresh failed: {}", err);
+                }
+            }
+        }
+    });
+    Some(rx)
+}
+
+async fn fetch_top_options_contracts(
+    client: &Client,
+    rest_base_url: &str,
+    api_key: &str,
+    underlying: &str,
+    limit: usize,
+) -> Result<Vec<String>, BoxError> {
+    let mut url = Url::parse(rest_base_url)?;
+    url.set_path(&format!("/v3/snapshot/options/{}", underlying));
+    url.query_pairs_mut()
+        .append_pair("limit", "250")
+        .append_pair("apiKey", api_key);
+    let mut collected: Vec<(String, f64)> = Vec::new();
+    let mut next = Some(url);
+    while let Some(current) = next {
+        let resp = client.get(current.clone()).send().await?;
+        if !resp.status().is_success() {
+            return Err(format!("snapshot status {}", resp.status()).into());
+        }
+        let parsed: ChainResponse = resp.json().await?;
+        if let Some(results) = parsed.results {
+            for item in results {
+                if let Some(ticker) = item
+                    .details
+                    .as_ref()
+                    .and_then(|d| d.ticker.as_ref())
+                    .cloned()
+                {
+                    let score = item
+                        .open_interest
+                        .unwrap_or(0.0)
+                        .max(item.day.as_ref().and_then(|d| d.volume).unwrap_or(0.0));
+                    collected.push((ticker, score));
+                }
+            }
+        }
+        if collected.len() >= limit {
+            break;
+        }
+        next = if let Some(next_url) = parsed.next_url {
+            let mut next_parsed = match Url::parse(&next_url) {
+                Ok(u) => u,
+                Err(_) => {
+                    let mut base = Url::parse(rest_base_url)?;
+                    base.set_path(&next_url);
+                    base
+                }
+            };
+            if !next_parsed.query_pairs().any(|(k, _)| k == "apiKey") {
+                next_parsed.query_pairs_mut().append_pair("apiKey", api_key);
+            }
+            Some(next_parsed)
+        } else {
+            None
+        };
+    }
+    collected.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    collected.truncate(limit);
+    Ok(collected.into_iter().map(|(t, _)| t).collect())
+}
+
+#[derive(Debug, Deserialize)]
+struct ChainResponse {
+    next_url: Option<String>,
+    results: Option<Vec<ChainItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChainItem {
+    open_interest: Option<f64>,
+    day: Option<DayItem>,
+    details: Option<DetailsItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DayItem {
+    volume: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DetailsItem {
+    ticker: Option<String>,
 }

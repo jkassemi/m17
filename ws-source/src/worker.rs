@@ -5,7 +5,6 @@
 use core_types::types::{DataBatch, EquityTrade};
 use futures::Stream;
 use std::pin::Pin;
-use tokio_tungstenite::connect_async;
 use url::Url;
 
 /// Stub WS worker.
@@ -20,10 +19,8 @@ impl WsWorker {
         }
     }
 
-    /// Stub: Connect and emit empty batches.
+    /// Stub: Return empty stream (no real connection yet)
     pub async fn run(&self) -> Pin<Box<dyn Stream<Item = DataBatch<EquityTrade>> + Send>> {
-        // Placeholder connection (doesn't connect to real endpoint yet)
-        let (_ws_stream, _) = connect_async(self.url.as_str()).await.unwrap();
         // Stub: Return empty stream
         Box::pin(futures::stream::empty())
     }

@@ -19,6 +19,7 @@ use core_types::types::{
 use csv::Reader;
 use futures::Stream;
 use futures::TryStreamExt;
+use log::info;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -311,6 +312,7 @@ impl SourceTrait for FlatfileSource {
                         "us_stocks_sip/trades_v1/{}/{:02}/{}-{:02}-{:02}.csv.gz",
                         year, month, year, month, day
                     );
+                    info!("Checking path for equity trades: {}", path);
                     process_equity_trades_stream(&self_clone, &path, &scope_clone, tx.clone())
                         .await;
                 }
@@ -334,7 +336,9 @@ async fn process_equity_trades_stream<S: SourceTrait>(
     scope: &QueryScope,
     tx: mpsc::Sender<DataBatch<EquityTrade>>,
 ) {
+    info!("Attempting to get stream for path: {}", path);
     if let Ok(stream) = source.get_stream(path).await {
+        info!("Stream obtained for path: {}, collecting bytes...", path);
         if let Ok(bytes) = stream
             .try_fold(Vec::new(), |mut acc, chunk| async move {
                 acc.extend(chunk);
@@ -342,6 +346,7 @@ async fn process_equity_trades_stream<S: SourceTrait>(
             })
             .await
         {
+            info!("Collected {} bytes for path: {}", bytes.len(), path);
             let instruments = scope.instruments.clone();
             let tx_clone = tx.clone();
             tokio::task::spawn_blocking(move || {
@@ -349,8 +354,11 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                 let mut rdr = Reader::from_reader(cursor);
                 let mut batch = Vec::new();
                 const BATCH_SIZE: usize = 1000;
+                let mut record_count = 0;
+                let mut batch_count = 0;
                 for result in rdr.records() {
                     if let Ok(record) = result {
+                        record_count += 1;
                         let symbol = record[0].to_string();
                         if !instruments.is_empty() && !instruments.contains(&symbol) {
                             continue;
@@ -390,6 +398,7 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                         };
                         batch.push(trade);
                         if batch.len() == BATCH_SIZE {
+                            batch_count += 1;
                             let meta = DataBatchMeta {
                                 source: Source::Flatfile,
                                 quality: Quality::Prelim,
@@ -408,6 +417,7 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                     }
                 }
                 if !batch.is_empty() {
+                    batch_count += 1;
                     let meta = DataBatchMeta {
                         source: Source::Flatfile,
                         quality: Quality::Prelim,
@@ -420,10 +430,15 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                     };
                     let _ = tx_clone.try_send(DataBatch { rows: batch, meta });
                 }
+                info!("Processed {} records into {} batches for path: {}", record_count, batch_count, path);
             })
             .await
             .unwrap();
+        } else {
+            info!("Failed to collect bytes for path: {}", path);
         }
+    } else {
+        info!("Failed to get stream for path: {}", path);
     }
 }
 

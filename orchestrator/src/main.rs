@@ -35,6 +35,10 @@ async fn main() {
     .unwrap();
 
     let config = AppConfig::load().expect("Failed to load config: required environment variables POLYGONIO_KEY, POLYGONIO_ACCESS_KEY_ID, POLYGONIO_SECRET_ACCESS_KEY must be set");
+    info!("Loaded config with {} flatfile date ranges", config.flatfile.date_ranges.len());
+    for (i, range) in config.flatfile.date_ranges.iter().enumerate() {
+        info!("Range {}: start_ts={}, end_ts={:?}", i, range.start_ts, range.end_ts);
+    }
     let flatfile_config = config.flatfile.clone();
     let flatfile_source = FlatfileSource::new(Arc::new(flatfile_config)).await;
     let flatfile_source_clone = flatfile_source.clone();
@@ -86,6 +90,10 @@ async fn main() {
                                 .unwrap()
                                 .as_nanos() as i64;
                             metrics_clone_for_reload.set_last_config_reload_ts_ns(now);
+                            info!("Config reloaded with {} flatfile date ranges", new_config.flatfile.date_ranges.len());
+                            for (i, range) in new_config.flatfile.date_ranges.iter().enumerate() {
+                                info!("Reloaded range {}: start_ts={}, end_ts={:?}", i, range.start_ts, range.end_ts);
+                            }
                             // Note: In a real implementation, you might need to update other components with new_config
                         }
                         Err(e) => {
@@ -136,6 +144,7 @@ async fn main() {
         };
         let mut current_date = start_date;
         while current_date <= end_date {
+            info!("Starting ingestion task for day: {}", current_date.format("%Y-%m-%d"));
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let storage = storage.clone();
             let metrics = metrics.clone();
@@ -164,6 +173,7 @@ async fn main() {
                 quality_target: core_types::types::Quality::Prelim,
             };
             tokio::spawn(async move {
+                info!("Processing day: {}", current_date.format("%Y-%m-%d"));
                 let mut stream = flatfile_source_for_task.get_equity_trades(scope).await;
                 let mut batch_count = 0;
                 while let Some(batch) = stream.next().await {

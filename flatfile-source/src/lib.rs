@@ -337,109 +337,112 @@ async fn process_equity_trades_stream<S: SourceTrait>(
     tx: mpsc::Sender<DataBatch<EquityTrade>>,
 ) {
     info!("Attempting to get stream for path: {}", path);
-    if let Ok(stream) = source.get_stream(path).await {
-        info!("Stream obtained for path: {}, collecting bytes...", path);
-        if let Ok(bytes) = stream
-            .try_fold(Vec::new(), |mut acc, chunk| async move {
-                acc.extend(chunk);
-                Ok(acc)
-            })
-            .await
-        {
-            info!("Collected {} bytes for path: {}", bytes.len(), path);
-            let instruments = scope.instruments.clone();
-            let tx_clone = tx.clone();
-            let path_owned = path.to_string();
-            tokio::task::spawn_blocking(move || {
-                let cursor = std::io::Cursor::new(bytes);
-                let mut rdr = Reader::from_reader(cursor);
-                let mut batch = Vec::new();
-                const BATCH_SIZE: usize = 1000;
-                let mut record_count = 0;
-                let mut batch_count = 0;
-                for result in rdr.records() {
-                    if let Ok(record) = result {
-                        record_count += 1;
-                        let symbol = record[0].to_string();
-                        if !instruments.is_empty() && !instruments.contains(&symbol) {
-                            continue;
-                        }
-                        let trade = EquityTrade {
-                            symbol,
-                            trade_ts_ns: record[5].parse().unwrap_or(0),
-                            price: record[6].parse().unwrap_or(0.0),
-                            size: record[9].parse().unwrap_or(0),
-                            conditions: record[1]
-                                .split(',')
-                                .filter_map(|s| s.trim().parse().ok())
-                                .collect(),
-                            exchange: record[3].parse().unwrap_or(0),
-                            aggressor_side: AggressorSide::Unknown,
-                            class_method: ClassMethod::Unknown,
-                            aggressor_offset_mid_bp: None,
-                            aggressor_offset_touch_ticks: None,
-                            nbbo_bid: None,
-                            nbbo_ask: None,
-                            nbbo_bid_sz: None,
-                            nbbo_ask_sz: None,
-                            nbbo_ts_ns: None,
-                            nbbo_age_us: None,
-                            nbbo_state: None,
-                            tick_size_used: None,
-                            source: Source::Flatfile,
-                            quality: Quality::Prelim,
-                            watermark_ts_ns: 0,
-                            trade_id: Some(record[4].to_string()),
-                            seq: Some(record[7].parse().unwrap_or(0)),
-                            participant_ts_ns: Some(record[8].parse().unwrap_or(0)),
-                            tape: Some(record[10].to_string()),
-                            correction: Some(record[2].parse().unwrap_or(0)),
-                            trf_id: Some(record[11].to_string()),
-                            trf_ts_ns: Some(record[12].parse().unwrap_or(0)),
-                        };
-                        batch.push(trade);
-                        if batch.len() == BATCH_SIZE {
-                            batch_count += 1;
-                            let meta = DataBatchMeta {
+    match source.get_stream(path).await {
+        Ok(stream) => {
+            info!("Stream obtained for path: {}, collecting bytes...", path);
+            if let Ok(bytes) = stream
+                .try_fold(Vec::new(), |mut acc, chunk| async move {
+                    acc.extend(chunk);
+                    Ok(acc)
+                })
+                .await
+            {
+                info!("Collected {} bytes for path: {}", bytes.len(), path);
+                let instruments = scope.instruments.clone();
+                let tx_clone = tx.clone();
+                let path_owned = path.to_string();
+                tokio::task::spawn_blocking(move || {
+                    let cursor = std::io::Cursor::new(bytes);
+                    let mut rdr = Reader::from_reader(cursor);
+                    let mut batch = Vec::new();
+                    const BATCH_SIZE: usize = 1000;
+                    let mut record_count = 0;
+                    let mut batch_count = 0;
+                    for result in rdr.records() {
+                        if let Ok(record) = result {
+                            record_count += 1;
+                            let symbol = record[0].to_string();
+                            if !instruments.is_empty() && !instruments.contains(&symbol) {
+                                continue;
+                            }
+                            let trade = EquityTrade {
+                                symbol,
+                                trade_ts_ns: record[5].parse().unwrap_or(0),
+                                price: record[6].parse().unwrap_or(0.0),
+                                size: record[9].parse().unwrap_or(0),
+                                conditions: record[1]
+                                    .split(',')
+                                    .filter_map(|s| s.trim().parse().ok())
+                                    .collect(),
+                                exchange: record[3].parse().unwrap_or(0),
+                                aggressor_side: AggressorSide::Unknown,
+                                class_method: ClassMethod::Unknown,
+                                aggressor_offset_mid_bp: None,
+                                aggressor_offset_touch_ticks: None,
+                                nbbo_bid: None,
+                                nbbo_ask: None,
+                                nbbo_bid_sz: None,
+                                nbbo_ask_sz: None,
+                                nbbo_ts_ns: None,
+                                nbbo_age_us: None,
+                                nbbo_state: None,
+                                tick_size_used: None,
                                 source: Source::Flatfile,
                                 quality: Quality::Prelim,
-                                watermark: Watermark {
-                                    watermark_ts_ns: 0, // Placeholder
-                                    completeness: Completeness::Complete,
-                                    hints: None,
-                                },
-                                schema_version: 1,
+                                watermark_ts_ns: 0,
+                                trade_id: Some(record[4].to_string()),
+                                seq: Some(record[7].parse().unwrap_or(0)),
+                                participant_ts_ns: Some(record[8].parse().unwrap_or(0)),
+                                tape: Some(record[10].to_string()),
+                                correction: Some(record[2].parse().unwrap_or(0)),
+                                trf_id: Some(record[11].to_string()),
+                                trf_ts_ns: Some(record[12].parse().unwrap_or(0)),
                             };
-                            let _ = tx_clone.try_send(DataBatch {
-                                rows: std::mem::take(&mut batch),
-                                meta,
-                            });
+                            batch.push(trade);
+                            if batch.len() == BATCH_SIZE {
+                                batch_count += 1;
+                                let meta = DataBatchMeta {
+                                    source: Source::Flatfile,
+                                    quality: Quality::Prelim,
+                                    watermark: Watermark {
+                                        watermark_ts_ns: 0, // Placeholder
+                                        completeness: Completeness::Complete,
+                                        hints: None,
+                                    },
+                                    schema_version: 1,
+                                };
+                                let _ = tx_clone.try_send(DataBatch {
+                                    rows: std::mem::take(&mut batch),
+                                    meta,
+                                });
+                            }
                         }
                     }
-                }
-                if !batch.is_empty() {
-                    batch_count += 1;
-                    let meta = DataBatchMeta {
-                        source: Source::Flatfile,
-                        quality: Quality::Prelim,
-                        watermark: Watermark {
-                            watermark_ts_ns: 0, // Placeholder
-                            completeness: Completeness::Complete,
-                            hints: None,
-                        },
-                        schema_version: 1,
-                    };
-                    let _ = tx_clone.try_send(DataBatch { rows: batch, meta });
-                }
-                info!("Processed {} records into {} batches for path: {}", record_count, batch_count, path_owned);
-            })
-            .await
-            .unwrap();
-        } else {
-            info!("Failed to collect bytes for path: {}", path);
+                    if !batch.is_empty() {
+                        batch_count += 1;
+                        let meta = DataBatchMeta {
+                            source: Source::Flatfile,
+                            quality: Quality::Prelim,
+                            watermark: Watermark {
+                                watermark_ts_ns: 0, // Placeholder
+                                completeness: Completeness::Complete,
+                                hints: None,
+                            },
+                            schema_version: 1,
+                        };
+                        let _ = tx_clone.try_send(DataBatch { rows: batch, meta });
+                    }
+                    info!("Processed {} records into {} batches for path: {}", record_count, batch_count, path_owned);
+                })
+                .await
+                .unwrap();
+            } else {
+                info!("Failed to collect bytes for path: {}", path);
+            }
         }
-    } else {
-        info!("Failed to get stream for path: {}", path);
+        Err(e) => {
+            info!("Failed to get stream for path: {}: {:?}", path, e);
+        }
     }
 }
 

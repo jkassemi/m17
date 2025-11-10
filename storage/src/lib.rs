@@ -375,7 +375,7 @@ mod tests {
     use core_types::types::{EquityTrade, Source, Quality, AggressorSide, ClassMethod, NbboState, DataBatchMeta, Watermark, Completeness};
     use std::fs;
     use tempfile::TempDir;
-    use parquet::arrow::ParquetFileArrowReader;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     #[test]
     fn test_serialize_equity_trade() {
@@ -426,7 +426,7 @@ mod tests {
         let storage = Storage::new(core_types::config::StorageConfig::default());
         let record_batch = storage.equity_trades_to_record_batch(&batch.rows, &batch.meta).unwrap();
         assert_eq!(record_batch.num_rows(), 1);
-        assert_eq!(record_batch.num_columns(), 27);
+        assert_eq!(record_batch.num_columns(), 28);
     }
 
     #[test]
@@ -498,14 +498,19 @@ mod tests {
         for entry in fs::read_dir(temp_dir.path().join("equity_trades")).unwrap() {
             let entry = entry.unwrap();
             if entry.path().is_dir() {
-                for file_entry in fs::read_dir(entry.path()).unwrap() {
-                    let file_entry = file_entry.unwrap();
-                    if file_entry.path().extension().unwrap_or_default() == "parquet" {
-                        let file = std::fs::File::open(&file_entry.path()).unwrap();
-                        let reader = ParquetFileArrowReader::new(file).unwrap();
-                        let mut record_reader = reader.get_record_reader(1024).unwrap();
-                        if let Some(record_batch) = record_reader.next() {
-                            total_rows += record_batch.unwrap().num_rows();
+                for sub_entry in fs::read_dir(entry.path()).unwrap() {
+                    let sub_entry = sub_entry.unwrap();
+                    if sub_entry.path().is_dir() {
+                        for file_entry in fs::read_dir(sub_entry.path()).unwrap() {
+                            let file_entry = file_entry.unwrap();
+                            if file_entry.path().extension().unwrap_or_default() == "parquet" {
+                                let file = std::fs::File::open(&file_entry.path()).unwrap();
+                                let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+                                let mut reader = builder.build().unwrap();
+                                if let Some(record_batch) = reader.next() {
+                                    total_rows += record_batch.unwrap().num_rows();
+                                }
+                            }
                         }
                     }
                 }

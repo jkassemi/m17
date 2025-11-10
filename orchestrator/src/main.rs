@@ -5,7 +5,7 @@
 use classifier::Classifier;
 use core_types::config::AppConfig;
 use data_client::DataClientRouter;
-use flatfile_source::FlatfileSource;
+use flatfile_source::{FlatfileSource, LocalFileStore};
 use metrics::Metrics;
 use nbbo_cache::NbboStore;
 use storage::Storage;
@@ -16,6 +16,7 @@ use tokio::sync::oneshot;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use tokio::time::sleep;
+use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() {
@@ -41,7 +42,8 @@ async fn main() {
     let _stream = ws_worker.run().await;
 
     // Launch flatfile source
-    let flatfile_source = FlatfileSource::new();
+    let local_store = LocalFileStore::new(PathBuf::from("data"));
+    let flatfile_source = FlatfileSource::new(Box::new(local_store));
     let flatfile_config = config.flatfile.clone();
     let metrics_clone_for_flatfile = metrics.clone();
     tokio::spawn(async move {

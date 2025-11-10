@@ -159,21 +159,6 @@ impl AppConfig {
             .add_source(config::Environment::default())
             .build()?;
         let config: Self = settings.try_deserialize()?;
-        if config.flatfile.polygonio_key.is_empty() {
-            return Err(ConfigError::Message(
-                "POLYGONIO_KEY is required".to_string(),
-            ));
-        }
-        if config.flatfile.polygonio_access_key_id.is_empty() {
-            return Err(ConfigError::Message(
-                "POLYGONIO_ACCESS_KEY_ID is required".to_string(),
-            ));
-        }
-        if config.flatfile.polygonio_secret_access_key.is_empty() {
-            return Err(ConfigError::Message(
-                "POLYGONIO_SECRET_ACCESS_KEY is required".to_string(),
-            ));
-        }
         Ok(config)
     }
 }

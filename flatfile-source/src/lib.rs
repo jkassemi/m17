@@ -1,12 +1,8 @@
-// Copyright (c) James Kassemi, SC, US. All rights reserved.
-
-//! Flatfile reader
-
 use async_compression::tokio::bufread::GzipDecoder;
 use async_trait::async_trait;
+use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{
-    config::{BehaviorVersion, Credentials},
     Client,
 };
 use bytes::Bytes;
@@ -80,6 +76,7 @@ impl FlatfileSource {
         );
         let s3_config = aws_sdk_s3::Config::builder()
             .endpoint_url("https://files.massive.com")
+            .region(Region::new("us-east-1"))
             .credentials_provider(credentials)
             .behavior_version(BehaviorVersion::latest())
             .build();
@@ -424,27 +421,27 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                             source: Source::Flatfile,
                             quality: Quality::Prelim,
                             watermark: Watermark {
-                                watermark_ts_ns: 0, // Placeholder
-                                completeness: Completeness::Complete,
-                                hints: None,
-                            },
-                            schema_version: 1,
-                        };
-                        let _ = tx_clone.try_send(DataBatch { rows: batch, meta });
+                                        watermark_ts_ns: 0, // Placeholder
+                                        completeness: Completeness::Complete,
+                                        hints: None,
+                                    },
+                                    schema_version: 1,
+                                };
+                                let _ = tx_clone.try_send(DataBatch { rows: batch, meta });
+                            }
+                            info!("Processed {} records into {} batches for path: {}", record_count, batch_count, path_owned);
+                        })
+                        .await
+                        .unwrap();
+                    } else {
+                        info!("Failed to collect bytes for path: {}", path);
                     }
-                    info!("Processed {} records into {} batches for path: {}", record_count, batch_count, path_owned);
-                })
-                .await
-                .unwrap();
-            } else {
-                info!("Failed to collect bytes for path: {}", path);
+                }
+                Err(e) => {
+                    info!("Failed to get stream for path: {}: {:?}", path, e);
+                }
             }
         }
-        Err(e) => {
-            info!("Failed to get stream for path: {}: {:?}", path, e);
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

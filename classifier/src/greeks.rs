@@ -1,9 +1,9 @@
+use black_scholes::*;
 use core_types::config::GreeksConfig;
 use core_types::types::{OptionTrade, TradeLike};
 use nbbo_cache::NbboStore;
 use std::sync::Arc;
-use tokio::sync::{Semaphore, RwLock};
-use black_scholes::*;
+use tokio::sync::{RwLock, Semaphore};
 
 // Flags bitfield
 pub const FLAG_NO_UNDERLYING: u32 = 0b0001;
@@ -21,7 +21,12 @@ pub struct GreeksEngine {
 impl GreeksEngine {
     pub fn new(cfg: GreeksConfig, nbbo: Arc<RwLock<NbboStore>>, staleness_us: u32) -> Self {
         let pool = Arc::new(Semaphore::new(std::cmp::max(1, cfg.pool_size)));
-        Self { cfg, pool, nbbo, staleness_us }
+        Self {
+            cfg,
+            pool,
+            nbbo,
+            staleness_us,
+        }
     }
 
     pub async fn enrich_batch(&self, trades: &mut [OptionTrade]) {
@@ -52,8 +57,12 @@ impl GreeksEngine {
             }
             // Inputs
             let k = t.strike_price;
-            let t_years = ((t.expiry_ts_ns - t.trade_ts_ns) as f64 / 1_000_000_000f64 / 31_536_000f64).max(0.0);
-            if t_years <= 0.0 { flags |= FLAG_TIME_EXPIRED; }
+            let t_years =
+                ((t.expiry_ts_ns - t.trade_ts_ns) as f64 / 1_000_000_000f64 / 31_536_000f64)
+                    .max(0.0);
+            if t_years <= 0.0 {
+                flags |= FLAG_TIME_EXPIRED;
+            }
 
             // Sigma (IV) optional; if None, skip for now
             let sigma = t.iv;
@@ -65,10 +74,26 @@ impl GreeksEngine {
 
             // Compute greeks via black_scholes crate
             let is_call = t.contract_direction == 'C';
-            let delta = if is_call { call_delta(s, k, r, sigma, t_years) } else { put_delta(s, k, r, sigma, t_years) };
-            let gamma = if is_call { call_gamma(s, k, r, sigma, t_years) } else { put_gamma(s, k, r, sigma, t_years) };
-            let vega = if is_call { call_vega(s, k, r, sigma, t_years) } else { put_vega(s, k, r, sigma, t_years) };
-            let theta = if is_call { call_theta(s, k, r, sigma, t_years) } else { put_theta(s, k, r, sigma, t_years) };
+            let delta = if is_call {
+                call_delta(s, k, r, sigma, t_years)
+            } else {
+                put_delta(s, k, r, sigma, t_years)
+            };
+            let gamma = if is_call {
+                call_gamma(s, k, r, sigma, t_years)
+            } else {
+                put_gamma(s, k, r, sigma, t_years)
+            };
+            let vega = if is_call {
+                call_vega(s, k, r, sigma, t_years)
+            } else {
+                put_vega(s, k, r, sigma, t_years)
+            };
+            let theta = if is_call {
+                call_theta(s, k, r, sigma, t_years)
+            } else {
+                put_theta(s, k, r, sigma, t_years)
+            };
             t.delta = Some(delta);
             t.gamma = Some(gamma);
             t.vega = Some(vega);

@@ -1,4 +1,4 @@
- // Copyright (c) James Kassemi, SC, US. All rights reserved.
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 
 //! Arrow/Parquet schemas (stub).
 
@@ -53,7 +53,11 @@ pub fn equity_trade_schema() -> Schema {
         Field::new("trade_ts_ns", DataType::Int64, false),
         Field::new("price", DataType::Float64, false),
         Field::new("size", DataType::UInt32, false),
-        Field::new("conditions", DataType::List(Arc::new(Field::new("item", DataType::Int32, true))), true),
+        Field::new(
+            "conditions",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        ),
         Field::new("exchange", DataType::Int32, false),
         Field::new("aggressor_side", DataType::Utf8, false),
         Field::new("class_method", DataType::Utf8, false),
@@ -86,4 +90,101 @@ pub fn nbbo_schema() -> Schema {
         Field::new("instrument_id", DataType::Utf8, false),
         // Add other fields as needed...
     ])
+}
+
+/// Aggregations schema.
+pub fn aggregation_schema() -> Schema {
+    let mut fields = vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new("window", DataType::Utf8, false),
+        Field::new("window_start_ns", DataType::Int64, false),
+        Field::new("window_end_ns", DataType::Int64, false),
+    ];
+    let metric_fields = [
+        "underlying_price_open",
+        "underlying_price_high",
+        "underlying_price_low",
+        "underlying_price_close",
+        "underlying_dollar_value_total",
+        "underlying_dollar_value_minimum",
+        "underlying_dollar_value_maximum",
+        "underlying_dollar_value_mean",
+        "underlying_dollar_value_stddev",
+        "underlying_dollar_value_skew",
+        "underlying_dollar_value_kurtosis",
+        "underlying_dollar_value_iqr",
+        "underlying_dollar_value_mad",
+        "underlying_dollar_value_cv",
+        "underlying_dollar_value_mode",
+        "underlying_dollar_value_bc",
+        "underlying_dollar_value_dip_pval",
+        "underlying_dollar_value_kde_peaks",
+        "puts_below_intrinsic_pct",
+        "puts_above_intrinsic_pct",
+        "puts_dadvv_total",
+        "puts_dadvv_minimum",
+        "puts_dadvv_maximum",
+        "puts_dadvv_mean",
+        "puts_dadvv_stddev",
+        "puts_dadvv_skew",
+        "puts_dadvv_kurtosis",
+        "puts_dadvv_iqr",
+        "puts_dadvv_mad",
+        "puts_dadvv_cv",
+        "puts_dadvv_mode",
+        "puts_dadvv_bc",
+        "puts_dadvv_dip_pval",
+        "puts_dadvv_kde_peaks",
+        "puts_gadvv_total",
+        "puts_gadvv_minimum",
+        "puts_gadvv_maximum",
+        "puts_gadvv_mean",
+        "puts_gadvv_stddev",
+        "puts_gadvv_skew",
+        "puts_gadvv_kurtosis",
+        "puts_gadvv_iqr",
+        "puts_gadvv_mad",
+        "puts_gadvv_cv",
+        "puts_gadvv_mode",
+        "puts_gadvv_bc",
+        "puts_gadvv_dip_pval",
+        "puts_gadvv_kde_peaks",
+        "calls_dollar_value",
+        "calls_above_intrinsic_pct",
+        "calls_dadvv_total",
+        "calls_dadvv_minimum",
+        "calls_dadvv_maximum",
+        "calls_dadvv_mean",
+        "calls_dadvv_stddev",
+        "calls_dadvv_skew",
+        "calls_dadvv_kurtosis",
+        "calls_dadvv_iqr",
+        "calls_dadvv_mad",
+        "calls_dadvv_cv",
+        "calls_dadvv_mode",
+        "calls_dadvv_bc",
+        "calls_dadvv_dip_pval",
+        "calls_dadvv_kde_peaks",
+        "calls_gadvv_total",
+        "calls_gadvv_minimum",
+        "calls_gadvv_q1",
+        "calls_gadvv_q2",
+        "calls_gadvv_q3",
+        "calls_gadvv_maximum",
+        "calls_gadvv_mean",
+        "calls_gadvv_stddev",
+        "calls_gadvv_skew",
+        "calls_gadvv_kurtosis",
+        "calls_gadvv_iqr",
+        "calls_gadvv_mad",
+        "calls_gadvv_cv",
+        "calls_gadvv_mode",
+        "calls_gadvv_bc",
+        "calls_gadvv_dip_pval",
+        "calls_gadvv_kde_peaks",
+    ];
+    for name in metric_fields.iter() {
+        fields.push(Field::new(*name, DataType::Float64, true));
+    }
+    Schema::new(fields)
 }

@@ -15,6 +15,13 @@ options_contract_limit = 800
 options_refresh_interval_s = 900
 batch_size = 512
 
+[aggregations]
+symbol = "SPY"
+windows = ["1m", "5m", "15m", "30m"]
+contract_size = 100
+risk_free_rate = 0.02
+dividend_yield = 0.0
+
 [ingest]
 batch_size = 20000
 concurrent_days = 4

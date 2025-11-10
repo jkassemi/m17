@@ -10,6 +10,7 @@ classifier = { path = "../classifier" }
 core-types = { path = "../core-types" }
 data-client = { path = "../data-client" }
 flatfile-source = { path = "../flatfile-source" }
+aggregations = { path = "../aggregations" }
 futures = "0.3"
 log = "0.4"
 metrics = { path = "../metrics" }

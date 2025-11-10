@@ -1,0 +1,9 @@
+[package]
+name = "aggregations"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core-types = { path = "../core-types" }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"

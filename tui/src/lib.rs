@@ -87,8 +87,8 @@ impl Tui {
             .direction(Direction::Vertical)
             .constraints(
                 [
-                    Constraint::Length(3), // ingestion progress
-                    Constraint::Length(3), // current file progress
+                    Constraint::Length(3),       // ingestion progress
+                    Constraint::Length(3),       // current file progress
                     Constraint::Percentage(100), // details
                 ]
                 .as_ref(),
@@ -131,7 +131,11 @@ impl Tui {
                 } else {
                     0.0
                 };
-                let ratio = if total > 0 { (read as f64) / (total as f64) } else { 0.0 };
+                let ratio = if total > 0 {
+                    (read as f64) / (total as f64)
+                } else {
+                    0.0
+                };
                 let label = if total > 0 {
                     format!(
                         "{}  {:.1}/{:.1} MB  {:.1} MB/s",
@@ -141,11 +145,7 @@ impl Tui {
                     format!("{}  {:.1} MB read  (unknown total)", name, read_mb)
                 };
                 let cf_gauge = Gauge::default()
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title("Current file"),
-                    )
+                    .block(Block::default().borders(Borders::ALL).title("Current file"))
                     .ratio(ratio)
                     .label(Span::styled(label, Style::default().fg(Color::White)));
                 f.render_widget(cf_gauge, chunks[1]);

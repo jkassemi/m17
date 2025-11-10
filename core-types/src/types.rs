@@ -178,6 +178,96 @@ pub struct DataBatchMeta {
     pub schema_version: u16,
 }
 
+/// Aggregated feature row per window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregationRow {
+    pub symbol: String,
+    pub window: String,
+    pub window_start_ns: i64,
+    pub window_end_ns: i64,
+    pub underlying_price_open: Option<f64>,
+    pub underlying_price_high: Option<f64>,
+    pub underlying_price_low: Option<f64>,
+    pub underlying_price_close: Option<f64>,
+    pub underlying_dollar_value_total: Option<f64>,
+    pub underlying_dollar_value_minimum: Option<f64>,
+    pub underlying_dollar_value_maximum: Option<f64>,
+    pub underlying_dollar_value_mean: Option<f64>,
+    pub underlying_dollar_value_stddev: Option<f64>,
+    pub underlying_dollar_value_skew: Option<f64>,
+    pub underlying_dollar_value_kurtosis: Option<f64>,
+    pub underlying_dollar_value_iqr: Option<f64>,
+    pub underlying_dollar_value_mad: Option<f64>,
+    pub underlying_dollar_value_cv: Option<f64>,
+    pub underlying_dollar_value_mode: Option<f64>,
+    pub underlying_dollar_value_bc: Option<f64>,
+    pub underlying_dollar_value_dip_pval: Option<f64>,
+    pub underlying_dollar_value_kde_peaks: Option<f64>,
+    pub puts_below_intrinsic_pct: Option<f64>,
+    pub puts_above_intrinsic_pct: Option<f64>,
+    pub puts_dadvv_total: Option<f64>,
+    pub puts_dadvv_minimum: Option<f64>,
+    pub puts_dadvv_maximum: Option<f64>,
+    pub puts_dadvv_mean: Option<f64>,
+    pub puts_dadvv_stddev: Option<f64>,
+    pub puts_dadvv_skew: Option<f64>,
+    pub puts_dadvv_kurtosis: Option<f64>,
+    pub puts_dadvv_iqr: Option<f64>,
+    pub puts_dadvv_mad: Option<f64>,
+    pub puts_dadvv_cv: Option<f64>,
+    pub puts_dadvv_mode: Option<f64>,
+    pub puts_dadvv_bc: Option<f64>,
+    pub puts_dadvv_dip_pval: Option<f64>,
+    pub puts_dadvv_kde_peaks: Option<f64>,
+    pub puts_gadvv_total: Option<f64>,
+    pub puts_gadvv_minimum: Option<f64>,
+    pub puts_gadvv_maximum: Option<f64>,
+    pub puts_gadvv_mean: Option<f64>,
+    pub puts_gadvv_stddev: Option<f64>,
+    pub puts_gadvv_skew: Option<f64>,
+    pub puts_gadvv_kurtosis: Option<f64>,
+    pub puts_gadvv_iqr: Option<f64>,
+    pub puts_gadvv_mad: Option<f64>,
+    pub puts_gadvv_cv: Option<f64>,
+    pub puts_gadvv_mode: Option<f64>,
+    pub puts_gadvv_bc: Option<f64>,
+    pub puts_gadvv_dip_pval: Option<f64>,
+    pub puts_gadvv_kde_peaks: Option<f64>,
+    pub calls_dollar_value: Option<f64>,
+    pub calls_above_intrinsic_pct: Option<f64>,
+    pub calls_dadvv_total: Option<f64>,
+    pub calls_dadvv_minimum: Option<f64>,
+    pub calls_dadvv_maximum: Option<f64>,
+    pub calls_dadvv_mean: Option<f64>,
+    pub calls_dadvv_stddev: Option<f64>,
+    pub calls_dadvv_skew: Option<f64>,
+    pub calls_dadvv_kurtosis: Option<f64>,
+    pub calls_dadvv_iqr: Option<f64>,
+    pub calls_dadvv_mad: Option<f64>,
+    pub calls_dadvv_cv: Option<f64>,
+    pub calls_dadvv_mode: Option<f64>,
+    pub calls_dadvv_bc: Option<f64>,
+    pub calls_dadvv_dip_pval: Option<f64>,
+    pub calls_dadvv_kde_peaks: Option<f64>,
+    pub calls_gadvv_total: Option<f64>,
+    pub calls_gadvv_minimum: Option<f64>,
+    pub calls_gadvv_q1: Option<f64>,
+    pub calls_gadvv_q2: Option<f64>,
+    pub calls_gadvv_q3: Option<f64>,
+    pub calls_gadvv_maximum: Option<f64>,
+    pub calls_gadvv_mean: Option<f64>,
+    pub calls_gadvv_stddev: Option<f64>,
+    pub calls_gadvv_skew: Option<f64>,
+    pub calls_gadvv_kurtosis: Option<f64>,
+    pub calls_gadvv_iqr: Option<f64>,
+    pub calls_gadvv_mad: Option<f64>,
+    pub calls_gadvv_cv: Option<f64>,
+    pub calls_gadvv_mode: Option<f64>,
+    pub calls_gadvv_bc: Option<f64>,
+    pub calls_gadvv_dip_pval: Option<f64>,
+    pub calls_gadvv_kde_peaks: Option<f64>,
+}
+
 /// ClassParams (stub).
 #[derive(Debug, Clone)]
 pub struct ClassParams {
@@ -200,32 +290,99 @@ pub trait TradeLike {
     fn set_aggressor_side(&mut self, side: AggressorSide);
     fn set_class_method(&mut self, method: ClassMethod);
     fn set_aggressor_offset_mid_bp(&mut self, offset: Option<i32>);
-    fn set_nbbo_snapshot(&mut self, bid: Option<f64>, ask: Option<f64>, bid_sz: Option<u32>, ask_sz: Option<u32>, ts_ns: Option<i64>, age_us: Option<u32>, state: Option<NbboState>);
+    fn set_nbbo_snapshot(
+        &mut self,
+        bid: Option<f64>,
+        ask: Option<f64>,
+        bid_sz: Option<u32>,
+        ask_sz: Option<u32>,
+        ts_ns: Option<i64>,
+        age_us: Option<u32>,
+        state: Option<NbboState>,
+    );
     fn set_tick_size_used(&mut self, size: Option<f64>);
 }
 
 impl TradeLike for OptionTrade {
-    fn instrument_id(&self) -> &str { &self.contract }
-    fn trade_ts_ns(&self) -> i64 { self.trade_ts_ns }
-    fn price(&self) -> f64 { self.price }
-    fn set_aggressor_side(&mut self, side: AggressorSide) { self.aggressor_side = side; }
-    fn set_class_method(&mut self, method: ClassMethod) { self.class_method = method; }
-    fn set_aggressor_offset_mid_bp(&mut self, offset: Option<i32>) { self.aggressor_offset_mid_bp = offset; }
-    fn set_nbbo_snapshot(&mut self, bid: Option<f64>, ask: Option<f64>, bid_sz: Option<u32>, ask_sz: Option<u32>, ts_ns: Option<i64>, age_us: Option<u32>, state: Option<NbboState>) {
-        self.nbbo_bid = bid; self.nbbo_ask = ask; self.nbbo_bid_sz = bid_sz; self.nbbo_ask_sz = ask_sz; self.nbbo_ts_ns = ts_ns; self.nbbo_age_us = age_us; self.nbbo_state = state;
+    fn instrument_id(&self) -> &str {
+        &self.contract
     }
-    fn set_tick_size_used(&mut self, size: Option<f64>) { self.tick_size_used = size; }
+    fn trade_ts_ns(&self) -> i64 {
+        self.trade_ts_ns
+    }
+    fn price(&self) -> f64 {
+        self.price
+    }
+    fn set_aggressor_side(&mut self, side: AggressorSide) {
+        self.aggressor_side = side;
+    }
+    fn set_class_method(&mut self, method: ClassMethod) {
+        self.class_method = method;
+    }
+    fn set_aggressor_offset_mid_bp(&mut self, offset: Option<i32>) {
+        self.aggressor_offset_mid_bp = offset;
+    }
+    fn set_nbbo_snapshot(
+        &mut self,
+        bid: Option<f64>,
+        ask: Option<f64>,
+        bid_sz: Option<u32>,
+        ask_sz: Option<u32>,
+        ts_ns: Option<i64>,
+        age_us: Option<u32>,
+        state: Option<NbboState>,
+    ) {
+        self.nbbo_bid = bid;
+        self.nbbo_ask = ask;
+        self.nbbo_bid_sz = bid_sz;
+        self.nbbo_ask_sz = ask_sz;
+        self.nbbo_ts_ns = ts_ns;
+        self.nbbo_age_us = age_us;
+        self.nbbo_state = state;
+    }
+    fn set_tick_size_used(&mut self, size: Option<f64>) {
+        self.tick_size_used = size;
+    }
 }
 
 impl TradeLike for EquityTrade {
-    fn instrument_id(&self) -> &str { &self.symbol }
-    fn trade_ts_ns(&self) -> i64 { self.trade_ts_ns }
-    fn price(&self) -> f64 { self.price }
-    fn set_aggressor_side(&mut self, side: AggressorSide) { self.aggressor_side = side; }
-    fn set_class_method(&mut self, method: ClassMethod) { self.class_method = method; }
-    fn set_aggressor_offset_mid_bp(&mut self, offset: Option<i32>) { self.aggressor_offset_mid_bp = offset; }
-    fn set_nbbo_snapshot(&mut self, bid: Option<f64>, ask: Option<f64>, bid_sz: Option<u32>, ask_sz: Option<u32>, ts_ns: Option<i64>, age_us: Option<u32>, state: Option<NbboState>) {
-        self.nbbo_bid = bid; self.nbbo_ask = ask; self.nbbo_bid_sz = bid_sz; self.nbbo_ask_sz = ask_sz; self.nbbo_ts_ns = ts_ns; self.nbbo_age_us = age_us; self.nbbo_state = state;
+    fn instrument_id(&self) -> &str {
+        &self.symbol
     }
-    fn set_tick_size_used(&mut self, size: Option<f64>) { self.tick_size_used = size; }
+    fn trade_ts_ns(&self) -> i64 {
+        self.trade_ts_ns
+    }
+    fn price(&self) -> f64 {
+        self.price
+    }
+    fn set_aggressor_side(&mut self, side: AggressorSide) {
+        self.aggressor_side = side;
+    }
+    fn set_class_method(&mut self, method: ClassMethod) {
+        self.class_method = method;
+    }
+    fn set_aggressor_offset_mid_bp(&mut self, offset: Option<i32>) {
+        self.aggressor_offset_mid_bp = offset;
+    }
+    fn set_nbbo_snapshot(
+        &mut self,
+        bid: Option<f64>,
+        ask: Option<f64>,
+        bid_sz: Option<u32>,
+        ask_sz: Option<u32>,
+        ts_ns: Option<i64>,
+        age_us: Option<u32>,
+        state: Option<NbboState>,
+    ) {
+        self.nbbo_bid = bid;
+        self.nbbo_ask = ask;
+        self.nbbo_bid_sz = bid_sz;
+        self.nbbo_ask_sz = ask_sz;
+        self.nbbo_ts_ns = ts_ns;
+        self.nbbo_age_us = age_us;
+        self.nbbo_state = state;
+    }
+    fn set_tick_size_used(&mut self, size: Option<f64>) {
+        self.tick_size_used = size;
+    }
 }

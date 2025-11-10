@@ -9,6 +9,8 @@ pub struct AppConfig {
     pub staleness: StalenessConfig,
     pub classifier: ClassifierConfig,
     pub greeks: GreeksConfig,
+    #[serde(default)]
+    pub aggregations: AggregationsConfig,
     pub storage: StorageConfig,
     pub rest: RestConfig,
     pub scheduler: SchedulerConfig,
@@ -65,6 +67,45 @@ fn default_options_refresh_interval_s() -> u64 {
 
 fn default_ws_batch_size() -> usize {
     1000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AggregationsConfig {
+    #[serde(default = "default_agg_windows")]
+    pub windows: Vec<String>,
+    #[serde(default = "default_agg_symbol")]
+    pub symbol: String,
+    #[serde(default = "default_contract_size")]
+    pub contract_size: u32,
+    #[serde(default = "default_agg_rfr")]
+    pub risk_free_rate: f64,
+    #[serde(default = "default_agg_dividend")]
+    pub dividend_yield: f64,
+}
+
+fn default_agg_windows() -> Vec<String> {
+    vec![
+        "1m".to_string(),
+        "5m".to_string(),
+        "15m".to_string(),
+        "30m".to_string(),
+    ]
+}
+
+fn default_agg_symbol() -> String {
+    "SPY".to_string()
+}
+
+fn default_contract_size() -> u32 {
+    100
+}
+
+fn default_agg_rfr() -> f64 {
+    0.02
+}
+
+fn default_agg_dividend() -> f64 {
+    0.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -129,8 +170,12 @@ fn default_dividend_yield() -> f64 {
     0.0
 }
 
-fn default_flatfile_underlying_staleness_us() -> u32 { 1_000_000 }
-fn default_realtime_underlying_staleness_us() -> u32 { 1_000_000 }
+fn default_flatfile_underlying_staleness_us() -> u32 {
+    1_000_000
+}
+fn default_realtime_underlying_staleness_us() -> u32 {
+    1_000_000
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StorageConfig {

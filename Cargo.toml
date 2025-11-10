@@ -8,6 +8,7 @@ members = [
   "core-types",
   "data-client",
   "flatfile-source",
+  "aggregations",
   "metrics",
   "nbbo-cache",
   "orchestrator",

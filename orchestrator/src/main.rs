@@ -2,11 +2,16 @@
 
 //! Main runtime with Tokio.
 
+use aggregations::{AggregationEvent, AggregationsEngine};
 use chrono::{DateTime, NaiveDate, Utc};
 use classifier::Classifier;
-mod greeks_mod { pub use classifier::greeks::*; }
+mod greeks_mod {
+    pub use classifier::greeks::*;
+}
 use core_types::config::AppConfig;
-use core_types::types::{Completeness, DataBatch, DataBatchMeta, OptionTrade, Quality, Source, Watermark};
+use core_types::types::{
+    Completeness, DataBatch, DataBatchMeta, OptionTrade, Quality, Source, Watermark,
+};
 use flatfile_source::FlatfileSource;
 use flatfile_source::SourceTrait;
 use futures::StreamExt;
@@ -27,7 +32,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::sync::RwLock as TokioRwLock;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::time::sleep;
 use tui::Tui;
 use ws_source::worker::{ResourceKind, SubscriptionSource, WsMessage, WsWorker};
@@ -77,6 +82,47 @@ async fn main() {
         config.greeks.realtime_underlying_staleness_us,
     );
     let storage = Arc::new(Mutex::new(Storage::new(config.storage)));
+
+    let aggregator_sender = if !config.aggregations.symbol.trim().is_empty() {
+        match AggregationsEngine::new(config.aggregations.clone()) {
+            Ok(mut engine) => {
+                let (tx, mut rx) = mpsc::channel(4096);
+                let storage_clone = storage.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = rx.recv().await {
+                        let rows = engine.ingest(event);
+                        if rows.is_empty() {
+                            continue;
+                        }
+                        let watermark = rows.last().map(|r| r.window_end_ns).unwrap_or(0);
+                        let batch = DataBatch {
+                            rows,
+                            meta: DataBatchMeta {
+                                source: Source::Ws,
+                                quality: Quality::Prelim,
+                                watermark: Watermark {
+                                    watermark_ts_ns: watermark,
+                                    completeness: Completeness::Partial,
+                                    hints: None,
+                                },
+                                schema_version: 1,
+                            },
+                        };
+                        if let Err(e) = storage_clone.lock().unwrap().write_aggregations(&batch) {
+                            eprintln!("aggregation write error: {}", e);
+                        }
+                    }
+                });
+                Some(tx)
+            }
+            Err(e) => {
+                eprintln!("failed to initialize aggregations engine: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let mut planned_days: u64 = 0;
     for range in &config.flatfile.date_ranges {
@@ -285,16 +331,29 @@ async fn main() {
             tokio::spawn(async move {
                 info!("Seeding NBBO for day: {}", current_date.format("%Y-%m-%d"));
                 // Seed NBBO cache from flatfile equities quotes for the day
-                let mut nbbo_stream = flatfile_source_for_options.get_nbbo(scope_opt.clone()).await;
+                let mut nbbo_stream = flatfile_source_for_options
+                    .get_nbbo(scope_opt.clone())
+                    .await;
                 let mut last_ts = None;
                 while let Some(batch) = nbbo_stream.next().await {
                     let mut guard = nbbo_flatfile_clone.write().await;
-                    for q in batch.rows.iter() { guard.put(q); }
-                    if let Some(q) = batch.rows.last() { last_ts = Some(q.quote_ts_ns); }
-                    if let Some(ts) = last_ts { guard.prune_before(ts.saturating_sub(2_000_000_000)); } // keep ~2s tail
+                    for q in batch.rows.iter() {
+                        guard.put(q);
+                    }
+                    if let Some(q) = batch.rows.last() {
+                        last_ts = Some(q.quote_ts_ns);
+                    }
+                    if let Some(ts) = last_ts {
+                        guard.prune_before(ts.saturating_sub(2_000_000_000));
+                    } // keep ~2s tail
                 }
-                info!("Processing options (OPRA) day: {}", current_date.format("%Y-%m-%d"));
-                let mut stream = flatfile_source_for_options.get_option_trades(scope_opt).await;
+                info!(
+                    "Processing options (OPRA) day: {}",
+                    current_date.format("%Y-%m-%d")
+                );
+                let mut stream = flatfile_source_for_options
+                    .get_option_trades(scope_opt)
+                    .await;
                 let mut batch_count = 0u64;
                 let mut row_count = 0u64;
                 while let Some(mut batch) = stream.next().await {
@@ -326,6 +385,7 @@ async fn main() {
     {
         let ws_cfg = config.ws.clone();
         let underlying = ws_cfg.underlying_symbol.trim().to_string();
+        let agg_symbol = config.aggregations.symbol.trim().to_string();
         if underlying.is_empty() {
             eprintln!("ws underlying_symbol is empty; skipping realtime feeds");
         } else {
@@ -355,6 +415,30 @@ async fn main() {
             });
         }
 
+        if let Some(sender) = aggregator_sender.clone() {
+            if !agg_symbol.is_empty() {
+                let trades_worker = WsWorker::new(
+                    &ws_cfg.stocks_ws_url,
+                    ResourceKind::EquityTrades,
+                    ws_cfg.api_key.clone(),
+                    SubscriptionSource::Static(vec![format!("T.{}", agg_symbol)]),
+                );
+                tokio::spawn(async move {
+                    match trades_worker.stream().await {
+                        Ok(mut stream) => {
+                            while let Some(msg) = stream.next().await {
+                                if let WsMessage::EquityTrade(trade) = msg {
+                                    let _ =
+                                        sender.send(AggregationEvent::UnderlyingTrade(trade)).await;
+                                }
+                            }
+                        }
+                        Err(err) => eprintln!("ws equities trade stream error: {}", err),
+                    }
+                });
+            }
+        }
+
         let options_sub_rx = spawn_options_subscription_task(ws_cfg.clone());
         if let Some(options_rx) = options_sub_rx {
             let options_worker = WsWorker::new(
@@ -367,20 +451,53 @@ async fn main() {
             let metrics_rt = metrics.clone();
             let greeks_rt = greeks_engine_rt.clone();
             let batch_cap = std::cmp::max(1, ws_cfg.batch_size);
+            let agg_sender_options = aggregator_sender.clone();
+            let nbbo_lookup_for_agg = nbbo_realtime.clone();
+            let staleness_us = config.greeks.realtime_underlying_staleness_us;
             tokio::spawn(async move {
                 match options_worker.stream().await {
                     Ok(mut stream) => {
                         let mut pending: Vec<OptionTrade> = Vec::with_capacity(batch_cap);
                         while let Some(msg) = stream.next().await {
                             if let WsMessage::OptionTrade(trade) = msg {
+                                if let Some(sender) = &agg_sender_options {
+                                    let underlying_price = {
+                                        let store = nbbo_lookup_for_agg.read().await;
+                                        store
+                                            .get_best_before(
+                                                &trade.underlying,
+                                                trade.trade_ts_ns,
+                                                staleness_us,
+                                            )
+                                            .map(|q| q.bid)
+                                    };
+                                    let _ = sender
+                                        .send(AggregationEvent::OptionTrade {
+                                            trade: trade.clone(),
+                                            underlying_price,
+                                        })
+                                        .await;
+                                }
                                 pending.push(trade);
                                 if pending.len() >= batch_cap {
-                                    persist_realtime_options(&mut pending, &greeks_rt, &storage_rt, &metrics_rt).await;
+                                    persist_realtime_options(
+                                        &mut pending,
+                                        &greeks_rt,
+                                        &storage_rt,
+                                        &metrics_rt,
+                                    )
+                                    .await;
                                 }
                             }
                         }
                         if !pending.is_empty() {
-                            persist_realtime_options(&mut pending, &greeks_rt, &storage_rt, &metrics_rt).await;
+                            persist_realtime_options(
+                                &mut pending,
+                                &greeks_rt,
+                                &storage_rt,
+                                &metrics_rt,
+                            )
+                            .await;
                         }
                     }
                     Err(err) => {
@@ -455,15 +572,7 @@ fn spawn_options_subscription_task(
             } else {
                 first = false;
             }
-            match fetch_top_options_contracts(
-                &client,
-                &rest_base,
-                &api_key,
-                &symbol,
-                limit,
-            )
-            .await
-            {
+            match fetch_top_options_contracts(&client, &rest_base, &api_key, &symbol, limit).await {
                 Ok(contracts) => {
                     let subs: Vec<String> =
                         contracts.into_iter().map(|c| format!("T.{}", c)).collect();

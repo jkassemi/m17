@@ -14,10 +14,11 @@ use core_types::types::{
 use csv_async::AsyncReaderBuilder;
 use futures::{Stream, StreamExt, TryStreamExt};
 use log::info;
+use metrics::Metrics;
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::sync::mpsc;
@@ -25,7 +26,6 @@ use tokio::time::{sleep, Duration, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::{ReaderStream, StreamReader};
 use trading_calendar::{Market, TradingCalendar};
-use metrics::Metrics;
 
 /// Combined source trait merging ObjectStore, UpdateLoop, and Queryable.
 #[async_trait]
@@ -166,12 +166,7 @@ impl SourceTrait for FlatfileSource {
         if fs::try_exists(&local_path).await? {
             let file = File::open(&local_path).await?;
             let reader = BufReader::new(file);
-            let stream: Pin<
-                Box<
-                    dyn Stream<Item = Result<Bytes, std::io::Error>>
-                        + Send,
-                >,
-            >;
+            let stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
             if path.ends_with(".gz") {
                 let decoder = GzipDecoder::new(reader);
                 stream = Box::pin(ReaderStream::new(decoder));
@@ -189,12 +184,7 @@ impl SourceTrait for FlatfileSource {
                 .await?;
             let body: ByteStream = resp.body;
             let reader = body.into_async_read();
-            let stream: Pin<
-                Box<
-                    dyn Stream<Item = Result<Bytes, std::io::Error>>
-                        + Send,
-                >,
-            >;
+            let stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
             if path.ends_with(".gz") {
                 let buf_reader = BufReader::new(reader);
                 let decoder = GzipDecoder::new(buf_reader);
@@ -566,11 +556,10 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                             },
                             schema_version: 1,
                         };
-                        let _ = tx
-                            .try_send(DataBatch {
-                                rows: std::mem::take(&mut batch),
-                                meta,
-                            });
+                        let _ = tx.try_send(DataBatch {
+                            rows: std::mem::take(&mut batch),
+                            meta,
+                        });
                     }
                 }
                 if let Some(m) = metrics.as_ref() {
@@ -666,9 +655,10 @@ async fn process_nbbo_stream<S: SourceTrait>(
                     let bid_ex: i32 = record[4].parse().unwrap_or(0);
                     let bid: f64 = record[5].parse().unwrap_or(0.0);
                     let bid_sz: u32 = record[6].parse().unwrap_or(0);
-                    let cond_opt: Option<i32> = record
-                        .get(7)
-                        .and_then(|s| if s.is_empty() { None } else { s.parse().ok() });
+                    let cond_opt: Option<i32> =
+                        record
+                            .get(7)
+                            .and_then(|s| if s.is_empty() { None } else { s.parse().ok() });
                     let sip_ts: i64 = record[11].parse().unwrap_or(0);
                     // Infer state
                     let state = if ask > 0.0 {
@@ -703,10 +693,17 @@ async fn process_nbbo_stream<S: SourceTrait>(
                         let meta = DataBatchMeta {
                             source: Source::Flatfile,
                             quality: Quality::Prelim,
-                            watermark: Watermark { watermark_ts_ns: 0, completeness: Completeness::Complete, hints: None },
+                            watermark: Watermark {
+                                watermark_ts_ns: 0,
+                                completeness: Completeness::Complete,
+                                hints: None,
+                            },
                             schema_version: 1,
                         };
-                        let _ = tx.try_send(DataBatch { rows: std::mem::take(&mut batch), meta });
+                        let _ = tx.try_send(DataBatch {
+                            rows: std::mem::take(&mut batch),
+                            meta,
+                        });
                     }
                 }
                 if let Some(m) = metrics.as_ref() {
@@ -721,7 +718,11 @@ async fn process_nbbo_stream<S: SourceTrait>(
                 let meta = DataBatchMeta {
                     source: Source::Flatfile,
                     quality: Quality::Prelim,
-                    watermark: Watermark { watermark_ts_ns: 0, completeness: Completeness::Complete, hints: None },
+                    watermark: Watermark {
+                        watermark_ts_ns: 0,
+                        completeness: Completeness::Complete,
+                        hints: None,
+                    },
                     schema_version: 1,
                 };
                 let _ = tx.try_send(DataBatch { rows: batch, meta });
@@ -730,7 +731,11 @@ async fn process_nbbo_stream<S: SourceTrait>(
             if let Some(m) = metrics.as_ref() {
                 if let Some(total) = total_len {
                     let read = bytes_read.load(Ordering::Relaxed);
-                    if read < total { m.set_current_file_read(total); } else { m.set_current_file_read(read); }
+                    if read < total {
+                        m.set_current_file_read(total);
+                    } else {
+                        m.set_current_file_read(read);
+                    }
                 } else {
                     m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
                 }
@@ -782,7 +787,10 @@ async fn process_option_trades_stream<S: SourceTrait>(
                     }
 
                     let (contract_direction, strike_price, expiry_ts_ns, underlying) =
-                        parse_opra_contract(&contract, record.get(6).and_then(|s| s.parse::<i64>().ok()));
+                        parse_opra_contract(
+                            &contract,
+                            record.get(6).and_then(|s| s.parse::<i64>().ok()),
+                        );
 
                     let trade = OptionTrade {
                         contract: contract.clone(),
@@ -832,7 +840,10 @@ async fn process_option_trades_stream<S: SourceTrait>(
                             },
                             schema_version: 1,
                         };
-                        let _ = tx.try_send(DataBatch { rows: std::mem::take(&mut batch), meta });
+                        let _ = tx.try_send(DataBatch {
+                            rows: std::mem::take(&mut batch),
+                            meta,
+                        });
                     }
                 }
                 if let Some(m) = metrics.as_ref() {
@@ -860,7 +871,11 @@ async fn process_option_trades_stream<S: SourceTrait>(
             if let Some(m) = metrics.as_ref() {
                 if let Some(total) = total_len {
                     let read = bytes_read.load(Ordering::Relaxed);
-                    if read < total { m.set_current_file_read(total); } else { m.set_current_file_read(read); }
+                    if read < total {
+                        m.set_current_file_read(total);
+                    } else {
+                        m.set_current_file_read(read);
+                    }
                 } else {
                     m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
                 }
@@ -900,24 +915,14 @@ mod tests {
             &self,
             path: &str,
         ) -> Result<
-            Pin<
-                Box<
-                    dyn Stream<Item = Result<Bytes, std::io::Error>>
-                        + Send,
-                >,
-            >,
+            Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             let full_path = self.base_path.join(path);
             let file = File::open(&full_path).await?;
             let reader = BufReader::new(file);
 
-            let stream: Pin<
-                Box<
-                    dyn Stream<Item = Result<Bytes, std::io::Error>>
-                        + Send,
-                >,
-            >;
+            let stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
             if path.ends_with(".gz") {
                 let decoder = GzipDecoder::new(reader);
                 stream = Box::pin(ReaderStream::new(decoder));
@@ -962,16 +967,8 @@ mod tests {
             let scope_clone = scope.clone();
             tokio::spawn(async move {
                 let path = "stock_trades_sample.csv.gz";
-                process_equity_trades_stream(
-                    &self_clone,
-                    path,
-                    &scope_clone,
-                    tx,
-                    1000,
-                    250,
-                    None,
-                )
-                .await;
+                process_equity_trades_stream(&self_clone, path, &scope_clone, tx, 1000, 250, None)
+                    .await;
             });
             Box::pin(ReceiverStream::new(rx))
         }

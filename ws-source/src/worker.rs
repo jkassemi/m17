@@ -4,7 +4,7 @@
 
 use core_types::opra::parse_opra_contract;
 use core_types::types::{
-    AggressorSide, ClassMethod, Nbbo, NbboState, OptionTrade, Quality, Source,
+    AggressorSide, ClassMethod, EquityTrade, Nbbo, NbboState, OptionTrade, Quality, Source,
 };
 use futures::{
     stream::{SplitSink, SplitStream},
@@ -22,14 +22,11 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::{
-    connect_async,
-    tungstenite::protocol::Message as WsTextMessage,
-    WebSocketStream,
+    connect_async, tungstenite::protocol::Message as WsTextMessage, WebSocketStream,
 };
 use url::Url;
 
-type Socket =
-    WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type Socket = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type SocketSink = SplitSink<Socket, WsTextMessage>;
 
 /// Output emitted by a [`WsWorker`].
@@ -37,6 +34,7 @@ type SocketSink = SplitSink<Socket, WsTextMessage>;
 pub enum WsMessage {
     Nbbo(Nbbo),
     OptionTrade(OptionTrade),
+    EquityTrade(EquityTrade),
 }
 
 pub type WsStream = Pin<Box<dyn Stream<Item = WsMessage> + Send>>;
@@ -44,6 +42,7 @@ pub type WsStream = Pin<Box<dyn Stream<Item = WsMessage> + Send>>;
 #[derive(Debug, Clone, Copy)]
 pub enum ResourceKind {
     EquityQuotes,
+    EquityTrades,
     OptionsTrades,
 }
 
@@ -146,7 +145,11 @@ async fn handle_connection(
 ) -> Result<(), WsError> {
     let writer = Arc::new(Mutex::new(write));
     if let Some(key) = api_key.clone() {
-        send_text(&writer, serde_json::json!({"action":"auth","params": key}).to_string()).await?;
+        send_text(
+            &writer,
+            serde_json::json!({"action":"auth","params": key}).to_string(),
+        )
+        .await?;
     }
 
     let current = subscriptions.snapshot();
@@ -185,19 +188,13 @@ async fn handle_connection(
     while let Some(msg) = read.next().await {
         match msg {
             Ok(WsTextMessage::Text(text)) => {
-                if handle_incoming_text(&text, resource, &tx)
-                    .await
-                    .is_err()
-                {
+                if handle_incoming_text(&text, resource, &tx).await.is_err() {
                     break;
                 }
             }
             Ok(WsTextMessage::Binary(bin)) => {
                 if let Ok(text) = String::from_utf8(bin.to_vec()) {
-                    if handle_incoming_text(&text, resource, &tx)
-                        .await
-                        .is_err()
-                    {
+                    if handle_incoming_text(&text, resource, &tx).await.is_err() {
                         break;
                     }
                 }
@@ -305,6 +302,12 @@ fn decode_value(value: &Value, resource: ResourceKind) -> Option<WsMessage> {
                 .and_then(raw_quote_to_nbbo)
                 .map(WsMessage::Nbbo)
         }
+        ResourceKind::EquityTrades if ev == "T" => {
+            serde_json::from_value::<RawEquityTrade>(value.clone())
+                .ok()
+                .and_then(raw_equity_trade_to_row)
+                .map(WsMessage::EquityTrade)
+        }
         ResourceKind::OptionsTrades if ev == "T" => {
             serde_json::from_value::<RawOptionTrade>(value.clone())
                 .ok()
@@ -390,6 +393,40 @@ fn millis_to_ns(ms: i64) -> i64 {
     ms.saturating_mul(1_000_000)
 }
 
+fn raw_equity_trade_to_row(raw: RawEquityTrade) -> Option<EquityTrade> {
+    let symbol = raw.sym?;
+    Some(EquityTrade {
+        symbol,
+        trade_ts_ns: millis_to_ns(raw.ts_ms),
+        price: raw.price,
+        size: raw.size.unwrap_or(0),
+        conditions: raw.conditions.unwrap_or_default(),
+        exchange: raw.exchange.unwrap_or(0),
+        aggressor_side: AggressorSide::Unknown,
+        class_method: ClassMethod::Unknown,
+        aggressor_offset_mid_bp: None,
+        aggressor_offset_touch_ticks: None,
+        nbbo_bid: None,
+        nbbo_ask: None,
+        nbbo_bid_sz: None,
+        nbbo_ask_sz: None,
+        nbbo_ts_ns: None,
+        nbbo_age_us: None,
+        nbbo_state: None,
+        tick_size_used: None,
+        source: Source::Ws,
+        quality: Quality::Prelim,
+        watermark_ts_ns: millis_to_ns(raw.ts_ms),
+        trade_id: raw.trade_id,
+        seq: None,
+        participant_ts_ns: None,
+        tape: None,
+        correction: None,
+        trf_id: None,
+        trf_ts_ns: None,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct RawQuote {
     #[serde(rename = "sym")]
@@ -426,6 +463,24 @@ struct RawOptionTrade {
     exchange: Option<i32>,
     #[serde(rename = "t")]
     ts_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawEquityTrade {
+    #[serde(rename = "sym")]
+    sym: Option<String>,
+    #[serde(rename = "p")]
+    price: f64,
+    #[serde(rename = "q")]
+    size: Option<u32>,
+    #[serde(rename = "c", default)]
+    conditions: Option<Vec<i32>>,
+    #[serde(rename = "x")]
+    exchange: Option<i32>,
+    #[serde(rename = "t")]
+    ts_ms: i64,
+    #[serde(rename = "i")]
+    trade_id: Option<String>,
 }
 
 #[derive(Debug, Error)]

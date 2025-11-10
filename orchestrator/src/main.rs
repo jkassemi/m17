@@ -6,6 +6,7 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use classifier::Classifier;
 use core_types::config::AppConfig;
 use flatfile_source::FlatfileSource;
+use flatfile_source::SourceTrait;
 use futures::StreamExt;
 use metrics::Metrics;
 use nbbo_cache::NbboStore;

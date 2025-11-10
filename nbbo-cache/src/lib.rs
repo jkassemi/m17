@@ -35,7 +35,7 @@ impl NbboStore {
     /// Get the NBBO state before the given timestamp.
     pub fn get_state_before(&self, id: &str, ts_ns: i64) -> Option<NbboState> {
         // Stub: Return state from the most recent quote (no-op for now)
-        self.data.get(id)?.last().map(|q| q.state)
+        self.data.get(id)?.last().map(|q| q.state.clone())
     }
 
     /// Get adaptive staleness parameters for an instrument.

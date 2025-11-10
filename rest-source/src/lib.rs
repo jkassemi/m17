@@ -2,7 +2,7 @@
 
 //! REST client (stub).
 
-use core_types::{DataBatch, EquityTrade, Nbbo, OptionTrade, QueryScope};
+use core_types::types::{DataBatch, EquityTrade, Nbbo, OptionTrade, QueryScope};
 use futures::Stream;
 use std::pin::Pin;
 

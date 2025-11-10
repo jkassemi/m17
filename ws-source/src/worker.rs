@@ -2,7 +2,7 @@
 
 //! Stub WS worker for equities trades/NBBO.
 
-use core_types::{DataBatch, EquityTrade, Nbbo, Source, Quality, Watermark, DataBatchMeta};
+use core_types::types::{DataBatch, DataBatchMeta, EquityTrade, Nbbo, Quality, Source, Watermark};
 use futures::Stream;
 use std::pin::Pin;
 use tokio::net::TcpStream;

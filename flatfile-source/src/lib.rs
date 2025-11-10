@@ -27,8 +27,8 @@ impl FlatfileSource {
             // Stub: Check and update data for each range
             let mut status_parts = Vec::new();
             for range in &config.date_ranges {
-                let start = range.start_ts_ns;
-                let end = range.end_ts_ns.unwrap_or(0); // Placeholder
+                let start = range.start_ts_ns().unwrap_or(0);
+                let end = range.end_ts_ns().unwrap_or(None).unwrap_or(0);
                 status_parts.push(format!("Range {} - {}: Checking...", start, end));
             }
             let status = format!("Flatfile: {}", status_parts.join(", "));

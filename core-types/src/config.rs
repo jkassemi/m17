@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use config::{Config, ConfigError};
 use serde::{Deserialize, Serialize};
 
@@ -126,8 +127,26 @@ pub struct FlatfileConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DateRange {
-    pub start_ts_ns: i64,
-    pub end_ts_ns: Option<i64>,
+    pub start_ts: String,
+    pub end_ts: Option<String>,
+}
+
+impl DateRange {
+    /// Parse start_ts to nanoseconds since epoch.
+    pub fn start_ts_ns(&self) -> Result<i64, chrono::ParseError> {
+        let dt: DateTime<Utc> = self.start_ts.parse()?;
+        Ok(dt.timestamp_nanos_opt().unwrap())
+    }
+
+    /// Parse end_ts to nanoseconds since epoch, if present.
+    pub fn end_ts_ns(&self) -> Result<Option<i64>, chrono::ParseError> {
+        if let Some(ref end) = self.end_ts {
+            let dt: DateTime<Utc> = end.parse()?;
+            Ok(Some(dt.timestamp_nanos_opt().unwrap()))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 impl AppConfig {

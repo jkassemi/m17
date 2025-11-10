@@ -68,14 +68,14 @@ pub struct FlatfileSource {
 impl FlatfileSource {
     pub async fn new(config: Arc<FlatfileConfig>) -> Self {
         let credentials = Credentials::new(
-            config.polygonio_access_key_id.clone(),
-            config.polygonio_secret_access_key.clone(),
+            config.massive_access_key_id.clone(),
+            config.massive_secret_access_key.clone(),
             None,
             None,
             "flatfile",
         );
         let s3_config = aws_sdk_s3::Config::builder()
-            .endpoint_url("https://files.massive.com")
+            .endpoint_url(config.massive_endpoint.clone())
             .region(Region::new("us-east-1"))
             .credentials_provider(credentials)
             .behavior_version(BehaviorVersion::latest())

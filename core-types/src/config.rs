@@ -13,6 +13,8 @@ pub struct AppConfig {
     pub rest: RestConfig,
     pub scheduler: SchedulerConfig,
     pub flatfile: FlatfileConfig,
+    #[serde(default)]
+    pub ingest: IngestConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -75,6 +77,8 @@ pub struct StorageConfig {
     pub row_group_target: usize,
     #[serde(default = "default_retention_weeks")]
     pub retention_weeks: u32,
+    #[serde(default = "default_file_size_mb_target")]
+    pub file_size_mb_target: u64,
 }
 
 fn default_row_group_target() -> usize {
@@ -83,6 +87,10 @@ fn default_row_group_target() -> usize {
 
 fn default_retention_weeks() -> u32 {
     4
+}
+
+fn default_file_size_mb_target() -> u64 {
+    128
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -101,6 +109,38 @@ pub struct SchedulerConfig {
     pub rebalance_interval_s: u64,
     #[serde(default = "default_hysteresis")]
     pub hysteresis: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestConfig {
+    #[serde(default = "default_ingest_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_ingest_concurrent_days")]
+    pub concurrent_days: usize,
+    #[serde(default = "default_progress_update_ms")]
+    pub progress_update_ms: u64,
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: default_ingest_batch_size(),
+            concurrent_days: default_ingest_concurrent_days(),
+            progress_update_ms: default_progress_update_ms(),
+        }
+    }
+}
+
+fn default_ingest_batch_size() -> usize {
+    20_000
+}
+
+fn default_ingest_concurrent_days() -> usize {
+    4
+}
+
+fn default_progress_update_ms() -> u64 {
+    250
 }
 
 fn default_top_n() -> usize {

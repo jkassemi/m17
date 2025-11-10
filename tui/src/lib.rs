@@ -87,7 +87,8 @@ impl Tui {
             .direction(Direction::Vertical)
             .constraints(
                 [
-                    Constraint::Length(3),       // progress gauge
+                    Constraint::Length(3), // ingestion progress
+                    Constraint::Length(3), // current file progress
                     Constraint::Percentage(100), // details
                 ]
                 .as_ref(),
@@ -114,6 +115,42 @@ impl Tui {
                 Style::default().fg(Color::White),
             ));
         f.render_widget(gauge, chunks[0]);
+
+        // Current file progress
+        if let Some(name) = self.metrics.current_file_name() {
+            if let Some((read, total, started_ns)) = self.metrics.current_file_progress() {
+                let now_ns_cf = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as i64;
+                let elapsed_ns = (now_ns_cf - started_ns).max(1);
+                let read_mb = (read as f64) / (1024.0 * 1024.0);
+                let total_mb = (total as f64) / (1024.0 * 1024.0);
+                let throughput_mb_s = if elapsed_ns > 0 {
+                    read_mb / ((elapsed_ns as f64) / 1_000_000_000.0)
+                } else {
+                    0.0
+                };
+                let ratio = if total > 0 { (read as f64) / (total as f64) } else { 0.0 };
+                let label = if total > 0 {
+                    format!(
+                        "{}  {:.1}/{:.1} MB  {:.1} MB/s",
+                        name, read_mb, total_mb, throughput_mb_s
+                    )
+                } else {
+                    format!("{}  {:.1} MB read  (unknown total)", name, read_mb)
+                };
+                let cf_gauge = Gauge::default()
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("Current file"),
+                    )
+                    .ratio(ratio)
+                    .label(Span::styled(label, Style::default().fg(Color::White)));
+                f.render_widget(cf_gauge, chunks[1]);
+            }
+        }
 
         // Metrics
         let now_ns = SystemTime::now()
@@ -181,6 +218,6 @@ impl Tui {
         let paragraph = Paragraph::new(status_text)
             .block(Block::default().borders(Borders::ALL).title("Dashboard"))
             .alignment(Alignment::Left);
-        f.render_widget(paragraph, chunks[1]);
+        f.render_widget(paragraph, chunks[2]);
     }
 }

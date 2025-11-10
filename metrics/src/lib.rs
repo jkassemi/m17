@@ -24,6 +24,11 @@ pub struct Metrics {
     completed_days: AtomicU64,
     ingested_batches: AtomicU64,
     ingested_rows: AtomicU64,
+    // Current file progress
+    current_file_name: Arc<Mutex<Option<String>>>,
+    current_file_total: AtomicU64,
+    current_file_read: AtomicU64,
+    current_file_started_ts_ns: AtomicU64,
 }
 
 impl Metrics {
@@ -40,6 +45,10 @@ impl Metrics {
             completed_days: AtomicU64::new(0),
             ingested_batches: AtomicU64::new(0),
             ingested_rows: AtomicU64::new(0),
+            current_file_name: Arc::new(Mutex::new(None)),
+            current_file_total: AtomicU64::new(0),
+            current_file_read: AtomicU64::new(0),
+            current_file_started_ts_ns: AtomicU64::new(0),
         }
     }
 
@@ -89,6 +98,37 @@ impl Metrics {
     }
     pub fn ingested_rows(&self) -> u64 {
         self.ingested_rows.load(Ordering::Relaxed)
+    }
+
+    // current file progress
+    pub fn set_current_file(&self, name: String, total: u64) {
+        *self.current_file_name.lock().unwrap() = Some(name);
+        self.current_file_total.store(total, Ordering::Relaxed);
+        self.current_file_read.store(0, Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        self.current_file_started_ts_ns
+            .store(now as u64, Ordering::Relaxed);
+    }
+
+    pub fn set_current_file_read(&self, read: u64) {
+        self.current_file_read.store(read, Ordering::Relaxed);
+    }
+
+    pub fn current_file_name(&self) -> Option<String> {
+        self.current_file_name.lock().unwrap().clone()
+    }
+
+    pub fn current_file_progress(&self) -> Option<(u64, u64, i64)> {
+        if self.current_file_name.lock().unwrap().is_none() {
+            return None;
+        }
+        let read = self.current_file_read.load(Ordering::Relaxed);
+        let total = self.current_file_total.load(Ordering::Relaxed);
+        let started = self.current_file_started_ts_ns.load(Ordering::Relaxed) as i64;
+        Some((read, total, started))
     }
 
     async fn handle_metrics(

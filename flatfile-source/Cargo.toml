@@ -11,6 +11,7 @@ bytes = "1"
 chrono = "0.4"
 core-types = { path = "../core-types" }
 csv = "1.1"
+csv-async = "1"
 flate2 = "1"
 futures = "0.3"
 hyper-rustls = "0.27.7"
@@ -23,3 +24,4 @@ tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 trading-calendar = "0.2.3"
 aws-smithy-runtime = { version = "1.9.4" }
+metrics = { path = "../metrics" }

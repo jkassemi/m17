@@ -46,7 +46,13 @@ async fn main() {
         );
     }
     let flatfile_config = config.flatfile.clone();
-    let flatfile_source = FlatfileSource::new(Arc::new(flatfile_config)).await;
+    let flatfile_source = FlatfileSource::new(
+        Arc::new(flatfile_config),
+        Some(metrics.clone()),
+        config.ingest.batch_size,
+        config.ingest.progress_update_ms,
+    )
+    .await;
     let flatfile_source_clone = flatfile_source.clone();
     let nbbo_store = NbboStore::new();
     let classifier = Classifier::new();
@@ -156,7 +162,7 @@ async fn main() {
     });
 
     // Ingestion loop for equity trades
-    let semaphore = Arc::new(Semaphore::new(2)); // Limit to 2 concurrent days
+    let semaphore = Arc::new(Semaphore::new(config.ingest.concurrent_days)); // Configurable concurrent days
     for range in &config.flatfile.date_ranges {
         let start_ts_ns = range.start_ts_ns().unwrap_or(0);
         let end_ts_ns = if let Some(end) = range.end_ts_ns().ok().flatten() {

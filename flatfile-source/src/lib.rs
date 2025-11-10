@@ -10,20 +10,21 @@ use core_types::types::{
     AggressorSide, ClassMethod, Completeness, DataBatch, DataBatchMeta, EquityTrade, Nbbo,
     OptionTrade, Quality, QueryScope, Source, Watermark,
 };
-use csv::Reader;
-use futures::Stream;
-use futures::TryStreamExt;
+use csv_async::AsyncReaderBuilder;
+use futures::{Stream, StreamExt, TryStreamExt};
 use log::info;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::sync::mpsc;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::{ReaderStream, StreamReader};
 use trading_calendar::{Market, TradingCalendar};
+use metrics::Metrics;
 
 /// Combined source trait merging ObjectStore, UpdateLoop, and Queryable.
 #[async_trait]
@@ -35,6 +36,8 @@ pub trait SourceTrait: Send + Sync + 'static {
         Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send>>,
         Box<dyn std::error::Error + Send + Sync>,
     >;
+
+    async fn object_len(&self, path: &str) -> Option<u64>;
 
     async fn run(&self);
 
@@ -61,10 +64,18 @@ pub struct FlatfileSource {
     status: Arc<Mutex<String>>,
     config: Arc<FlatfileConfig>,
     client: Client,
+    metrics: Option<Arc<Metrics>>,
+    ingest_batch_size: usize,
+    progress_update_ms: u64,
 }
 
 impl FlatfileSource {
-    pub async fn new(config: Arc<FlatfileConfig>) -> Self {
+    pub async fn new(
+        config: Arc<FlatfileConfig>,
+        metrics: Option<Arc<Metrics>>,
+        ingest_batch_size: usize,
+        progress_update_ms: u64,
+    ) -> Self {
         let credentials = Credentials::new(
             config.massive_access_key_id.clone(),
             config.massive_secret_access_key.clone(),
@@ -87,6 +98,9 @@ impl FlatfileSource {
             status: Arc::new(Mutex::new("Initializing".to_string())),
             config,
             client,
+            metrics,
+            ingest_batch_size,
+            progress_update_ms,
         }
     }
 
@@ -204,6 +218,28 @@ impl SourceTrait for FlatfileSource {
         }
     }
 
+    async fn object_len(&self, path: &str) -> Option<u64> {
+        let local_dir = std::path::PathBuf::from("data");
+        let local_path = local_dir.join(path);
+        if fs::try_exists(&local_path).await.ok()? {
+            if let Ok(meta) = fs::metadata(&local_path).await {
+                return Some(meta.len());
+            }
+            return None;
+        }
+        match self
+            .client
+            .head_object()
+            .bucket(self.config.massive_flatfiles_bucket.clone())
+            .key(path)
+            .send()
+            .await
+        {
+            Ok(resp) => resp.content_length().map(|v| v as u64),
+            Err(_) => None,
+        }
+    }
+
     async fn run(&self) {
         loop {
             let mut status_parts = Vec::new();
@@ -313,8 +349,16 @@ impl SourceTrait for FlatfileSource {
                         year, month, year, month, day
                     );
                     info!("Checking path for equity trades: {}", path);
-                    process_equity_trades_stream(&self_clone, &path, &scope_clone, tx.clone())
-                        .await;
+                    process_equity_trades_stream(
+                        &self_clone,
+                        &path,
+                        &scope_clone,
+                        tx.clone(),
+                        self_clone.ingest_batch_size,
+                        self_clone.progress_update_ms,
+                        self_clone.metrics.clone(),
+                    )
+                    .await;
                 }
                 current_date += TimeDelta::try_days(1).unwrap();
             }
@@ -330,95 +374,118 @@ impl SourceTrait for FlatfileSource {
     }
 }
 
+struct CountingReader<R> {
+    inner: R,
+    counter: Arc<AtomicU64>,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R, counter: Arc<AtomicU64>) -> Self {
+        Self { inner, counter }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let pre = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &poll {
+            let post = buf.filled().len();
+            let read = (post - pre) as u64;
+            if read > 0 {
+                self.counter.fetch_add(read, Ordering::Relaxed);
+            }
+        }
+        poll
+    }
+}
+
 async fn process_equity_trades_stream<S: SourceTrait>(
     source: &S,
     path: &str,
     scope: &QueryScope,
     tx: mpsc::Sender<DataBatch<EquityTrade>>,
+    batch_size: usize,
+    progress_update_ms: u64,
+    metrics: Option<Arc<Metrics>>,
 ) {
     info!("Attempting to get stream for path: {}", path);
     match source.get_stream(path).await {
         Ok(stream) => {
-            info!("Stream obtained for path: {}, collecting bytes...", path);
-            if let Ok(bytes) = stream
-                .try_fold(Vec::new(), |mut acc, chunk| async move {
-                    acc.extend(chunk);
-                    Ok(acc)
-                })
-                .await
-            {
-                info!("Collected {} bytes for path: {}", bytes.len(), path);
-                let instruments = scope.instruments.clone();
-                let tx_clone = tx.clone();
-                let path_owned = path.to_string();
-                tokio::task::spawn_blocking(move || {
-                    let cursor = std::io::Cursor::new(bytes);
-                    let mut rdr = Reader::from_reader(cursor);
-                    let mut batch = Vec::new();
-                    const BATCH_SIZE: usize = 1000;
-                    let mut record_count = 0;
-                    let mut batch_count = 0;
-                    for result in rdr.records() {
-                        if let Ok(record) = result {
-                            record_count += 1;
-                            let symbol = record[0].to_string();
-                            if !instruments.is_empty() && !instruments.contains(&symbol) {
-                                continue;
-                            }
-                            let trade = EquityTrade {
-                                symbol,
-                                trade_ts_ns: record[5].parse().unwrap_or(0),
-                                price: record[6].parse().unwrap_or(0.0),
-                                size: record[9].parse().unwrap_or(0),
-                                conditions: record[1]
-                                    .split(',')
-                                    .filter_map(|s| s.trim().parse().ok())
-                                    .collect(),
-                                exchange: record[3].parse().unwrap_or(0),
-                                aggressor_side: AggressorSide::Unknown,
-                                class_method: ClassMethod::Unknown,
-                                aggressor_offset_mid_bp: None,
-                                aggressor_offset_touch_ticks: None,
-                                nbbo_bid: None,
-                                nbbo_ask: None,
-                                nbbo_bid_sz: None,
-                                nbbo_ask_sz: None,
-                                nbbo_ts_ns: None,
-                                nbbo_age_us: None,
-                                nbbo_state: None,
-                                tick_size_used: None,
-                                source: Source::Flatfile,
-                                quality: Quality::Prelim,
-                                watermark_ts_ns: 0,
-                                trade_id: Some(record[4].to_string()),
-                                seq: Some(record[7].parse().unwrap_or(0)),
-                                participant_ts_ns: Some(record[8].parse().unwrap_or(0)),
-                                tape: Some(record[10].to_string()),
-                                correction: Some(record[2].parse().unwrap_or(0)),
-                                trf_id: Some(record[11].to_string()),
-                                trf_ts_ns: Some(record[12].parse().unwrap_or(0)),
-                            };
-                            batch.push(trade);
-                            if batch.len() == BATCH_SIZE {
-                                batch_count += 1;
-                                let meta = DataBatchMeta {
-                                    source: Source::Flatfile,
-                                    quality: Quality::Prelim,
-                                    watermark: Watermark {
-                                        watermark_ts_ns: 0, // Placeholder
-                                        completeness: Completeness::Complete,
-                                        hints: None,
-                                    },
-                                    schema_version: 1,
-                                };
-                                let _ = tx_clone.try_send(DataBatch {
-                                    rows: std::mem::take(&mut batch),
-                                    meta,
-                                });
+            let total_len = source.object_len(path).await;
+            if let Some(m) = metrics.as_ref() {
+                m.set_current_file(path.to_string(), total_len.unwrap_or(0));
+            }
+            let bytes_read = Arc::new(AtomicU64::new(0));
+            let reader = StreamReader::new(stream);
+            let counting = CountingReader::new(reader, bytes_read.clone());
+            let buf = BufReader::new(counting);
+            let inner: Box<dyn AsyncRead + Unpin + Send> = if path.ends_with(".gz") {
+                Box::new(GzipDecoder::new(buf))
+            } else {
+                Box::new(buf)
+            };
+            let mut csv_reader = AsyncReaderBuilder::new().create_reader(inner);
+            let mut records = csv_reader.records();
+            let instruments = scope.instruments.clone();
+            let mut batch = Vec::with_capacity(batch_size);
+            let mut record_count = 0usize;
+            let mut batch_count = 0usize;
+            let mut last_update = Instant::now();
+
+            while let Some(rec) = records.next().await {
+                if let Ok(record) = rec {
+                    record_count += 1;
+                    let symbol = record[0].to_string();
+                    if !instruments.is_empty() && !instruments.contains(&symbol) {
+                        // update progress periodically even if filtered out
+                        if let Some(m) = metrics.as_ref() {
+                            if last_update.elapsed() >= Duration::from_millis(progress_update_ms) {
+                                m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
+                                last_update = Instant::now();
                             }
                         }
+                        continue;
                     }
-                    if !batch.is_empty() {
+                    let trade = EquityTrade {
+                        symbol,
+                        trade_ts_ns: record[5].parse().unwrap_or(0),
+                        price: record[6].parse().unwrap_or(0.0),
+                        size: record[9].parse().unwrap_or(0),
+                        conditions: record[1]
+                            .split(',')
+                            .filter_map(|s| s.trim().parse().ok())
+                            .collect(),
+                        exchange: record[3].parse().unwrap_or(0),
+                        aggressor_side: AggressorSide::Unknown,
+                        class_method: ClassMethod::Unknown,
+                        aggressor_offset_mid_bp: None,
+                        aggressor_offset_touch_ticks: None,
+                        nbbo_bid: None,
+                        nbbo_ask: None,
+                        nbbo_bid_sz: None,
+                        nbbo_ask_sz: None,
+                        nbbo_ts_ns: None,
+                        nbbo_age_us: None,
+                        nbbo_state: None,
+                        tick_size_used: None,
+                        source: Source::Flatfile,
+                        quality: Quality::Prelim,
+                        watermark_ts_ns: 0,
+                        trade_id: Some(record[4].to_string()),
+                        seq: Some(record[7].parse().unwrap_or(0)),
+                        participant_ts_ns: Some(record[8].parse().unwrap_or(0)),
+                        tape: Some(record[10].to_string()),
+                        correction: Some(record[2].parse().unwrap_or(0)),
+                        trf_id: Some(record[11].to_string()),
+                        trf_ts_ns: Some(record[12].parse().unwrap_or(0)),
+                    };
+                    batch.push(trade);
+                    if batch.len() >= batch_size {
                         batch_count += 1;
                         let meta = DataBatchMeta {
                             source: Source::Flatfile,
@@ -430,18 +497,53 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                             },
                             schema_version: 1,
                         };
-                        let _ = tx_clone.try_send(DataBatch { rows: batch, meta });
+                        let _ = tx
+                            .try_send(DataBatch {
+                                rows: std::mem::take(&mut batch),
+                                meta,
+                            });
                     }
-                    info!(
-                        "Processed {} records into {} batches for path: {}",
-                        record_count, batch_count, path_owned
-                    );
-                })
-                .await
-                .unwrap();
-            } else {
-                info!("Failed to collect bytes for path: {}", path);
+                }
+                if let Some(m) = metrics.as_ref() {
+                    if last_update.elapsed() >= Duration::from_millis(progress_update_ms) {
+                        m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
+                        last_update = Instant::now();
+                    }
+                }
             }
+
+            if !batch.is_empty() {
+                batch_count += 1;
+                let meta = DataBatchMeta {
+                    source: Source::Flatfile,
+                    quality: Quality::Prelim,
+                    watermark: Watermark {
+                        watermark_ts_ns: 0, // Placeholder
+                        completeness: Completeness::Complete,
+                        hints: None,
+                    },
+                    schema_version: 1,
+                };
+                let _ = tx.try_send(DataBatch { rows: batch, meta });
+            }
+
+            if let Some(m) = metrics.as_ref() {
+                if let Some(total) = total_len {
+                    let read = bytes_read.load(Ordering::Relaxed);
+                    if read < total {
+                        m.set_current_file_read(total);
+                    } else {
+                        m.set_current_file_read(read);
+                    }
+                } else {
+                    m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
+                }
+            }
+
+            info!(
+                "Processed {} records into {} batches for path: {}",
+                record_count, batch_count, path
+            );
         }
         Err(e) => {
             info!("Failed to get stream for path: {}: {:?}", path, e);
@@ -510,6 +612,14 @@ mod tests {
             Ok(stream)
         }
 
+        async fn object_len(&self, path: &str) -> Option<u64> {
+            let full_path = self.base_path.join(path);
+            match tokio::fs::metadata(&full_path).await {
+                Ok(meta) => Some(meta.len()),
+                Err(_) => None,
+            }
+        }
+
         async fn run(&self) {
             loop {
                 sleep(Duration::from_secs(10)).await;
@@ -536,7 +646,16 @@ mod tests {
             let scope_clone = scope.clone();
             tokio::spawn(async move {
                 let path = "stock_trades_sample.csv.gz";
-                process_equity_trades_stream(&self_clone, path, &scope_clone, tx).await;
+                process_equity_trades_stream(
+                    &self_clone,
+                    path,
+                    &scope_clone,
+                    tx,
+                    1000,
+                    250,
+                    None,
+                )
+                .await;
             });
             Box::pin(ReceiverStream::new(rx))
         }

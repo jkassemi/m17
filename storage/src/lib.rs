@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StringArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{Int32Type, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -35,6 +35,7 @@ pub struct Storage {
     config: core_types::config::StorageConfig,
     base_path: PathBuf,
     dedup_cache: HashMap<String, LruCache<String, ()>>,
+    writers: Mutex<HashMap<String, PartitionWriter>>,
 }
 
 impl Storage {
@@ -43,6 +44,7 @@ impl Storage {
             base_path: PathBuf::from(&config.paths.get("base").unwrap_or(&"data".to_string())),
             config,
             dedup_cache: HashMap::new(),
+            writers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -70,8 +72,8 @@ impl Storage {
             trades_by_date.entry(dt).or_insert_with(Vec::new).push(trade.clone());
         }
 
-        // For each date group, dedup and write
-        for (date, mut trades) in trades_by_date {
+        // For each date group, dedup and write using a pooled writer per partition
+        for (date, trades) in trades_by_date {
             // Dedup using in-memory cache
             let mut deduped_trades = Vec::new();
             for trade in trades {
@@ -88,9 +90,29 @@ impl Storage {
                 }
             }
 
-            if !deduped_trades.is_empty() {
-                let record_batch = self.equity_trades_to_record_batch(&deduped_trades, &batch.meta)?;
-                self.write_partitioned("equity_trades", &record_batch, &batch.meta, date)?;
+            if deduped_trades.is_empty() {
+                continue;
+            }
+
+            let record_batch = self.equity_trades_to_record_batch(&deduped_trades, &batch.meta)?;
+            let dt_str = date.to_string();
+            let prefix = "prefix"; // TODO: derive from instrument_id prefix
+            let partition_dir = format!("{}/{}/dt={}/{}/", self.base_path.display(), "equity_trades", dt_str, prefix);
+            std::fs::create_dir_all(&partition_dir)?;
+            // Get a writer for this partition
+            let target_bytes = self.config.file_size_mb_target.saturating_mul(1024 * 1024);
+            {
+                let mut writers = self.writers.lock().unwrap();
+                let pw = writers.entry(partition_dir.clone()).or_insert_with(|| {
+                    PartitionWriter::new(&partition_dir, record_batch.schema())
+                        .expect("failed to create partition writer")
+                });
+                pw.write(&record_batch)?;
+                // Rotate if size target reached
+                if pw.current_size_bytes()? >= target_bytes && target_bytes > 0 {
+                    pw.close()?;
+                    writers.remove(&partition_dir);
+                }
             }
         }
         Ok(())
@@ -167,7 +189,7 @@ impl Storage {
         let mut trade_ts_ns = Vec::new();
         let mut price = Vec::new();
         let mut size = Vec::new();
-        let mut conditions = Vec::new();
+        let mut conditions: Vec<Vec<i32>> = Vec::new();
         let mut exchange = Vec::new();
         let mut expiry_ts_ns = Vec::new();
         let mut aggressor_side = Vec::new();
@@ -176,10 +198,10 @@ impl Storage {
         let mut aggressor_offset_touch_ticks = Vec::new();
         let mut nbbo_bid = Vec::new();
         let mut nbbo_ask = Vec::new();
-        let mut nbbo_bid_sz = Vec::new();
-        let mut nbbo_ask_sz = Vec::new();
+        let mut nbbo_bid_sz: Vec<Option<u32>> = Vec::new();
+        let mut nbbo_ask_sz: Vec<Option<u32>> = Vec::new();
         let mut nbbo_ts_ns = Vec::new();
-        let mut nbbo_age_us = Vec::new();
+        let mut nbbo_age_us: Vec<Option<u32>> = Vec::new();
         let mut nbbo_state = Vec::new();
         let mut tick_size_used = Vec::new();
         let mut delta = Vec::new();
@@ -200,19 +222,19 @@ impl Storage {
             trade_ts_ns.push(trade.trade_ts_ns);
             price.push(trade.price);
             size.push(trade.size);
-            conditions.push(format!("{:?}", trade.conditions)); // Vec<i32> as string for simplicity
+            conditions.push(trade.conditions.clone());
             exchange.push(trade.exchange);
             expiry_ts_ns.push(trade.expiry_ts_ns);
             aggressor_side.push(format!("{:?}", trade.aggressor_side));
             class_method.push(format!("{:?}", trade.class_method));
-            aggressor_offset_mid_bp.push(trade.aggressor_offset_mid_bp.map(|x| x as i64));
-            aggressor_offset_touch_ticks.push(trade.aggressor_offset_touch_ticks.map(|x| x as i64));
+            aggressor_offset_mid_bp.push(trade.aggressor_offset_mid_bp);
+            aggressor_offset_touch_ticks.push(trade.aggressor_offset_touch_ticks);
             nbbo_bid.push(trade.nbbo_bid);
             nbbo_ask.push(trade.nbbo_ask);
-            nbbo_bid_sz.push(trade.nbbo_bid_sz.map(|x| x as i64));
-            nbbo_ask_sz.push(trade.nbbo_ask_sz.map(|x| x as i64));
+            nbbo_bid_sz.push(trade.nbbo_bid_sz);
+            nbbo_ask_sz.push(trade.nbbo_ask_sz);
             nbbo_ts_ns.push(trade.nbbo_ts_ns);
-            nbbo_age_us.push(trade.nbbo_age_us.map(|x| x as i64));
+            nbbo_age_us.push(trade.nbbo_age_us);
             nbbo_state.push(format!("{:?}", trade.nbbo_state));
             tick_size_used.push(trade.tick_size_used);
             delta.push(trade.delta);
@@ -220,13 +242,16 @@ impl Storage {
             vega.push(trade.vega);
             theta.push(trade.theta);
             iv.push(trade.iv);
-            greeks_flags.push(trade.greeks_flags as i64);
+            greeks_flags.push(trade.greeks_flags);
             source.push(format!("{:?}", meta.source));
             quality.push(format!("{:?}", meta.quality));
             watermark_ts_ns.push(meta.watermark.watermark_ts_ns);
         }
 
         let schema: SchemaRef = Arc::new(option_trade_schema());
+        let conditions_array = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+            conditions.into_iter().map(|v| Some(v.into_iter().map(Some)))
+        ));
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(contract)),
             Arc::new(StringArray::from(contract_direction)),
@@ -235,19 +260,19 @@ impl Storage {
             Arc::new(Int64Array::from(trade_ts_ns)),
             Arc::new(Float64Array::from(price)),
             Arc::new(UInt32Array::from(size)),
-            Arc::new(StringArray::from(conditions)),
+            conditions_array,
             Arc::new(Int32Array::from(exchange)),
             Arc::new(Int64Array::from(expiry_ts_ns)),
             Arc::new(StringArray::from(aggressor_side)),
             Arc::new(StringArray::from(class_method)),
-            Arc::new(Int64Array::from(aggressor_offset_mid_bp)),
-            Arc::new(Int64Array::from(aggressor_offset_touch_ticks)),
+            Arc::new(Int32Array::from(aggressor_offset_mid_bp)),
+            Arc::new(Int32Array::from(aggressor_offset_touch_ticks)),
             Arc::new(Float64Array::from(nbbo_bid)),
             Arc::new(Float64Array::from(nbbo_ask)),
-            Arc::new(Int64Array::from(nbbo_bid_sz)),
-            Arc::new(Int64Array::from(nbbo_ask_sz)),
+            Arc::new(UInt32Array::from(nbbo_bid_sz)),
+            Arc::new(UInt32Array::from(nbbo_ask_sz)),
             Arc::new(Int64Array::from(nbbo_ts_ns)),
-            Arc::new(Int64Array::from(nbbo_age_us)),
+            Arc::new(UInt32Array::from(nbbo_age_us)),
             Arc::new(StringArray::from(nbbo_state)),
             Arc::new(Float64Array::from(tick_size_used)),
             Arc::new(Float64Array::from(delta)),
@@ -255,7 +280,7 @@ impl Storage {
             Arc::new(Float64Array::from(vega)),
             Arc::new(Float64Array::from(theta)),
             Arc::new(Float64Array::from(iv)),
-            Arc::new(Int64Array::from(greeks_flags)),
+            Arc::new(UInt32Array::from(greeks_flags)),
             Arc::new(StringArray::from(source)),
             Arc::new(StringArray::from(quality)),
             Arc::new(Int64Array::from(watermark_ts_ns)),
@@ -366,6 +391,38 @@ impl Storage {
         let schema: SchemaRef = Arc::new(nbbo_schema());
         // Build arrays...
         Ok(RecordBatch::new_empty(schema))
+    }
+}
+
+struct PartitionWriter {
+    file_path: PathBuf,
+    writer: ArrowWriter<std::fs::File>,
+}
+
+impl PartitionWriter {
+    fn new(partition_dir: &str, schema: SchemaRef) -> Result<Self, StorageError> {
+        let file_path = PathBuf::from(format!("{}data_{}.parquet", partition_dir, Uuid::new_v4()));
+        let file = std::fs::File::create(&file_path)?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(Default::default()))
+            .build();
+        let writer = ArrowWriter::try_new(file, schema, Some(props))?;
+        Ok(Self { file_path, writer })
+    }
+
+    fn write(&mut self, batch: &RecordBatch) -> Result<(), StorageError> {
+        self.writer.write(batch)?;
+        Ok(())
+    }
+
+    fn current_size_bytes(&self) -> Result<u64, StorageError> {
+        let meta = std::fs::metadata(&self.file_path)?;
+        Ok(meta.len())
+    }
+
+    fn close(&mut self) -> Result<(), StorageError> {
+        self.writer.close()?;
+        Ok(())
     }
 }
 

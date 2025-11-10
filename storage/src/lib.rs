@@ -53,6 +53,14 @@ impl Storage {
         }
     }
 
+    pub fn flush_all(&self) -> Result<(), StorageError> {
+        let mut writers = self.writers.lock().unwrap();
+        for writer in writers.values_mut() {
+            writer.close()?;
+        }
+        Ok(())
+    }
+
     /// Write a batch of option trades to Parquet, with basic dedup and pooled writers.
     pub fn write_option_trades(
         &mut self,
@@ -118,10 +126,7 @@ impl Storage {
                         .expect("failed to create partition writer")
                 });
                 pw.write(&record_batch)?;
-                // Production behavior: keep file open; rotate when large enough
-                if target_bytes > 0 && pw.current_size_bytes()? >= target_bytes as u64 {
-                    pw.rotate()?;
-                }
+                rotate_if_needed(pw, target_bytes)?;
             }
         }
         Ok(())
@@ -196,8 +201,7 @@ impl Storage {
                         .expect("failed to create partition writer")
                 });
                 pw.write(&record_batch)?;
-                // Close after each write to avoid leaving empty open files; tests read immediately
-                pw.close()?;
+                rotate_if_needed(pw, target_bytes)?;
             }
         }
         Ok(())
@@ -254,13 +258,16 @@ impl Storage {
                 date
             );
             std::fs::create_dir_all(&partition_dir)?;
-            let mut writers = self.writers.lock().unwrap();
-            let pw = writers.entry(partition_dir.clone()).or_insert_with(|| {
-                PartitionWriter::new(&partition_dir, record_batch.schema())
-                    .expect("failed to create aggregation writer")
-            });
-            pw.write(&record_batch)?;
-            pw.close()?;
+            let target_bytes = self.config.file_size_mb_target.saturating_mul(1024 * 1024);
+            {
+                let mut writers = self.writers.lock().unwrap();
+                let pw = writers.entry(partition_dir.clone()).or_insert_with(|| {
+                    PartitionWriter::new(&partition_dir, record_batch.schema())
+                        .expect("failed to create aggregation writer")
+                });
+                pw.write(&record_batch)?;
+                rotate_if_needed(pw, target_bytes)?;
+            }
         }
         Ok(())
     }
@@ -832,6 +839,13 @@ impl Storage {
     }
 }
 
+fn rotate_if_needed(pw: &mut PartitionWriter, target_bytes: u64) -> Result<(), StorageError> {
+    if target_bytes > 0 && pw.current_size_bytes()? >= target_bytes as u64 {
+        pw.rotate()?;
+    }
+    Ok(())
+}
+
 struct PartitionWriter {
     partition_dir: String,
     file_path: PathBuf,
@@ -1033,6 +1047,8 @@ mod tests {
             meta,
         };
         storage.write_equity_trades(&batch2).unwrap();
+
+        storage.flush_all().unwrap();
 
         // Check total rows in files
         let mut total_rows = 0;

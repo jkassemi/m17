@@ -21,7 +21,7 @@ use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use std::collections::HashSet;
-use std::io::{self, BufRead};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -35,7 +35,7 @@ use trading_calendar::{Market, TradingCalendar};
 
 /// Combined source trait merging ObjectStore, UpdateLoop, and Queryable.
 #[async_trait]
-pub trait Source: Send + Sync + 'static {
+pub trait SourceTrait: Send + Sync + 'static {
     async fn get_stream(
         &self,
         path: &str,
@@ -67,12 +67,12 @@ pub trait Source: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct FlatfileSource {
     status: Arc<Mutex<String>>,
-    config: Arc<dyn FlatfileConfig>,
+    config: Arc<FlatfileConfig>,
     client: Client,
 }
 
 impl FlatfileSource {
-    pub async fn new(config: Arc<dyn FlatfileConfig>) -> Self {
+    pub async fn new(config: Arc<FlatfileConfig>) -> Self {
         let credentials = Credentials::new(
             config.access_key(),
             config.secret_key(),
@@ -141,7 +141,7 @@ impl FlatfileSource {
 }
 
 #[async_trait]
-impl Source for FlatfileSource {
+impl SourceTrait for FlatfileSource {
     async fn get_stream(
         &self,
         path: &str,
@@ -221,12 +221,12 @@ impl Source for FlatfileSource {
                     .unwrap_or_else(|| Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX));
                 let start_dt: DateTime<Utc> = DateTime::from_timestamp(
                     start_ts / 1_000_000_000,
-                    ((start_ts % 1_000_000_000) as u32),
+                    (start_ts % 1_000_000_000) as u32,
                 )
                 .unwrap_or(Utc::now());
                 let end_dt: DateTime<Utc> = DateTime::from_timestamp(
                     end_ts / 1_000_000_000,
-                    ((end_ts % 1_000_000_000) as u32),
+                    (end_ts % 1_000_000_000) as u32,
                 )
                 .unwrap_or(Utc::now());
                 let mut current_date = start_dt.date_naive();
@@ -332,7 +332,7 @@ impl Source for FlatfileSource {
     }
 }
 
-async fn process_equity_trades_stream<S: Source>(
+async fn process_equity_trades_stream<S: SourceTrait>(
     source: &S,
     path: &str,
     scope: &QueryScope,
@@ -453,7 +453,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Source for LocalFileSource {
+    impl SourceTrait for LocalFileSource {
         async fn get_stream(
             &self,
             path: &str,

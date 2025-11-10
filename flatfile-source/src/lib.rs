@@ -180,7 +180,7 @@ impl SourceTrait for FlatfileSource {
                 .send()
                 .await?;
             let body: ByteStream = resp.body;
-            let stream_err_mapped = body.map(|res| res.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>));
+            let stream_err_mapped = body.map(|res| res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
 
             let stream: Pin<
                 Box<
@@ -189,10 +189,7 @@ impl SourceTrait for FlatfileSource {
                 >,
             >;
             if path.ends_with(".gz") {
-                let stream_reader =
-                    StreamReader::new(stream_err_mapped.map(|res| {
-                        res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                    }));
+                let stream_reader = StreamReader::new(stream_err_mapped);
                 let buf_reader = BufReader::new(stream_reader);
                 let decoder = GzipDecoder::new(buf_reader);
                 stream = Box::pin(
@@ -200,7 +197,7 @@ impl SourceTrait for FlatfileSource {
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
                 );
             } else {
-                stream = Box::pin(stream_err_mapped);
+                stream = Box::pin(stream_err_mapped.map(|res| res.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)));
             }
             Ok(stream)
         }

@@ -11,3 +11,4 @@ arrow = "57.0.0"
 thiserror = "2.0.17"
 chrono = "0.4.42"
 uuid = { version="1.18.1", features=["v4"] }
+lru = "0.16.2"

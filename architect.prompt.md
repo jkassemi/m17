@@ -16,6 +16,7 @@ Great — here’s a concrete plan to get equities flat-file ingestion from Mass
 1) Minimal, reusable design for Massive flat-file equities ingestion
 
 What we’re ingesting
+
 - Dataset: Massive us_stocks_sip/trades_v1 (equity trades).
 - Cadence: One daily file per symbol-universe (published EOD; your plan indicates previous day is finalized/available by ~11a ET).
 - Columns we’ll use immediately: ticker, sip_timestamp, price, size, exchange, conditions, id, sequence_number, participant_timestamp, correction, tape, trf_id, trf_timestamp.
@@ -33,9 +34,10 @@ What we’re ingesting
   - tape → EquityTrade.tape (add optional field)
   - trf_id → EquityTrade.trf_id (add optional field)
   - trf_timestamp → EquityTrade.trf_ts_ns (add optional field)
-- Classification fields (aggressor_* and nbbo_*) will remain Unknown/unset until we have NBBO. That’s OK for step one (we’re building the historical trade lake first).
+- Classification fields (aggressor_*and nbbo_*) will remain Unknown/unset until we have NBBO. That’s OK for step one (we’re building the historical trade lake first).
 
 Key ingestion components
+
 - Planner (date-range aware):
   - Input: FlatfileConfig.date_ranges (already present).
   - Expands to a per-day plan.
@@ -65,6 +67,7 @@ Key ingestion components
   - Existing TUI already polls a status string; extend FlatfileSource to set metrics.set_flatfile_status with per-day state (discovered/downloading/ingested/finalized).
 
 Scheduling and update loop
+
 - For historical backfill:
   - Iterate all configured ranges and ingest missing days.
 - For “maintenance”:
@@ -80,6 +83,7 @@ Scheduling and update loop
   - That lets the orchestrator feed the exact same downstream steps (storage, NBBO/classifier when we add them).
 
 Configuration you’ll need to add
+
 - config.flatfile.s3:
   - region, bucket, trades_prefix, endpoint (optional), concurrency, local_cache_path, format=csv|parquet, compression=gz|none.
 - config.flatfile.days_to_recheck=2 (how many recent days to probe for updates).
@@ -90,6 +94,7 @@ Configuration you’ll need to add
 2) Spec vs current implementation: gaps and fixes
 
 High-impact gaps to address first for equities flat-file ingestion
+
 - Types/schema
   - EquityTrade is missing: trade_id, seq, participant_ts_ns, tape, correction, trf_id, trf_ts_ns. Also the spec wants participant_ts and arrival_ts for diagnostics. Add optional fields so we can map Massive fields and dedup by trade_id as per spec.
   - core-types/schema.rs is placeholder; storage writers will not match. We need complete Arrow schema for equity trades and nbbo.
@@ -116,17 +121,13 @@ High-impact gaps to address first for equities flat-file ingestion
   - No unit/integration tests for parser/ingest/storage. Add golden-file based tests per spec.
 
 Lower-priority or follow-on gaps
+
 - S3-compatible reader for Parquet/Arrow datasets (we’ll begin with CSV+GZ if that’s what Massive serves; support Parquet if available).
 - Dedup on write and compaction pass.
 - Configurable retries/backoff on S3 429/5xx with token-bucket throttle.
 - Watermarks and finalization semantics across sources (for flatfiles, use batch max ts and completeness=Complete).
 
 3) Concrete, small steps to completion
-
-Phase A: Unblock a working flatfile trade ingest (equities)
-- A1. Config gating fix
-  - Make polygonio_* keys optional unless polygon/WS paths are enabled. Load config.toml so flatfile.date_ranges is honored.
-  - Acceptance: orchestrator prints config OK; TUI shows flatfile ranges in status.
 
 - A2. Expand EquityTrade and schema
   - Add optional fields: trade_id, seq, participant_ts_ns, tape, correction, trf_id, trf_ts_ns.
@@ -143,6 +144,8 @@ Phase A: Unblock a working flatfile trade ingest (equities)
   - Define ObjectStore trait: head, list, get_stream.
   - Implement local file adapter for dev; stub S3 (signature and config only).
   - Acceptance: flatfile reader can open local gz CSV and stream bytes.
+    - tests/fixtures/stock_quotes_sample.csv.gz
+    - tests/fixtures/stock_trades_sample.csv.gz
 
 - A5. FlatfileSource: CSV gz reader/parser -> DataBatch<EquityTrade>
   - Stream parse with bounded buffers, spawn_blocking for CSV decode; batch every N rows; set DataBatchMeta.
@@ -158,6 +161,7 @@ Phase A: Unblock a working flatfile trade ingest (equities)
   - Acceptance: curl localhost:9090/metrics shows ingest counters moving; TUI updates.
 
 Phase B: Productionize Massive S3 and scheduling
+
 - B1. S3 client (aws-sdk-s3)
   - Implement S3 adapter; support region, bucket, prefix; HEAD and GET streaming; retries and backoff.
   - Acceptance: HEAD and GET succeed against Massive bucket using credentials.
@@ -171,6 +175,7 @@ Phase B: Productionize Massive S3 and scheduling
   - Acceptance: fault-injection test with forced retries completes successfully.
 
 Phase C: Prepare reuse by WS and future classification
+
 - C1. Make the flatfile output path identical to WS path
   - DataBatch shape and storage code are already shared; document the contract in core-types so WS can emit the same rows.
 - C2. NBBO flatfile ingestion (equities)
@@ -181,6 +186,7 @@ Phase C: Prepare reuse by WS and future classification
   - Check in a tiny golden parquet for trades and NBBO; verify classification results repeat.
 
 Technical notes and recommendations
+
 - Object key template: make it a config string with date subst, e.g., s3://{bucket}/{prefix}/dt={YYYY-MM-DD}/equity_trades.csv.gz or path that matches Massive’s layout. You can support both “one file per day” and “many files per day” by listing under a date prefix and ingesting all parts.
 - Memory and concurrency: keep batches around 50k rows, with a bounded channel between parser and writer. Use spawn_blocking for CSV parsing and decompression to avoid blocking Tokio.
 - Timestamps: parse integers as ns; guard against invalid or zero; drop or mark completeness=Partial with reason hints if input is corrupted (and emit a metric).
@@ -188,6 +194,7 @@ Technical notes and recommendations
 - Idempotence: if re-ingesting a day, write a new parquet part and rely on dedup keys in reads/compaction, or atomically replace the partition after successful write.
 
 Immediate next actions
+
 - Adjust AppConfig::load to not require polygon keys so we can use config.toml as-is.
 - Add missing fields to EquityTrade and define the full Arrow schema for equities.
 - Implement equity_trades_to_record_batch with real arrays and per-row partitioning by dt.

@@ -5,9 +5,6 @@ use serde::{Deserialize, Serialize};
 /// Config structure with key knobs from spec.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
-    pub polygonio_key: String,
-    pub polygonio_access_key_id: String,
-    pub polygonio_secret_access_key: String,
     pub ws: WsConfig,
     pub staleness: StalenessConfig,
     pub classifier: ClassifierConfig,
@@ -126,6 +123,9 @@ fn default_hysteresis() -> f64 {
 pub struct FlatfileConfig {
     #[serde(default)]
     pub date_ranges: Vec<DateRange>,
+    pub polygonio_key: String,
+    pub polygonio_access_key_id: String,
+    pub polygonio_secret_access_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,14 +159,20 @@ impl AppConfig {
             .add_source(config::Environment::default())
             .build()?;
         let config: Self = settings.try_deserialize()?;
-        if config.polygonio_key.is_empty() {
-            return Err(ConfigError::Message("POLYGONIO_KEY is required".to_string()));
+        if config.flatfile.polygonio_key.is_empty() {
+            return Err(ConfigError::Message(
+                "POLYGONIO_KEY is required".to_string(),
+            ));
         }
-        if config.polygonio_access_key_id.is_empty() {
-            return Err(ConfigError::Message("POLYGONIO_ACCESS_KEY_ID is required".to_string()));
+        if config.flatfile.polygonio_access_key_id.is_empty() {
+            return Err(ConfigError::Message(
+                "POLYGONIO_ACCESS_KEY_ID is required".to_string(),
+            ));
         }
-        if config.polygonio_secret_access_key.is_empty() {
-            return Err(ConfigError::Message("POLYGONIO_SECRET_ACCESS_KEY is required".to_string()));
+        if config.flatfile.polygonio_secret_access_key.is_empty() {
+            return Err(ConfigError::Message(
+                "POLYGONIO_SECRET_ACCESS_KEY is required".to_string(),
+            ));
         }
         Ok(config)
     }

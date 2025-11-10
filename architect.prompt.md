@@ -129,7 +129,16 @@ Lower-priority or follow-on gaps
 
 3) Concrete, small steps to completion
 
-- A6. DataClientRouter and orchestrator wiring
+- A4. FlatfileSource: object store adapters
+  - Define ObjectStore trait: head, list, get_stream.
+  - Implement local file adapter for dev; stub S3 (signature and config only).
+  - Acceptance: flatfile reader can open local gz CSV and stream bytes.
+
+- A5. FlatfileSource: CSV gz reader/parser -> DataBatch<EquityTrade>
+  - Stream parse with bounded buffers, spawn_blocking for CSV decode; batch every N rows; set DataBatchMeta.
+  - Acceptance: unit test with a small sample file yields expected EquityTrade rows; conditions parsed; timestamps correct.
+
+- A6. DataClient router and orchestrator wiring
   - Implement DataClient for FlatfileSource.get_equity_trades(scope).
   - In orchestrator: for each date range day, call get_equity_trades and pipe batches to Storage.write_equity_trades. Use a simple concurrency of 1–2 days at a time.
   - Acceptance: Running cargo run ingests a local sample, writes parquet under data/equity_trades/dt=YYYY-MM-DD, and metrics reflect ingestion.

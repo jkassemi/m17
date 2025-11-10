@@ -1,12 +1,17 @@
 // Copyright (c) James Kassemi, SC, US. All rights reserved.
 
-//! Flatfile reader (stub).
+//! Flatfile reader
 
 use async_compression::tokio::bufread::GzipDecoder;
 use async_trait::async_trait;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::{
+    config::{BehaviorVersion, Credentials},
+    Client,
+};
 use bytes::Bytes;
+use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use core_types::config::FlatfileConfig;
-use core_types::data_client::DataClient;
 use core_types::types::{
     AggressorSide, ClassMethod, Completeness, DataBatch, DataBatchMeta, EquityTrade, Nbbo,
     OptionTrade, Quality, QueryScope, Source, Watermark,
@@ -15,30 +20,22 @@ use csv::Reader;
 use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
-use std::io::Cursor;
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::io::{self, BufRead};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use tokio::fs::File;
-use tokio::io::BufReader;
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::io::ReaderStream;
+use tokio_util::io::{ReaderStream, StreamReader};
+use trading_calendar::{Market, TradingCalendar};
 
-/// Object store trait for accessing files.
+/// Combined source trait merging ObjectStore, UpdateLoop, and Queryable.
 #[async_trait]
-pub trait ObjectStore: Send + Sync {
-    /// Check if a file exists (head operation).
-    async fn head(&self, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-    /// List files with a given prefix.
-    async fn list(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>;
-
-    /// Get a stream of bytes for a file.
+pub trait Source: Send + Sync + 'static {
     async fn get_stream(
         &self,
         path: &str,
@@ -46,51 +43,105 @@ pub trait ObjectStore: Send + Sync {
         Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send>>,
         Box<dyn std::error::Error + Send + Sync>,
     >;
+
+    async fn run(&self);
+
+    fn status(&self) -> String;
+
+    async fn get_option_trades(
+        &self,
+        scope: QueryScope,
+    ) -> Pin<Box<dyn Stream<Item = DataBatch<OptionTrade>> + Send>>;
+
+    async fn get_equity_trades(
+        &self,
+        scope: QueryScope,
+    ) -> Pin<Box<dyn Stream<Item = DataBatch<EquityTrade>> + Send>>;
+
+    async fn get_nbbo(
+        &self,
+        scope: QueryScope,
+    ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>>;
 }
 
-/// Local file system implementation for development.
-pub struct LocalFileStore {
-    base_path: PathBuf,
+#[derive(Clone)]
+pub struct FlatfileSource {
+    status: Arc<Mutex<String>>,
+    config: Arc<dyn FlatfileConfig>,
+    client: Client,
 }
 
-impl LocalFileStore {
-    pub fn new(base_path: PathBuf) -> Self {
-        Self { base_path }
+impl FlatfileSource {
+    pub async fn new(config: Arc<dyn FlatfileConfig>) -> Self {
+        let credentials = Credentials::new(
+            config.access_key(),
+            config.secret_key(),
+            None,
+            None,
+            "flatfile",
+        );
+        let s3_config = aws_sdk_s3::Config::builder()
+            .endpoint_url("https://files.massive.com")
+            .credentials_provider(credentials)
+            .behavior_version(BehaviorVersion::latest())
+            .build();
+        let client = Client::from_conf(s3_config);
+        Self {
+            status: Arc::new(Mutex::new("Initializing".to_string())),
+            config,
+            client,
+        }
+    }
+
+    async fn download_file(
+        &self,
+        path: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let local_dir = self.config.local_dir();
+        let local_path = local_dir.join(path);
+        fs::create_dir_all(local_path.parent().unwrap()).await?;
+        let resp = self
+            .client
+            .get_object()
+            .bucket("flatfiles")
+            .key(path)
+            .send()
+            .await?;
+        let data = resp.body.collect().await?;
+        fs::write(&local_path, data.payload()).await?;
+        Ok(())
+    }
+
+    async fn load_processed(
+        &self,
+    ) -> Result<HashSet<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let state_path = self.config.flatfile_state_path();
+        if !fs::try_exists(&state_path).await? {
+            fs::write(&state_path, b"").await?;
+        }
+        let file = File::open(&state_path).await?;
+        let reader = BufReader::new(file);
+        let mut lines = reader.lines();
+        let mut set = HashSet::new();
+        while let Some(line) = lines.next_line().await? {
+            set.insert(line);
+        }
+        Ok(set)
+    }
+
+    async fn append_processed(
+        &self,
+        path: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let state_path = self.config.flatfile_state_path();
+        let mut file = OpenOptions::new().append(true).open(&state_path).await?;
+        file.write_all((path.to_string() + "\n").as_bytes()).await?;
+        Ok(())
     }
 }
 
 #[async_trait]
-impl ObjectStore for LocalFileStore {
-    async fn head(&self, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let full_path = self.base_path.join(path);
-        if full_path.exists() {
-            Ok(())
-        } else {
-            Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "File not found",
-            )))
-        }
-    }
-
-    async fn list(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut files = Vec::new();
-        let prefix_path = self.base_path.join(prefix);
-        if let Ok(entries) = std::fs::read_dir(&prefix_path) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    if let Some(file_name) = entry.file_name().to_str() {
-                        files.push(file_name.to_string());
-                    }
-                }
-            }
-        }
-        Ok(files)
-    }
-
+impl Source for FlatfileSource {
     async fn get_stream(
         &self,
         path: &str,
@@ -98,225 +149,139 @@ impl ObjectStore for LocalFileStore {
         Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send>>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let full_path = self.base_path.join(path);
-        let file = File::open(&full_path).await?;
-        let reader = BufReader::new(file);
-
-        // Check if gzipped
-        let stream: Pin<
-            Box<dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send>,
-        >;
-        if path.ends_with(".gz") {
-            let decoder = GzipDecoder::new(reader);
-            stream = Box::pin(
-                ReaderStream::new(decoder)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
-            );
-        } else {
-            stream = Box::pin(
-                ReaderStream::new(reader)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
-            );
-        }
-
-        Ok(stream)
-    }
-}
-
-/// S3 implementation (stub: signature and config only).
-pub struct S3Store {
-    bucket: String,
-    // Add config fields as needed
-}
-
-impl S3Store {
-    pub fn new(bucket: String) -> Self {
-        Self { bucket }
-    }
-}
-
-#[async_trait]
-impl ObjectStore for S3Store {
-    async fn head(&self, _path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Stub: Always return error
-        Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "S3 not implemented",
-        )))
-    }
-
-    async fn list(
-        &self,
-        _prefix: &str,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        // Stub: Return empty list
-        Ok(Vec::new())
-    }
-
-    async fn get_stream(
-        &self,
-        _path: &str,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        // Stub: Return empty stream
-        Ok(Box::pin(futures::stream::empty()))
-    }
-}
-
-/// Stub flatfile source.
-pub struct FlatfileSource {
-    status: Arc<Mutex<String>>,
-    store: Arc<dyn ObjectStore>,
-}
-
-impl FlatfileSource {
-    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self {
-            status: Arc::new(Mutex::new("Initializing".to_string())),
-            store,
-        }
-    }
-
-    /// Run the flatfile source loop to maintain data for configured ranges.
-    pub async fn run(&self, config: FlatfileConfig) {
-        loop {
-            // Stub: Check and update data for each range
-            let mut status_parts = Vec::new();
-            for range in &config.date_ranges {
-                let start = range.start_ts_ns().unwrap_or(0);
-                let end = range.end_ts_ns().unwrap_or(None).unwrap_or(0);
-                status_parts.push(format!("Range {} - {}: Checking...", start, end));
+        let local_dir = self.config.local_dir();
+        let local_path = local_dir.join(path);
+        if fs::try_exists(&local_path).await? {
+            let file = File::open(&local_path).await?;
+            let reader = BufReader::new(file);
+            let stream: Pin<
+                Box<
+                    dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>
+                        + Send,
+                >,
+            >;
+            if path.ends_with(".gz") {
+                let decoder = GzipDecoder::new(reader);
+                stream = Box::pin(
+                    ReaderStream::new(decoder)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+                );
+            } else {
+                stream = Box::pin(
+                    ReaderStream::new(reader)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+                );
             }
-            let status = format!("Flatfile: {}", status_parts.join(", "));
+            Ok(stream)
+        } else {
+            let resp = self
+                .client
+                .get_object()
+                .bucket("flatfiles")
+                .key(path)
+                .send()
+                .await?;
+            let body: ByteStream = resp.body;
+            let stream_err_mapped =
+                body.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+
+            let stream: Pin<
+                Box<
+                    dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>
+                        + Send,
+                >,
+            >;
+            if path.ends_with(".gz") {
+                let stream_reader =
+                    StreamReader::new(stream_err_mapped.map(|res| {
+                        res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                    }));
+                let buf_reader = BufReader::new(stream_reader);
+                let decoder = GzipDecoder::new(buf_reader);
+                stream = Box::pin(
+                    ReaderStream::new(decoder)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+                );
+            } else {
+                stream = Box::pin(stream_err_mapped);
+            }
+            Ok(stream)
+        }
+    }
+
+    async fn run(&self) {
+        loop {
+            let mut status_parts = Vec::new();
+            let calendar = TradingCalendar::new(Market::NYSE).unwrap();
+            let mut processed = self.load_processed().await.unwrap_or_default();
+            for range in self.config.date_ranges() {
+                let start_ts = range.start_ts_ns().unwrap_or(0);
+                let end_ts = range
+                    .end_ts_ns()
+                    .unwrap_or_else(|| Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX));
+                let start_dt: DateTime<Utc> = DateTime::from_timestamp(
+                    start_ts / 1_000_000_000,
+                    ((start_ts % 1_000_000_000) as u32),
+                )
+                .unwrap_or(Utc::now());
+                let end_dt: DateTime<Utc> = DateTime::from_timestamp(
+                    end_ts / 1_000_000_000,
+                    ((end_ts % 1_000_000_000) as u32),
+                )
+                .unwrap_or(Utc::now());
+                let mut current_date = start_dt.date_naive();
+                let end_date = end_dt.date_naive();
+                let now_date = Utc::now().date_naive();
+                while current_date <= end_date {
+                    if calendar.is_trading_day(current_date).unwrap_or(false) {
+                        let year = current_date.year();
+                        let month = current_date.month();
+                        let day = current_date.day();
+                        let path = format!(
+                            "us_stocks_sip/trades_v1/{}/{:02}/{}-{:02}-{:02}.csv.gz",
+                            year, month, year, month, day
+                        );
+                        let exists = self
+                            .client
+                            .head_object()
+                            .bucket("flatfiles")
+                            .key(&path)
+                            .send()
+                            .await
+                            .is_ok();
+                        if exists {
+                            if !processed.contains(&path) {
+                                if let Ok(_) = self.download_file(&path).await {
+                                    processed.insert(path.clone());
+                                    let _ = self.append_processed(&path).await;
+                                }
+                            }
+                        } else if current_date < now_date {
+                            status_parts.push(format!("Missing: {}", current_date));
+                        }
+                    }
+                    current_date += TimeDelta::try_days(1).unwrap();
+                }
+            }
+            let status = if status_parts.is_empty() {
+                "All files present and processed".to_string()
+            } else {
+                format!("Missing files: {}", status_parts.join(", "))
+            };
             *self.status.lock().unwrap() = status;
 
-            // Stub: Simulate work
-            sleep(Duration::from_secs(10)).await;
+            sleep(Duration::from_secs(300)).await; // Check every 5 minutes
         }
     }
 
-    /// Get current status.
-    pub fn status(&self) -> String {
+    fn status(&self) -> String {
         self.status.lock().unwrap().clone()
     }
 
-    /// Stub: Return empty stream.
-    pub async fn get_nbbo(
-        &self,
-        _scope: QueryScope,
-    ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>> {
-        Box::pin(futures::stream::empty())
-    }
-
-    /// Stream parse CSV gz to DataBatch<EquityTrade> with bounded buffers, spawn_blocking for decode, batch every 1000 rows, set DataBatchMeta.
-    pub async fn get_equity_trades(
-        &self,
-        _scope: QueryScope,
-    ) -> Pin<Box<dyn Stream<Item = DataBatch<EquityTrade>> + Send>> {
-        let (tx, rx) = mpsc::channel(10);
-        let store = self.store.clone();
-        tokio::spawn(async move {
-            // Hardcode path for stub; in real impl, derive from scope
-            let path = "stock_trades_sample.csv.gz";
-            let stream_result = store.get_stream(path).await;
-            if let Ok(mut stream) = stream_result {
-                let mut bytes = Vec::new();
-                while let Some(chunk) = stream.next().await {
-                    if let Ok(chunk) = chunk {
-                        bytes.extend_from_slice(&chunk);
-                    }
-                }
-                // Spawn blocking for CPU-intensive decode and parse
-                let tx_clone = tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let csv_data = bytes;
-                    let cursor = Cursor::new(csv_data);
-                    let mut rdr = Reader::from_reader(cursor);
-                    let mut batch = Vec::new();
-                    const BATCH_SIZE: usize = 1000;
-                    for result in rdr.records() {
-                        if let Ok(record) = result {
-                            let trade = EquityTrade {
-                                symbol: record[0].to_string(),
-                                trade_ts_ns: record[5].parse().unwrap_or(0),
-                                price: record[6].parse().unwrap_or(0.0),
-                                size: record[9].parse().unwrap_or(0),
-                                conditions: record[1]
-                                    .split(',')
-                                    .filter_map(|s| s.trim().parse().ok())
-                                    .collect(),
-                                exchange: record[3].parse().unwrap_or(0),
-                                aggressor_side: AggressorSide::Unknown,
-                                class_method: ClassMethod::Unknown,
-                                aggressor_offset_mid_bp: None,
-                                aggressor_offset_touch_ticks: None,
-                                nbbo_bid: None,
-                                nbbo_ask: None,
-                                nbbo_bid_sz: None,
-                                nbbo_ask_sz: None,
-                                nbbo_ts_ns: None,
-                                nbbo_age_us: None,
-                                nbbo_state: None,
-                                tick_size_used: None,
-                                source: Source::Flatfile,
-                                quality: Quality::Prelim,
-                                watermark_ts_ns: 0,
-                                trade_id: Some(record[4].to_string()),
-                                seq: Some(record[7].parse().unwrap_or(0)),
-                                participant_ts_ns: Some(record[8].parse().unwrap_or(0)),
-                                tape: Some(record[10].to_string()),
-                                correction: Some(record[2].parse().unwrap_or(0)),
-                                trf_id: Some(record[11].to_string()),
-                                trf_ts_ns: Some(record[12].parse().unwrap_or(0)),
-                            };
-                            batch.push(trade);
-                            if batch.len() == BATCH_SIZE {
-                                let meta = DataBatchMeta {
-                                    source: Source::Flatfile,
-                                    quality: Quality::Prelim,
-                                    watermark: Watermark {
-                                        watermark_ts_ns: 0, // Placeholder
-                                        completeness: Completeness::Complete,
-                                        hints: None,
-                                    },
-                                    schema_version: 1,
-                                };
-                                let _ = tx_clone.try_send(DataBatch { rows: batch, meta });
-                                batch = Vec::new();
-                            }
-                        }
-                    }
-                    if !batch.is_empty() {
-                        let meta = DataBatchMeta {
-                            source: Source::Flatfile,
-                            quality: Quality::Prelim,
-                            watermark: Watermark {
-                                watermark_ts_ns: 0, // Placeholder
-                                completeness: Completeness::Complete,
-                                hints: None,
-                            },
-                            schema_version: 1,
-                        };
-                        let _ = tx_clone.try_send(DataBatch { rows: batch, meta });
-                    }
-                })
-                .await
-                .unwrap();
-            }
-        });
-        Box::pin(ReceiverStream::new(rx))
-    }
-}
-
-#[async_trait::async_trait]
-impl DataClient for FlatfileSource {
     async fn get_option_trades(
         &self,
         _scope: QueryScope,
     ) -> Pin<Box<dyn Stream<Item = DataBatch<OptionTrade>> + Send>> {
-        // Stub: Return empty stream
         Box::pin(futures::stream::empty())
     }
 
@@ -324,29 +289,145 @@ impl DataClient for FlatfileSource {
         &self,
         scope: QueryScope,
     ) -> Pin<Box<dyn Stream<Item = DataBatch<EquityTrade>> + Send>> {
-        self.get_equity_trades(scope).await
+        let (tx, rx) = mpsc::channel(100);
+        let self_clone = self.clone();
+        let scope_clone = scope.clone();
+        tokio::spawn(async move {
+            let calendar = TradingCalendar::new(Market::NYSE).unwrap();
+            let start_ts = scope_clone.time_range.0;
+            let end_ts = scope_clone.time_range.1;
+            let start_dt: DateTime<Utc> = DateTime::from_timestamp(
+                start_ts / 1_000_000_000,
+                (start_ts % 1_000_000_000) as u32,
+            )
+            .unwrap_or(Utc::now());
+            let end_dt: DateTime<Utc> =
+                DateTime::from_timestamp(end_ts / 1_000_000_000, (end_ts % 1_000_000_000) as u32)
+                    .unwrap_or(Utc::now());
+            let mut current_date = start_dt.date_naive();
+            let end_date = end_dt.date_naive();
+            while current_date <= end_date {
+                if calendar.is_trading_day(current_date).unwrap_or(false) {
+                    let year = current_date.year();
+                    let month = current_date.month();
+                    let day = current_date.day();
+                    let path = format!(
+                        "us_stocks_sip/trades_v1/{}/{:02}/{}-{:02}-{:02}.csv.gz",
+                        year, month, year, month, day
+                    );
+                    process_equity_trades_stream(&self_clone, &path, &scope_clone, tx.clone())
+                        .await;
+                }
+                current_date += TimeDelta::try_days(1).unwrap();
+            }
+        });
+        Box::pin(ReceiverStream::new(rx))
     }
 
     async fn get_nbbo(
         &self,
-        scope: QueryScope,
+        _scope: QueryScope,
     ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>> {
-        self.get_nbbo(scope).await
+        Box::pin(futures::stream::empty())
     }
 }
 
-fn parse_aggressor_side(s: &str) -> AggressorSide {
-    match s.to_lowercase().as_str() {
-        "buy" => AggressorSide::Buyer,
-        "sell" => AggressorSide::Seller,
-        _ => AggressorSide::Unknown,
-    }
-}
-
-fn parse_class_method(s: &str) -> ClassMethod {
-    match s.to_lowercase().as_str() {
-        "tick_rule" => ClassMethod::TickRule,
-        _ => ClassMethod::Unknown,
+async fn process_equity_trades_stream<S: Source>(
+    source: &S,
+    path: &str,
+    scope: &QueryScope,
+    tx: mpsc::Sender<DataBatch<EquityTrade>>,
+) {
+    if let Ok(stream) = source.get_stream(path).await {
+        if let Ok(bytes) = stream
+            .try_fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend(chunk);
+                Ok(acc)
+            })
+            .await
+        {
+            let instruments = scope.instruments.clone();
+            let tx_clone = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let cursor = std::io::Cursor::new(bytes);
+                let mut rdr = Reader::from_reader(cursor);
+                let mut batch = Vec::new();
+                const BATCH_SIZE: usize = 1000;
+                for result in rdr.records() {
+                    if let Ok(record) = result {
+                        let symbol = record[0].to_string();
+                        if !instruments.is_empty() && !instruments.contains(&symbol) {
+                            continue;
+                        }
+                        let trade = EquityTrade {
+                            symbol,
+                            trade_ts_ns: record[5].parse().unwrap_or(0),
+                            price: record[6].parse().unwrap_or(0.0),
+                            size: record[9].parse().unwrap_or(0),
+                            conditions: record[1]
+                                .split(',')
+                                .filter_map(|s| s.trim().parse().ok())
+                                .collect(),
+                            exchange: record[3].parse().unwrap_or(0),
+                            aggressor_side: AggressorSide::Unknown,
+                            class_method: ClassMethod::Unknown,
+                            aggressor_offset_mid_bp: None,
+                            aggressor_offset_touch_ticks: None,
+                            nbbo_bid: None,
+                            nbbo_ask: None,
+                            nbbo_bid_sz: None,
+                            nbbo_ask_sz: None,
+                            nbbo_ts_ns: None,
+                            nbbo_age_us: None,
+                            nbbo_state: None,
+                            tick_size_used: None,
+                            source: Source::Flatfile,
+                            quality: Quality::Prelim,
+                            watermark_ts_ns: 0,
+                            trade_id: Some(record[4].to_string()),
+                            seq: Some(record[7].parse().unwrap_or(0)),
+                            participant_ts_ns: Some(record[8].parse().unwrap_or(0)),
+                            tape: Some(record[10].to_string()),
+                            correction: Some(record[2].parse().unwrap_or(0)),
+                            trf_id: Some(record[11].to_string()),
+                            trf_ts_ns: Some(record[12].parse().unwrap_or(0)),
+                        };
+                        batch.push(trade);
+                        if batch.len() == BATCH_SIZE {
+                            let meta = DataBatchMeta {
+                                source: Source::Flatfile,
+                                quality: Quality::Prelim,
+                                watermark: Watermark {
+                                    watermark_ts_ns: 0, // Placeholder
+                                    completeness: Completeness::Complete,
+                                    hints: None,
+                                },
+                                schema_version: 1,
+                            };
+                            let _ = tx_clone.try_send(DataBatch {
+                                rows: std::mem::take(&mut batch),
+                                meta,
+                            });
+                        }
+                    }
+                }
+                if !batch.is_empty() {
+                    let meta = DataBatchMeta {
+                        source: Source::Flatfile,
+                        quality: Quality::Prelim,
+                        watermark: Watermark {
+                            watermark_ts_ns: 0, // Placeholder
+                            completeness: Completeness::Complete,
+                            hints: None,
+                        },
+                        schema_version: 1,
+                    };
+                    let _ = tx_clone.try_send(DataBatch { rows: batch, meta });
+                }
+            })
+            .await
+            .unwrap();
+        }
     }
 }
 
@@ -354,11 +435,106 @@ fn parse_class_method(s: &str) -> ClassMethod {
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::path::PathBuf;
+
+    #[derive(Clone)]
+    pub struct LocalFileSource {
+        status: Arc<Mutex<String>>,
+        base_path: PathBuf,
+    }
+
+    impl LocalFileSource {
+        pub fn new(base_path: PathBuf) -> Self {
+            Self {
+                status: Arc::new(Mutex::new("Initializing".to_string())),
+                base_path,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Source for LocalFileSource {
+        async fn get_stream(
+            &self,
+            path: &str,
+        ) -> Result<
+            Pin<
+                Box<
+                    dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>
+                        + Send,
+                >,
+            >,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            let full_path = self.base_path.join(path);
+            let file = File::open(&full_path).await?;
+            let reader = BufReader::new(file);
+
+            let stream: Pin<
+                Box<
+                    dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>
+                        + Send,
+                >,
+            >;
+            if path.ends_with(".gz") {
+                let decoder = GzipDecoder::new(reader);
+                stream = Box::pin(
+                    ReaderStream::new(decoder)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+                );
+            } else {
+                stream = Box::pin(
+                    ReaderStream::new(reader)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+                );
+            }
+
+            Ok(stream)
+        }
+
+        async fn run(&self) {
+            loop {
+                sleep(Duration::from_secs(10)).await;
+            }
+        }
+
+        fn status(&self) -> String {
+            "OK".to_string()
+        }
+
+        async fn get_option_trades(
+            &self,
+            _scope: QueryScope,
+        ) -> Pin<Box<dyn Stream<Item = DataBatch<OptionTrade>> + Send>> {
+            Box::pin(futures::stream::empty())
+        }
+
+        async fn get_equity_trades(
+            &self,
+            scope: QueryScope,
+        ) -> Pin<Box<dyn Stream<Item = DataBatch<EquityTrade>> + Send>> {
+            let (tx, rx) = mpsc::channel(10);
+            let self_clone = self.clone();
+            let scope_clone = scope.clone();
+            tokio::spawn(async move {
+                let path = "stock_trades_sample.csv.gz";
+                process_equity_trades_stream(&self_clone, path, &scope_clone, tx).await;
+            });
+            Box::pin(ReceiverStream::new(rx))
+        }
+
+        async fn get_nbbo(
+            &self,
+            _scope: QueryScope,
+        ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>> {
+            Box::pin(futures::stream::empty())
+        }
+    }
 
     #[tokio::test]
     async fn test_local_file_store_stream_stock_quotes_sample() {
-        let store = LocalFileStore::new(PathBuf::from("fixtures"));
-        let mut stream = store
+        let source = LocalFileSource::new(PathBuf::from("fixtures"));
+        let mut stream = source
             .get_stream("stock_quotes_sample.csv.gz")
             .await
             .unwrap();
@@ -374,8 +550,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_local_file_store_stream_stock_trades_sample() {
-        let store = LocalFileStore::new(PathBuf::from("fixtures"));
-        let mut stream = store
+        let source = LocalFileSource::new(PathBuf::from("fixtures"));
+        let mut stream = source
             .get_stream("stock_trades_sample.csv.gz")
             .await
             .unwrap();
@@ -390,9 +566,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_flatfile_source_get_equity_trades() {
-        let store = Arc::new(LocalFileStore::new(PathBuf::from("fixtures")));
-        let source = FlatfileSource::new(store);
+    async fn test_local_file_source_get_equity_trades() {
+        let source = LocalFileSource::new(PathBuf::from("fixtures"));
         let scope = QueryScope {
             instruments: vec![],
             time_range: (0, i64::MAX),

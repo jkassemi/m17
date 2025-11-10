@@ -24,7 +24,9 @@ use tui::Tui;
 #[tokio::main]
 async fn main() {
     let config = AppConfig::load().expect("Failed to load config: required environment variables POLYGONIO_KEY, POLYGONIO_ACCESS_KEY_ID, POLYGONIO_SECRET_ACCESS_KEY must be set");
-    let flatfile_source = FlatfileSource::new(Arc::new(config.flatfile)).await;
+    let flatfile_config = config.flatfile.clone();
+    let flatfile_source = FlatfileSource::new(Arc::new(flatfile_config)).await;
+    let flatfile_source_clone = flatfile_source.clone();
     let nbbo_store = NbboStore::new();
     let classifier = Classifier::new();
     let storage = Arc::new(Mutex::new(Storage::new(config.storage)));
@@ -125,6 +127,7 @@ async fn main() {
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let storage = storage.clone();
             let metrics = metrics.clone();
+            let flatfile_source_for_task = flatfile_source_clone.clone();
             let day_start_ns = current_date
                 .and_hms_opt(0, 0, 0)
                 .unwrap()
@@ -149,7 +152,7 @@ async fn main() {
                 quality_target: core_types::types::Quality::Prelim,
             };
             tokio::spawn(async move {
-                let mut stream = flatfile_source.get_equity_trades(scope).await;
+                let mut stream = flatfile_source_for_task.get_equity_trades(scope).await;
                 while let Some(batch) = stream.next().await {
                     if let Err(e) = storage.lock().unwrap().write_equity_trades(&batch) {
                         eprintln!("Failed to write equity trades batch: {}", e);

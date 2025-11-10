@@ -23,7 +23,7 @@ use tui::Tui;
 #[tokio::main]
 async fn main() {
     let config = AppConfig::load().expect("Failed to load config: required environment variables POLYGONIO_KEY, POLYGONIO_ACCESS_KEY_ID, POLYGONIO_SECRET_ACCESS_KEY must be set");
-    let flatfile_source = FlatfileSource::new(Arc::new(config.flatfile));
+    let flatfile_source = FlatfileSource::new(Arc::new(config.flatfile)).await;
     let nbbo_store = NbboStore::new();
     let classifier = Classifier::new();
     let storage = Arc::new(Mutex::new(Storage::new(config.storage)));

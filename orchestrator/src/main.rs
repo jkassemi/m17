@@ -45,6 +45,7 @@ async fn main() {
             i, range.start_ts, range.end_ts
         );
     }
+    let metrics = Arc::new(Metrics::new());
     let flatfile_config = config.flatfile.clone();
     let flatfile_source = FlatfileSource::new(
         Arc::new(flatfile_config),
@@ -57,7 +58,6 @@ async fn main() {
     let nbbo_store = NbboStore::new();
     let classifier = Classifier::new();
     let storage = Arc::new(Mutex::new(Storage::new(config.storage)));
-    let metrics = Arc::new(Metrics::new()); // Wrap in Arc to match the serve method signature
 
     let mut planned_days: u64 = 0;
     for range in &config.flatfile.date_ranges {

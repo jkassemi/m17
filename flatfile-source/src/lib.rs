@@ -33,7 +33,7 @@ pub trait SourceTrait: Send + Sync + 'static {
         &self,
         path: &str,
     ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>> + Send>>,
+        Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
         Box<dyn std::error::Error + Send + Sync>,
     >;
 
@@ -173,15 +173,9 @@ impl SourceTrait for FlatfileSource {
             >;
             if path.ends_with(".gz") {
                 let decoder = GzipDecoder::new(reader);
-                stream = Box::pin(
-                    ReaderStream::new(decoder)
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
-                );
+                stream = Box::pin(ReaderStream::new(decoder));
             } else {
-                stream = Box::pin(
-                    ReaderStream::new(reader)
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
-                );
+                stream = Box::pin(ReaderStream::new(reader));
             }
             Ok(stream)
         } else {
@@ -203,16 +197,10 @@ impl SourceTrait for FlatfileSource {
             if path.ends_with(".gz") {
                 let buf_reader = BufReader::new(reader);
                 let decoder = GzipDecoder::new(buf_reader);
-                stream = Box::pin(
-                    ReaderStream::new(decoder)
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
-                );
+                stream = Box::pin(ReaderStream::new(decoder));
             } else {
                 let buf_reader = BufReader::new(reader);
-                stream = Box::pin(
-                    ReaderStream::new(buf_reader)
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
-                );
+                stream = Box::pin(ReaderStream::new(buf_reader));
             }
             Ok(stream)
         }
@@ -580,7 +568,7 @@ mod tests {
         ) -> Result<
             Pin<
                 Box<
-                    dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>
+                    dyn Stream<Item = Result<Bytes, std::io::Error>>
                         + Send,
                 >,
             >,
@@ -592,21 +580,15 @@ mod tests {
 
             let stream: Pin<
                 Box<
-                    dyn Stream<Item = Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>
+                    dyn Stream<Item = Result<Bytes, std::io::Error>>
                         + Send,
                 >,
             >;
             if path.ends_with(".gz") {
                 let decoder = GzipDecoder::new(reader);
-                stream = Box::pin(
-                    ReaderStream::new(decoder)
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
-                );
+                stream = Box::pin(ReaderStream::new(decoder));
             } else {
-                stream = Box::pin(
-                    ReaderStream::new(reader)
-                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
-                );
+                stream = Box::pin(ReaderStream::new(reader));
             }
 
             Ok(stream)

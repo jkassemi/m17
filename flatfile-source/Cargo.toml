@@ -11,7 +11,7 @@ bytes = "1"
 chrono = "0.4"
 core-types = { path = "../core-types" }
 csv = "1.1"
-csv-async = "1"
+csv-async = { version = "1", features = ["tokio"] }
 flate2 = "1"
 futures = "0.3"
 hyper-rustls = "0.27.7"

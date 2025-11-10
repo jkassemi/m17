@@ -396,7 +396,7 @@ impl Storage {
 
 struct PartitionWriter {
     file_path: PathBuf,
-    writer: ArrowWriter<std::fs::File>,
+    writer: Option<ArrowWriter<std::fs::File>>,
 }
 
 impl PartitionWriter {
@@ -407,11 +407,13 @@ impl PartitionWriter {
             .set_compression(Compression::ZSTD(Default::default()))
             .build();
         let writer = ArrowWriter::try_new(file, schema, Some(props))?;
-        Ok(Self { file_path, writer })
+        Ok(Self { file_path, writer: Some(writer) })
     }
 
     fn write(&mut self, batch: &RecordBatch) -> Result<(), StorageError> {
-        self.writer.write(batch)?;
+        if let Some(writer) = &mut self.writer {
+            writer.write(batch)?;
+        }
         Ok(())
     }
 
@@ -421,7 +423,9 @@ impl PartitionWriter {
     }
 
     fn close(&mut self) -> Result<(), StorageError> {
-        self.writer.close()?;
+        if let Some(writer) = self.writer.take() {
+            writer.close()?;
+        }
         Ok(())
     }
 }

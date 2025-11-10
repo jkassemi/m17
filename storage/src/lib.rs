@@ -2,14 +2,16 @@
 
 //! Parquet writer/reader with partitioning, compaction, and deduplication.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StringArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{Int32Type, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use chrono::DateTime;
+use chrono::{DateTime, NaiveDate, Utc};
 use core_types::schema::{equity_trade_schema, nbbo_schema, option_trade_schema};
 use core_types::types::{DataBatch, DataBatchMeta, EquityTrade, Nbbo, OptionTrade};
+use lru::LruCache;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -32,6 +34,7 @@ pub enum StorageError {
 pub struct Storage {
     config: core_types::config::StorageConfig,
     base_path: PathBuf,
+    dedup_cache: HashMap<String, LruCache<String, ()>>,
 }
 
 impl Storage {
@@ -39,6 +42,7 @@ impl Storage {
         Self {
             base_path: PathBuf::from(&config.paths.get("base").unwrap_or(&"data".to_string())),
             config,
+            dedup_cache: HashMap::new(),
         }
     }
 
@@ -46,15 +50,49 @@ impl Storage {
     pub fn write_option_trades(&self, batch: &DataBatch<OptionTrade>) -> Result<(), StorageError> {
         let _schema = option_trade_schema();
         let record_batch = self.option_trades_to_record_batch(&batch.rows, &batch.meta)?;
-        self.write_partitioned("options_trades", &record_batch, &batch.meta)?;
+        let dt = DateTime::from_timestamp(batch.meta.watermark.watermark_ts_ns / 1_000_000_000, (batch.meta.watermark.watermark_ts_ns % 1_000_000_000) as u32)
+            .unwrap()
+            .naive_utc()
+            .date();
+        self.write_partitioned("options_trades", &record_batch, &batch.meta, dt)?;
         Ok(())
     }
 
     /// Write a batch of equity trades to Parquet.
-    pub fn write_equity_trades(&self, batch: &DataBatch<EquityTrade>) -> Result<(), StorageError> {
-        let _schema = equity_trade_schema();
-        let record_batch = self.equity_trades_to_record_batch(&batch.rows, &batch.meta)?;
-        self.write_partitioned("equity_trades", &record_batch, &batch.meta)?;
+    pub fn write_equity_trades(&mut self, batch: &DataBatch<EquityTrade>) -> Result<(), StorageError> {
+        // Group trades by date
+        let mut trades_by_date: HashMap<NaiveDate, Vec<EquityTrade>> = HashMap::new();
+        for trade in &batch.rows {
+            let dt = DateTime::from_timestamp(trade.trade_ts_ns / 1_000_000_000, (trade.trade_ts_ns % 1_000_000_000) as u32)
+                .unwrap()
+                .naive_utc()
+                .date();
+            trades_by_date.entry(dt).or_insert_with(Vec::new).push(trade.clone());
+        }
+
+        // For each date group, dedup and write
+        for (date, mut trades) in trades_by_date {
+            // Dedup using in-memory cache
+            let mut deduped_trades = Vec::new();
+            for trade in trades {
+                let symbol = &trade.symbol;
+                let key = if let Some(ref trade_id) = trade.trade_id {
+                    format!("{}:{}", symbol, trade_id)
+                } else {
+                    format!("{}:{}:{}:{}", symbol, trade.trade_ts_ns, trade.price, trade.size)
+                };
+                let cache = self.dedup_cache.entry(symbol.clone()).or_insert_with(|| LruCache::new(std::num::NonZeroUsize::new(1000).unwrap()));
+                if !cache.contains(&key) {
+                    cache.put(key, ());
+                    deduped_trades.push(trade);
+                }
+            }
+
+            if !deduped_trades.is_empty() {
+                let record_batch = self.equity_trades_to_record_batch(&deduped_trades, &batch.meta)?;
+                self.write_partitioned("equity_trades", &record_batch, &batch.meta, date)?;
+            }
+        }
         Ok(())
     }
 
@@ -62,7 +100,11 @@ impl Storage {
     pub fn write_nbbo(&self, batch: &DataBatch<Nbbo>) -> Result<(), StorageError> {
         let _schema = nbbo_schema();
         let record_batch = self.nbbo_to_record_batch(&batch.rows, &batch.meta)?;
-        self.write_partitioned("nbbo", &record_batch, &batch.meta)?;
+        let dt = DateTime::from_timestamp(batch.meta.watermark.watermark_ts_ns / 1_000_000_000, (batch.meta.watermark.watermark_ts_ns % 1_000_000_000) as u32)
+            .unwrap()
+            .naive_utc()
+            .date();
+        self.write_partitioned("nbbo", &record_batch, &batch.meta, dt)?;
         Ok(())
     }
 
@@ -93,20 +135,16 @@ impl Storage {
         Ok(())
     }
 
-    fn write_partitioned(&self, table: &str, record_batch: &RecordBatch, meta: &DataBatchMeta) -> Result<(), StorageError> {
+    fn write_partitioned(&self, table: &str, record_batch: &RecordBatch, meta: &DataBatchMeta, dt: NaiveDate) -> Result<(), StorageError> {
         // Determine partition path: dt=YYYY-MM-DD, instrument_type, prefix
-        let dt = DateTime::from_timestamp(meta.watermark.watermark_ts_ns / 1_000_000_000, (meta.watermark.watermark_ts_ns % 1_000_000_000) as u32)
-            .unwrap()
-            .naive_utc()
-            .date()
-            .to_string();
+        let dt_str = dt.to_string();
         let _instrument_type = match table {
             "options_trades" | "nbbo" if table.contains("options") => "option",
             "equity_trades" => "equity",
             _ => "unknown",
         };
         let prefix = "prefix"; // Placeholder: derive from instrument_id prefix
-        let partition_path = format!("{}/{}/dt={}/{}/", self.base_path.display(), table, dt, prefix);
+        let partition_path = format!("{}/{}/dt={}/{}/", self.base_path.display(), table, dt_str, prefix);
         std::fs::create_dir_all(&partition_path)?;
     
         // Write Parquet with ZSTD compression
@@ -335,6 +373,9 @@ impl Storage {
 mod tests {
     use super::*;
     use core_types::types::{EquityTrade, Source, Quality, AggressorSide, ClassMethod, NbboState, DataBatchMeta, Watermark, Completeness};
+    use std::fs;
+    use tempfile::TempDir;
+    use parquet::arrow::ParquetFileArrowReader;
 
     #[test]
     fn test_serialize_equity_trade() {
@@ -386,5 +427,91 @@ mod tests {
         let record_batch = storage.equity_trades_to_record_batch(&batch.rows, &batch.meta).unwrap();
         assert_eq!(record_batch.num_rows(), 1);
         assert_eq!(record_batch.num_columns(), 27);
+    }
+
+    #[test]
+    fn test_dedup_equity_trades() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = core_types::config::StorageConfig::default();
+        config.paths.insert("base".to_string(), temp_dir.path().to_string_lossy().to_string());
+        let mut storage = Storage::new(config);
+
+        let trade1 = EquityTrade {
+            symbol: "AAPL".to_string(),
+            trade_ts_ns: 1640995200000000000, // Same day
+            price: 150.0,
+            size: 100,
+            conditions: vec![1],
+            exchange: 1,
+            aggressor_side: AggressorSide::Buyer,
+            class_method: ClassMethod::NbboTouch,
+            aggressor_offset_mid_bp: Some(10),
+            aggressor_offset_touch_ticks: Some(5),
+            nbbo_bid: Some(149.0),
+            nbbo_ask: Some(151.0),
+            nbbo_bid_sz: Some(200),
+            nbbo_ask_sz: Some(300),
+            nbbo_ts_ns: Some(1640995200000000000),
+            nbbo_age_us: Some(1000),
+            nbbo_state: Some(NbboState::Normal),
+            tick_size_used: Some(0.01),
+            source: Source::Ws,
+            quality: Quality::Prelim,
+            watermark_ts_ns: 1640995200000000000,
+            trade_id: Some("12345".to_string()),
+            seq: Some(123456),
+            participant_ts_ns: Some(1640995200000000000),
+            tape: Some("A".to_string()),
+            correction: Some(0),
+            trf_id: Some("trf123".to_string()),
+            trf_ts_ns: Some(1640995200000000000),
+        };
+        let trade2 = trade1.clone(); // Duplicate
+
+        let meta = DataBatchMeta {
+            source: Source::Ws,
+            quality: Quality::Prelim,
+            watermark: Watermark {
+                watermark_ts_ns: 1640995200000000000,
+                completeness: Completeness::Complete,
+                hints: None,
+            },
+            schema_version: 2,
+        };
+
+        // First batch
+        let batch1 = DataBatch {
+            rows: vec![trade1.clone()],
+            meta: meta.clone(),
+        };
+        storage.write_equity_trades(&batch1).unwrap();
+
+        // Second batch with duplicate
+        let batch2 = DataBatch {
+            rows: vec![trade2],
+            meta,
+        };
+        storage.write_equity_trades(&batch2).unwrap();
+
+        // Check total rows in files
+        let mut total_rows = 0;
+        for entry in fs::read_dir(temp_dir.path().join("equity_trades")).unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().is_dir() {
+                for file_entry in fs::read_dir(entry.path()).unwrap() {
+                    let file_entry = file_entry.unwrap();
+                    if file_entry.path().extension().unwrap_or_default() == "parquet" {
+                        let file = std::fs::File::open(&file_entry.path()).unwrap();
+                        let reader = ParquetFileArrowReader::new(file).unwrap();
+                        let mut record_reader = reader.get_record_reader(1024).unwrap();
+                        if let Some(record_batch) = record_reader.next() {
+                            total_rows += record_batch.unwrap().num_rows();
+                        }
+                    }
+                }
+            }
+        }
+        // Since dedup, should have only 1 row total
+        assert_eq!(total_rows, 1);
     }
 }

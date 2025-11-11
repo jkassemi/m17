@@ -12,11 +12,15 @@ use chrono::{DateTime, NaiveDate, Utc};
 use core_types::schema::{
     aggregation_schema, equity_trade_schema, nbbo_schema, option_trade_schema,
 };
-use core_types::types::{AggregationRow, DataBatch, DataBatchMeta, EquityTrade, Nbbo, OptionTrade};
+use core_types::types::{
+    AggregationRow, Completeness, DataBatch, DataBatchMeta, EquityTrade, Nbbo, OptionTrade,
+    Quality, Source, Watermark,
+};
 use lru::LruCache;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -33,6 +37,64 @@ pub enum StorageError {
     Parquet(#[from] parquet::errors::ParquetError),
     #[error("Schema version mismatch")]
     SchemaVersionMismatch,
+    #[error("Corrupt WAL entry: {0}")]
+    WalCorrupt(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WalEntry {
+    id: String,
+    dataset: String,
+    partition: String,
+    meta: WalMeta,
+    payload: WalPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WalMeta {
+    source: Source,
+    quality: Quality,
+    watermark_ts_ns: i64,
+    watermark_completeness: Completeness,
+    watermark_hints: Option<String>,
+    schema_version: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WalPayload {
+    OptionTrades { trades: Vec<OptionTrade> },
+    EquityTrades { trades: Vec<EquityTrade> },
+    Nbbo { quotes: Vec<Nbbo> },
+    Aggregations { rows: Vec<AggregationRow> },
+}
+
+impl From<&DataBatchMeta> for WalMeta {
+    fn from(meta: &DataBatchMeta) -> Self {
+        Self {
+            source: meta.source.clone(),
+            quality: meta.quality.clone(),
+            watermark_ts_ns: meta.watermark.watermark_ts_ns,
+            watermark_completeness: meta.watermark.completeness.clone(),
+            watermark_hints: meta.watermark.hints.clone(),
+            schema_version: meta.schema_version,
+        }
+    }
+}
+
+impl From<WalMeta> for DataBatchMeta {
+    fn from(meta: WalMeta) -> Self {
+        DataBatchMeta {
+            source: meta.source,
+            quality: meta.quality,
+            watermark: Watermark {
+                watermark_ts_ns: meta.watermark_ts_ns,
+                completeness: meta.watermark_completeness,
+                hints: meta.watermark_hints,
+            },
+            schema_version: meta.schema_version,
+        }
+    }
 }
 
 /// Storage handles Parquet I/O with partitioning and deduplication.
@@ -45,18 +107,237 @@ pub struct Storage {
 
 impl Storage {
     pub fn new(config: core_types::config::StorageConfig) -> Self {
-        Self {
+        let mut storage = Self {
             base_path: PathBuf::from(&config.paths.get("base").unwrap_or(&"data".to_string())),
             config,
             dedup_cache: HashMap::new(),
             writers: Mutex::new(HashMap::new()),
+        };
+        if let Err(err) = storage.replay_wal() {
+            panic!("failed to replay WAL: {}", err);
         }
+        storage
     }
 
     pub fn flush_all(&self) -> Result<(), StorageError> {
         let mut writers = self.writers.lock().unwrap();
         for writer in writers.values_mut() {
             writer.close()?;
+        }
+        Ok(())
+    }
+
+    fn wal_root(&self) -> PathBuf {
+        self.base_path.join("wal")
+    }
+
+    fn append_wal_entry(
+        &self,
+        dataset: &str,
+        partition: &str,
+        meta: &DataBatchMeta,
+        payload: WalPayload,
+    ) -> Result<PathBuf, StorageError> {
+        let entry = WalEntry {
+            id: Uuid::new_v4().to_string(),
+            dataset: dataset.to_string(),
+            partition: partition.to_string(),
+            meta: WalMeta::from(meta),
+            payload,
+        };
+        let wal_dir = self.wal_root().join(dataset);
+        std::fs::create_dir_all(&wal_dir)?;
+        let path = wal_dir.join(format!("{}.json", entry.id));
+        let file = std::fs::File::create(&path)?;
+        serde_json::to_writer(file, &entry).map_err(|e| StorageError::WalCorrupt(e.to_string()))?;
+        Ok(path)
+    }
+
+    fn commit_wal_entry(&self, path: PathBuf) -> Result<(), StorageError> {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    fn replay_wal(&mut self) -> Result<(), StorageError> {
+        let wal_root = self.wal_root();
+        if !wal_root.exists() {
+            return Ok(());
+        }
+        let mut pending = Vec::new();
+        for dataset_entry in std::fs::read_dir(&wal_root)? {
+            let dataset_path = dataset_entry?.path();
+            if !dataset_path.is_dir() {
+                continue;
+            }
+            for file in std::fs::read_dir(&dataset_path)? {
+                let path = file?.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                    continue;
+                }
+                pending.push(path);
+            }
+        }
+        pending.sort();
+        for path in pending {
+            let data = std::fs::read_to_string(&path)?;
+            let entry: WalEntry =
+                serde_json::from_str(&data).map_err(|e| StorageError::WalCorrupt(e.to_string()))?;
+            self.apply_wal_entry(entry)?;
+            std::fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    fn apply_wal_entry(&mut self, entry: WalEntry) -> Result<(), StorageError> {
+        let meta: DataBatchMeta = entry.meta.into();
+        match entry.payload {
+            WalPayload::OptionTrades { trades } => {
+                self.write_option_partition_from_rows(&entry.partition, trades, &meta, false)?;
+            }
+            WalPayload::EquityTrades { trades } => {
+                self.write_equity_partition_from_rows(&entry.partition, trades, &meta, false)?;
+            }
+            WalPayload::Nbbo { quotes } => {
+                self.write_nbbo_from_rows(&entry.partition, quotes, &meta, false)?;
+            }
+            WalPayload::Aggregations { rows } => {
+                self.write_aggregation_partition_from_rows(&entry.partition, rows, &meta, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn partition_dir(&self, rel_partition: &str) -> String {
+        if rel_partition.is_empty() {
+            self.base_path.display().to_string()
+        } else {
+            format!("{}/{}", self.base_path.display(), rel_partition)
+        }
+    }
+
+    fn write_with_pooled_writer(
+        &self,
+        rel_partition: &str,
+        record_batch: &RecordBatch,
+        target_bytes: u64,
+    ) -> Result<(), StorageError> {
+        let partition_dir = self.partition_dir(rel_partition);
+        std::fs::create_dir_all(&partition_dir)?;
+        {
+            let mut writers = self.writers.lock().unwrap();
+            let pw = writers.entry(partition_dir.clone()).or_insert_with(|| {
+                PartitionWriter::new(&partition_dir, record_batch.schema())
+                    .expect("failed to create partition writer")
+            });
+            pw.write(record_batch)?;
+            rotate_if_needed(pw, target_bytes)?;
+        }
+        Ok(())
+    }
+
+    fn write_option_partition_from_rows(
+        &mut self,
+        rel_partition: &str,
+        trades: Vec<OptionTrade>,
+        meta: &DataBatchMeta,
+        log_to_wal: bool,
+    ) -> Result<(), StorageError> {
+        if trades.is_empty() {
+            return Ok(());
+        }
+        let record_batch = self.option_trades_to_record_batch(&trades, meta)?;
+        let wal_path = if log_to_wal {
+            let payload = WalPayload::OptionTrades {
+                trades: trades.clone(),
+            };
+            Some(self.append_wal_entry("options_trades", rel_partition, meta, payload)?)
+        } else {
+            None
+        };
+        let target_bytes = self.config.file_size_mb_target.saturating_mul(1024 * 1024);
+        self.write_with_pooled_writer(rel_partition, &record_batch, target_bytes)?;
+        if let Some(path) = wal_path {
+            self.commit_wal_entry(path)?;
+        }
+        Ok(())
+    }
+
+    fn write_equity_partition_from_rows(
+        &mut self,
+        rel_partition: &str,
+        trades: Vec<EquityTrade>,
+        meta: &DataBatchMeta,
+        log_to_wal: bool,
+    ) -> Result<(), StorageError> {
+        if trades.is_empty() {
+            return Ok(());
+        }
+        let record_batch = self.equity_trades_to_record_batch(&trades, meta)?;
+        let wal_path = if log_to_wal {
+            let payload = WalPayload::EquityTrades {
+                trades: trades.clone(),
+            };
+            Some(self.append_wal_entry("equity_trades", rel_partition, meta, payload)?)
+        } else {
+            None
+        };
+        let target_bytes = self.config.file_size_mb_target.saturating_mul(1024 * 1024);
+        self.write_with_pooled_writer(rel_partition, &record_batch, target_bytes)?;
+        if let Some(path) = wal_path {
+            self.commit_wal_entry(path)?;
+        }
+        Ok(())
+    }
+
+    fn write_aggregation_partition_from_rows(
+        &mut self,
+        rel_partition: &str,
+        rows: Vec<AggregationRow>,
+        meta: &DataBatchMeta,
+        log_to_wal: bool,
+    ) -> Result<(), StorageError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let record_batch = self.aggregations_to_record_batch(&rows, meta)?;
+        let wal_path = if log_to_wal {
+            let payload = WalPayload::Aggregations { rows: rows.clone() };
+            Some(self.append_wal_entry("aggregations", rel_partition, meta, payload)?)
+        } else {
+            None
+        };
+        let target_bytes = self.config.file_size_mb_target.saturating_mul(1024 * 1024);
+        self.write_with_pooled_writer(rel_partition, &record_batch, target_bytes)?;
+        if let Some(path) = wal_path {
+            self.commit_wal_entry(path)?;
+        }
+        Ok(())
+    }
+
+    fn write_nbbo_from_rows(
+        &self,
+        rel_partition: &str,
+        quotes: Vec<Nbbo>,
+        meta: &DataBatchMeta,
+        log_to_wal: bool,
+    ) -> Result<(), StorageError> {
+        if quotes.is_empty() {
+            return Ok(());
+        }
+        let record_batch = self.nbbo_to_record_batch(&quotes, meta)?;
+        let wal_path = if log_to_wal {
+            let payload = WalPayload::Nbbo {
+                quotes: quotes.clone(),
+            };
+            Some(self.append_wal_entry("nbbo", rel_partition, meta, payload)?)
+        } else {
+            None
+        };
+        self.write_partitioned(rel_partition, &record_batch)?;
+        if let Some(path) = wal_path {
+            self.commit_wal_entry(path)?;
         }
         Ok(())
     }
@@ -105,29 +386,15 @@ impl Storage {
                 continue;
             }
 
-            let record_batch = self.option_trades_to_record_batch(&deduped_trades, &batch.meta)?;
             let dt_str = date.to_string();
             let prefix = "prefix"; // TODO: derive from contract prefix
-            let partition_dir = format!(
-                "{}/{}/dt={}/{}/",
-                self.base_path.display(),
-                "options_trades",
-                dt_str,
-                prefix
-            );
-            std::fs::create_dir_all(&partition_dir)?;
-
-            // Use pooled writer for this partition
-            let target_bytes = self.config.file_size_mb_target.saturating_mul(1024 * 1024);
-            {
-                let mut writers = self.writers.lock().unwrap();
-                let pw = writers.entry(partition_dir.clone()).or_insert_with(|| {
-                    PartitionWriter::new(&partition_dir, record_batch.schema())
-                        .expect("failed to create partition writer")
-                });
-                pw.write(&record_batch)?;
-                rotate_if_needed(pw, target_bytes)?;
-            }
+            let rel_partition = format!("options_trades/dt={}/{}/", dt_str, prefix);
+            self.write_option_partition_from_rows(
+                &rel_partition,
+                deduped_trades,
+                &batch.meta,
+                true,
+            )?;
         }
         Ok(())
     }
@@ -181,36 +448,21 @@ impl Storage {
                 continue;
             }
 
-            let record_batch = self.equity_trades_to_record_batch(&deduped_trades, &batch.meta)?;
             let dt_str = date.to_string();
             let prefix = "prefix"; // TODO: derive from instrument_id prefix
-            let partition_dir = format!(
-                "{}/{}/dt={}/{}/",
-                self.base_path.display(),
-                "equity_trades",
-                dt_str,
-                prefix
-            );
-            std::fs::create_dir_all(&partition_dir)?;
-            // Get a writer for this partition
-            let target_bytes = self.config.file_size_mb_target.saturating_mul(1024 * 1024);
-            {
-                let mut writers = self.writers.lock().unwrap();
-                let pw = writers.entry(partition_dir.clone()).or_insert_with(|| {
-                    PartitionWriter::new(&partition_dir, record_batch.schema())
-                        .expect("failed to create partition writer")
-                });
-                pw.write(&record_batch)?;
-                rotate_if_needed(pw, target_bytes)?;
-            }
+            let rel_partition = format!("equity_trades/dt={}/{}/", dt_str, prefix);
+            self.write_equity_partition_from_rows(
+                &rel_partition,
+                deduped_trades,
+                &batch.meta,
+                true,
+            )?;
         }
         Ok(())
     }
 
     /// Write a batch of NBBO to Parquet (deltas only if configured).
     pub fn write_nbbo(&self, batch: &DataBatch<Nbbo>) -> Result<(), StorageError> {
-        let _schema = nbbo_schema();
-        let record_batch = self.nbbo_to_record_batch(&batch.rows, &batch.meta)?;
         let dt = DateTime::from_timestamp(
             batch.meta.watermark.watermark_ts_ns / 1_000_000_000,
             (batch.meta.watermark.watermark_ts_ns % 1_000_000_000) as u32,
@@ -218,7 +470,10 @@ impl Storage {
         .unwrap()
         .naive_utc()
         .date();
-        self.write_partitioned("nbbo", &record_batch, &batch.meta, dt)?;
+        let dt_str = dt.to_string();
+        let prefix = "prefix"; // TODO: derive from instrument prefix
+        let rel_partition = format!("nbbo/dt={}/{}/", dt_str, prefix);
+        self.write_nbbo_from_rows(&rel_partition, batch.rows.clone(), &batch.meta, true)?;
         Ok(())
     }
 
@@ -248,26 +503,11 @@ impl Storage {
                 .push(row.clone());
         }
         for ((symbol, window, date), rows) in grouped {
-            let record_batch = self.aggregations_to_record_batch(&rows, &batch.meta)?;
-            let partition_dir = format!(
-                "{}/{}/symbol={}/window={}/dt={}/",
-                self.base_path.display(),
-                "aggregations",
-                symbol,
-                window,
-                date
+            let rel_partition = format!(
+                "aggregations/symbol={}/window={}/dt={}/",
+                symbol, window, date
             );
-            std::fs::create_dir_all(&partition_dir)?;
-            let target_bytes = self.config.file_size_mb_target.saturating_mul(1024 * 1024);
-            {
-                let mut writers = self.writers.lock().unwrap();
-                let pw = writers.entry(partition_dir.clone()).or_insert_with(|| {
-                    PartitionWriter::new(&partition_dir, record_batch.schema())
-                        .expect("failed to create aggregation writer")
-                });
-                pw.write(&record_batch)?;
-                rotate_if_needed(pw, target_bytes)?;
-            }
+            self.write_aggregation_partition_from_rows(&rel_partition, rows, &batch.meta, true)?;
         }
         Ok(())
     }
@@ -301,30 +541,12 @@ impl Storage {
 
     fn write_partitioned(
         &self,
-        table: &str,
+        rel_partition: &str,
         record_batch: &RecordBatch,
-        meta: &DataBatchMeta,
-        dt: NaiveDate,
     ) -> Result<(), StorageError> {
-        // Determine partition path: dt=YYYY-MM-DD, instrument_type, prefix
-        let dt_str = dt.to_string();
-        let _instrument_type = match table {
-            "options_trades" | "nbbo" if table.contains("options") => "option",
-            "equity_trades" => "equity",
-            _ => "unknown",
-        };
-        let prefix = "prefix"; // Placeholder: derive from instrument_id prefix
-        let partition_path = format!(
-            "{}/{}/dt={}/{}/",
-            self.base_path.display(),
-            table,
-            dt_str,
-            prefix
-        );
-        std::fs::create_dir_all(&partition_path)?;
-
-        // Write Parquet with ZSTD compression
-        let file_path = format!("{}data_{}.parquet", partition_path, Uuid::new_v4());
+        let partition_dir = self.partition_dir(rel_partition);
+        std::fs::create_dir_all(&partition_dir)?;
+        let file_path = format!("{}data_{}.parquet", partition_dir, Uuid::new_v4());
         let file = std::fs::File::create(&file_path)?;
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(Default::default()))

@@ -1,4 +1,4 @@
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use classifier::greeks::GreeksEngine;
 use core_types::config::{DateRange, FlatfileConfig, GreeksConfig, IngestConfig};
 use core_types::status::{OverallStatus, ServiceStatusHandle, StatusGauge};
@@ -8,10 +8,17 @@ use futures::StreamExt;
 use log::{error, info};
 use metrics::Metrics;
 use nbbo_cache::NbboStore;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use storage::Storage;
 use tokio::sync::{OwnedSemaphorePermit, RwLock as TokioRwLock, Semaphore};
 use treasury_ingestion_service::TreasuryServiceHandle;
+
+mod checkpoint;
+use checkpoint::CheckpointManager;
+
+const EQUITY_DATASET: &str = "equity_trades";
+const OPTIONS_DATASET: &str = "options_trades";
 
 /// Flatfile ingestion worker responsible for historical replay.
 pub struct FlatfileIngestionService {
@@ -24,6 +31,7 @@ pub struct FlatfileIngestionService {
     concurrent_days: usize,
     treasury: TreasuryServiceHandle,
     status: ServiceStatusHandle,
+    checkpoints: Arc<CheckpointManager>,
 }
 
 impl FlatfileIngestionService {
@@ -49,6 +57,7 @@ impl FlatfileIngestionService {
         let status = ServiceStatusHandle::new("flatfile_ingestion");
         status.set_overall(OverallStatus::Warn);
         status.push_warning("flatfile ingestion not started");
+        let checkpoints = Arc::new(CheckpointManager::new("checkpoints"));
         Self {
             source: Arc::new(source),
             metrics,
@@ -59,6 +68,7 @@ impl FlatfileIngestionService {
             concurrent_days: concurrent_days.max(1),
             treasury,
             status,
+            checkpoints,
         }
     }
 
@@ -109,6 +119,7 @@ impl FlatfileIngestionService {
             return;
         };
         let status = self.status.clone();
+        let checkpoint_manager = self.checkpoints.clone();
         while current_date <= end_date {
             let permit_eq = semaphore.clone().acquire_owned().await.unwrap();
             let scope_eq = self.build_scope(&current_date);
@@ -116,6 +127,7 @@ impl FlatfileIngestionService {
             let metrics_eq = self.metrics.clone();
             let storage_eq = self.storage.clone();
             let status_eq = status.clone();
+            let checkpoint_eq = checkpoint_manager.clone();
             tokio::spawn(Self::process_equities_day(
                 current_date,
                 permit_eq,
@@ -124,6 +136,7 @@ impl FlatfileIngestionService {
                 metrics_eq,
                 storage_eq,
                 status_eq,
+                checkpoint_eq,
             ));
 
             let permit_opt = semaphore.clone().acquire_owned().await.unwrap();
@@ -136,6 +149,7 @@ impl FlatfileIngestionService {
             let staleness = self.flatfile_staleness_us;
             let treasury = self.treasury.clone();
             let status_opt = status.clone();
+            let checkpoint_opt = checkpoint_manager.clone();
             tokio::spawn(async move {
                 Self::process_options_day(
                     current_date,
@@ -149,6 +163,7 @@ impl FlatfileIngestionService {
                     staleness,
                     treasury,
                     status_opt,
+                    checkpoint_opt,
                 )
                 .await;
             });
@@ -219,12 +234,31 @@ impl FlatfileIngestionService {
         metrics: Arc<Metrics>,
         storage: Arc<Mutex<Storage>>,
         status: ServiceStatusHandle,
+        checkpoint: Arc<CheckpointManager>,
     ) {
         info!("Processing equity day: {}", date.format("%Y-%m-%d"));
         let mut stream = source.get_equity_trades(scope).await;
         let mut batch_count = 0u64;
         let mut row_count = 0u64;
-        while let Some(batch) = stream.next().await {
+        let mut progress = build_progress_map(checkpoint.load(EQUITY_DATASET, date));
+        while let Some(mut batch) = stream.next().await {
+            let mut persist_needed = false;
+            batch.rows.retain(|trade| {
+                let hour = hour_from_ts_ns(trade.trade_ts_ns);
+                match observe_symbol(&mut progress, &trade.symbol, hour) {
+                    ProgressAction::Skip => false,
+                    ProgressAction::Process { persist } => {
+                        persist_needed |= persist;
+                        true
+                    }
+                }
+            });
+            if persist_needed {
+                persist_checkpoint(&checkpoint, EQUITY_DATASET, date, &progress);
+            }
+            if batch.rows.is_empty() {
+                continue;
+            }
             batch_count += 1;
             row_count += batch.rows.len() as u64;
             metrics.inc_batches(1);
@@ -232,6 +266,9 @@ impl FlatfileIngestionService {
             if let Err(e) = storage.lock().unwrap().write_equity_trades(&batch) {
                 error!("Failed to write equity trades batch: {}", e);
             }
+        }
+        if finalize_progress(&mut progress) {
+            persist_checkpoint(&checkpoint, EQUITY_DATASET, date, &progress);
         }
         metrics.inc_completed_day();
         Self::update_progress_gauge(&status, &metrics);
@@ -255,6 +292,7 @@ impl FlatfileIngestionService {
         flatfile_staleness_us: u32,
         treasury: TreasuryServiceHandle,
         status: ServiceStatusHandle,
+        checkpoint: Arc<CheckpointManager>,
     ) {
         info!("Seeding NBBO for options day: {}", date.format("%Y-%m-%d"));
         let mut nbbo_stream = source.get_nbbo(scope.clone()).await;
@@ -294,7 +332,30 @@ impl FlatfileIngestionService {
         let mut stream = source.get_option_trades(scope).await;
         let mut batch_count = 0u64;
         let mut row_count = 0u64;
+        let mut progress = build_progress_map(checkpoint.load(OPTIONS_DATASET, date));
         while let Some(mut batch) = stream.next().await {
+            let mut persist_needed = false;
+            batch.rows.retain(|trade| {
+                let symbol = if trade.underlying.is_empty() {
+                    trade.contract.as_str()
+                } else {
+                    trade.underlying.as_str()
+                };
+                let hour = hour_from_ts_ns(trade.trade_ts_ns);
+                match observe_symbol(&mut progress, symbol, hour) {
+                    ProgressAction::Skip => false,
+                    ProgressAction::Process { persist } => {
+                        persist_needed |= persist;
+                        true
+                    }
+                }
+            });
+            if persist_needed {
+                persist_checkpoint(&checkpoint, OPTIONS_DATASET, date, &progress);
+            }
+            if batch.rows.is_empty() {
+                continue;
+            }
             batch_count += 1;
             row_count += batch.rows.len() as u64;
             metrics.inc_batches(1);
@@ -304,6 +365,9 @@ impl FlatfileIngestionService {
                 error!("Failed to write option trades batch: {}", e);
             }
         }
+        if finalize_progress(&mut progress) {
+            persist_checkpoint(&checkpoint, OPTIONS_DATASET, date, &progress);
+        }
         metrics.inc_completed_day();
         Self::update_progress_gauge(&status, &metrics);
         metrics.set_flatfile_status(format!(
@@ -312,5 +376,106 @@ impl FlatfileIngestionService {
             batch_count,
             row_count
         ));
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SymbolProgress {
+    last_completed: i16,
+    current_hour: Option<i16>,
+}
+
+impl SymbolProgress {
+    fn new(initial: i16) -> Self {
+        Self {
+            last_completed: initial,
+            current_hour: None,
+        }
+    }
+}
+
+enum ProgressAction {
+    Skip,
+    Process { persist: bool },
+}
+
+fn build_progress_map(existing: HashMap<String, i16>) -> HashMap<String, SymbolProgress> {
+    existing
+        .into_iter()
+        .map(|(symbol, hour)| (symbol, SymbolProgress::new(hour)))
+        .collect()
+}
+
+fn observe_symbol(
+    progress: &mut HashMap<String, SymbolProgress>,
+    symbol: &str,
+    hour: i16,
+) -> ProgressAction {
+    let entry = progress
+        .entry(symbol.to_string())
+        .or_insert_with(|| SymbolProgress::new(-1));
+    if hour <= entry.last_completed {
+        return ProgressAction::Skip;
+    }
+    let mut persist = false;
+    match entry.current_hour {
+        Some(current) if hour > current => {
+            let completed = hour.saturating_sub(1);
+            if completed > entry.last_completed {
+                entry.last_completed = completed;
+                persist = true;
+            }
+            entry.current_hour = Some(hour);
+        }
+        None => {
+            entry.current_hour = Some(hour);
+        }
+        _ => {}
+    }
+    ProgressAction::Process { persist }
+}
+
+fn finalize_progress(progress: &mut HashMap<String, SymbolProgress>) -> bool {
+    let mut changed = false;
+    for entry in progress.values_mut() {
+        if let Some(current) = entry.current_hour.take() {
+            if current > entry.last_completed {
+                entry.last_completed = current;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn snapshot_progress(progress: &HashMap<String, SymbolProgress>) -> HashMap<String, i16> {
+    progress
+        .iter()
+        .filter_map(|(symbol, state)| {
+            if state.last_completed >= 0 {
+                Some((symbol.clone(), state.last_completed))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn persist_checkpoint(
+    manager: &CheckpointManager,
+    dataset: &str,
+    date: NaiveDate,
+    progress: &HashMap<String, SymbolProgress>,
+) {
+    let snapshot = snapshot_progress(progress);
+    manager.save(dataset, date, &snapshot);
+}
+
+fn hour_from_ts_ns(ts_ns: i64) -> i16 {
+    let secs = ts_ns / 1_000_000_000;
+    let nanos = (ts_ns % 1_000_000_000) as u32;
+    match DateTime::<Utc>::from_timestamp(secs, nanos) {
+        Some(dt) => dt.hour() as i16,
+        None => 0,
     }
 }

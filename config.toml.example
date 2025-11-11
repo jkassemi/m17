@@ -9,7 +9,7 @@
 [greeks]
 # Maximum number of option-batch tasks allowed in-flight when GreeksEngine::enrich_batch runs.
 # Both the flatfile service and the realtime WS service respect this limit, so raising it increases
-# CPU pressure everywhere Greeks are computed.
+# CPU pressure everywhere Greeks are computed. Set to 0 to auto-scale with host CPU cores.
 pool_size = 4
 # Constant dividend yield applied when we cannot locate the underlying’s explicit distribution.
 # Treasury data is mandatory for risk-free inputs; missing curves will put the service in CRIT.

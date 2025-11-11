@@ -3,6 +3,7 @@ use black_scholes::*;
 use core_types::config::GreeksConfig;
 use core_types::types::OptionTrade;
 use nbbo_cache::NbboStore;
+use num_cpus;
 use std::cmp::Ordering;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
@@ -12,6 +13,20 @@ pub const FLAG_NO_UNDERLYING: u32 = 0b0001;
 pub const FLAG_NO_IV: u32 = 0b0010;
 pub const FLAG_TIME_EXPIRED: u32 = 0b0100;
 pub const FLAG_NO_TREASURY: u32 = 0b1000;
+
+fn resolve_pool_permits(configured: usize, detected_cores: usize) -> usize {
+    let detected = detected_cores.max(1);
+    if configured == 0 {
+        detected
+    } else {
+        configured
+    }
+    .max(1)
+}
+
+fn runtime_pool_permits(configured: usize) -> usize {
+    resolve_pool_permits(configured, num_cpus::get())
+}
 
 #[derive(Clone)]
 pub struct GreeksEngine {
@@ -29,7 +44,8 @@ impl GreeksEngine {
         staleness_us: u32,
         treasury_curve: Arc<RwLock<Option<Arc<TreasuryCurve>>>>,
     ) -> Self {
-        let pool = Arc::new(Semaphore::new(std::cmp::max(1, cfg.pool_size)));
+        let permits = runtime_pool_permits(cfg.pool_size);
+        let pool = Arc::new(Semaphore::new(permits));
         Self {
             cfg,
             pool,
@@ -263,5 +279,15 @@ mod tests {
     #[test]
     fn test_treasury_curve_handles_empty_pairs() {
         assert!(TreasuryCurve::from_pairs(Vec::<(f64, f64)>::new()).is_none());
+    }
+
+    #[test]
+    fn pool_resolution_uses_config_when_nonzero() {
+        assert_eq!(super::resolve_pool_permits(8, 2), 8);
+    }
+
+    #[test]
+    fn pool_resolution_falls_back_to_cpu_count() {
+        assert_eq!(super::resolve_pool_permits(0, 6), 6);
     }
 }

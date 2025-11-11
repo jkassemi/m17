@@ -19,6 +19,7 @@ impl Classifier {
         nbbo: &NbboStore,
         params: &ClassParams,
     ) {
+        let _ = (trade, nbbo, params);
         // Stub: No-op for now
     }
 }

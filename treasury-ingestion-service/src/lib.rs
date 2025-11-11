@@ -44,7 +44,6 @@ pub struct TreasuryServiceHandle {
     latest: LatestCurve,
     latest_date: Arc<RwLock<Option<NaiveDate>>>,
     status: ServiceStatusHandle,
-    retry: RetryPolicy,
 }
 
 impl TreasuryIngestionService {
@@ -74,7 +73,6 @@ impl TreasuryIngestionService {
             latest: Arc::clone(&self.latest),
             latest_date: Arc::clone(&self.latest_date),
             status: self.status.clone(),
-            retry: self.retry.clone(),
         }
     }
 

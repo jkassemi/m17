@@ -8,7 +8,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{Int32Type, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate};
 use core_types::schema::{
     aggregation_schema, equity_trade_schema, nbbo_schema, option_trade_schema,
 };
@@ -21,7 +21,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -1131,7 +1131,7 @@ impl PartitionWriter {
     }
 
     fn close(&mut self) -> Result<(), StorageError> {
-        if let Some(mut writer) = self.writer.take() {
+        if let Some(writer) = self.writer.take() {
             writer.close()?; // ensures footer is written
         }
         Ok(())

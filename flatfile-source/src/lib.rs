@@ -13,7 +13,7 @@ use core_types::types::{
     OptionTrade, Quality, QueryScope, Source, Watermark,
 };
 use csv_async::AsyncReaderBuilder;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 use log::info;
 use metrics::Metrics;
 use std::collections::HashSet;
@@ -903,18 +903,15 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use std::path::PathBuf;
-    use tokio_stream::StreamExt as _; // explicit for test modules
 
     #[derive(Clone)]
     pub struct LocalFileSource {
-        status: Arc<Mutex<String>>,
         base_path: PathBuf,
     }
 
     impl LocalFileSource {
         pub fn new(base_path: PathBuf) -> Self {
             Self {
-                status: Arc::new(Mutex::new("Initializing".to_string())),
                 base_path,
             }
         }
@@ -1036,7 +1033,7 @@ mod tests {
             quality_target: Quality::Prelim,
         };
         // Reuse LocalFileSource get_stream; add a small runner for options fixture
-        let (tx, mut rx) = mpsc::channel(10);
+        let (tx, rx) = mpsc::channel(10);
         process_option_trades_stream(
             &source,
             "options_trades_example.csv.gz",
@@ -1067,6 +1064,7 @@ mod tests {
         assert_eq!(first.underlying, "SPY");
     }
 
+    #[tokio::test]
     async fn test_local_file_source_get_equity_trades() {
         let source = LocalFileSource::new(PathBuf::from("fixtures"));
         let scope = QueryScope {
@@ -1077,7 +1075,7 @@ mod tests {
         };
         let mut stream = source.get_equity_trades(scope).await;
         let mut all_trades = Vec::new();
-        while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+        while let Some(batch) = stream.next().await {
             all_trades.extend(batch.rows);
         }
         assert!(!all_trades.is_empty(), "Should yield EquityTrade rows");

@@ -10,9 +10,7 @@ use hyper::service::service_fn;
 use hyper::Request;
 use hyper::Response;
 use hyper_util::rt::TokioIo;
-use prometheus::{
-    register_gauge_vec, Encoder, GaugeVec, Histogram, HistogramOpts, IntCounter, TextEncoder,
-};
+use prometheus::{register_gauge_vec, Encoder, GaugeVec, TextEncoder};
 use std::error::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -21,8 +19,6 @@ use tokio::net::TcpListener;
 use tokio::time::{self, Duration};
 
 pub struct Metrics {
-    classify_unknown_rate: IntCounter,
-    nbbo_age_us: Histogram,
     last_request_ts_ns: Arc<Mutex<Option<i64>>>,
     flatfile_status: Arc<Mutex<String>>,
     last_config_reload_ts_ns: Arc<Mutex<Option<i64>>>,
@@ -49,10 +45,6 @@ impl Metrics {
         )
         .unwrap();
         Self {
-            classify_unknown_rate: IntCounter::new("classify_unknown_rate", "Unknown rate")
-                .unwrap(),
-            nbbo_age_us: Histogram::with_opts(HistogramOpts::new("nbbo_age_us", "NBBO age"))
-                .unwrap(),
             last_request_ts_ns: Arc::new(Mutex::new(None)),
             flatfile_status: Arc::new(Mutex::new("Not started".to_string())),
             last_config_reload_ts_ns: Arc::new(Mutex::new(None)),

@@ -14,7 +14,7 @@ use options_universe_ingestion_service::OptionsUniverseIngestionService;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use storage::Storage;
-use tokio::sync::{mpsc, RwLock as TokioRwLock};
+use tokio::sync::{mpsc, watch, RwLock as TokioRwLock};
 use tokio::time::sleep;
 use treasury_ingestion_service::TreasuryServiceHandle;
 use ws_source::worker::{ResourceKind, SubscriptionSource, WsMessage, WsWorker};
@@ -145,6 +145,37 @@ impl RealtimeWsIngestionService {
         });
     }
 
+    fn spawn_options_quotes_worker(&self, rx: watch::Receiver<Vec<String>>) {
+        let worker = WsWorker::new(
+            &self.ws_cfg.options_ws_url,
+            ResourceKind::OptionsQuotes,
+            self.ws_cfg.api_key.clone(),
+            SubscriptionSource::Dynamic(rx),
+        );
+        let nbbo_rt = self.nbbo.clone();
+        let status = self.status.clone();
+        tokio::spawn(async move {
+            match worker.stream().await {
+                Ok(mut stream) => {
+                    status.clear_errors_matching(|m| m.contains("options quotes stream"));
+                    while let Some(msg) = stream.next().await {
+                        if let WsMessage::Nbbo(nbbo) = msg {
+                            let mut guard = nbbo_rt.write().await;
+                            guard.put(&nbbo);
+                            guard.prune_before(nbbo.quote_ts_ns.saturating_sub(2_000_000_000));
+                        }
+                    }
+                }
+                Err(err) => {
+                    status.set_overall(OverallStatus::Crit);
+                    let msg = format!("ws options quotes stream error: {}", err);
+                    status.push_error(msg.clone());
+                    error!("{}", msg);
+                }
+            }
+        });
+    }
+
     async fn spawn_options_worker(&self, underlying: &str) {
         let Some(api_key) = self.ws_cfg.api_key.clone() else {
             error!("ws api_key missing; cannot start options trades");
@@ -162,6 +193,7 @@ impl RealtimeWsIngestionService {
             Duration::from_secs(self.ws_cfg.options_refresh_interval_s.max(60)),
         );
         let options_rx = service.spawn();
+        self.spawn_options_quotes_worker(options_rx.clone());
         let options_worker = WsWorker::new(
             &self.ws_cfg.options_ws_url,
             ResourceKind::OptionsTrades,

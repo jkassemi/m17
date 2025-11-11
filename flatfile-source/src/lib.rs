@@ -5,7 +5,7 @@ use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
-use chrono::{DateTime, Datelike, TimeDelta, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, Utc};
 use core_types::config::FlatfileConfig;
 use core_types::opra::parse_opra_contract;
 use core_types::retry::RetryPolicy;
@@ -60,6 +60,11 @@ pub trait SourceTrait: Send + Sync + 'static {
         &self,
         scope: QueryScope,
     ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>>;
+
+    async fn get_option_nbbo(
+        &self,
+        scope: QueryScope,
+    ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>>;
 }
 
 #[derive(Clone)]
@@ -107,6 +112,50 @@ impl FlatfileSource {
             progress_update_ms,
             retry: RetryPolicy::default_network(),
         }
+    }
+
+    fn nbbo_stream_for_dataset(
+        &self,
+        scope: QueryScope,
+        dataset: &'static str,
+        label: &'static str,
+    ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>> {
+        let (tx, rx) = mpsc::channel(100);
+        let self_clone = self.clone();
+        let scope_clone = scope.clone();
+        tokio::spawn(async move {
+            let calendar = TradingCalendar::new(Market::NYSE).unwrap();
+            let start_ts = scope_clone.time_range.0;
+            let end_ts = scope_clone.time_range.1;
+            let start_dt: DateTime<Utc> = DateTime::from_timestamp(
+                start_ts / 1_000_000_000,
+                (start_ts % 1_000_000_000) as u32,
+            )
+            .unwrap_or(Utc::now());
+            let end_dt: DateTime<Utc> =
+                DateTime::from_timestamp(end_ts / 1_000_000_000, (end_ts % 1_000_000_000) as u32)
+                    .unwrap_or(Utc::now());
+            let mut current_date = start_dt.date_naive();
+            let end_date = end_dt.date_naive();
+            while current_date <= end_date {
+                if calendar.is_trading_day(current_date).unwrap_or(false) {
+                    let path = build_quote_path(dataset, current_date);
+                    info!("Checking path for {} quotes: {}", label, path);
+                    process_nbbo_stream(
+                        &self_clone,
+                        &path,
+                        &scope_clone,
+                        tx.clone(),
+                        self_clone.ingest_batch_size,
+                        self_clone.progress_update_ms,
+                        self_clone.metrics.clone(),
+                    )
+                    .await;
+                }
+                current_date += TimeDelta::try_days(1).unwrap();
+            }
+        });
+        Box::pin(ReceiverStream::new(rx))
     }
 
     async fn download_file(
@@ -403,48 +452,14 @@ impl SourceTrait for FlatfileSource {
         &self,
         scope: QueryScope,
     ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>> {
-        let (tx, rx) = mpsc::channel(100);
-        let self_clone = self.clone();
-        let scope_clone = scope.clone();
-        tokio::spawn(async move {
-            let calendar = TradingCalendar::new(Market::NYSE).unwrap();
-            let start_ts = scope_clone.time_range.0;
-            let end_ts = scope_clone.time_range.1;
-            let start_dt: DateTime<Utc> = DateTime::from_timestamp(
-                start_ts / 1_000_000_000,
-                (start_ts % 1_000_000_000) as u32,
-            )
-            .unwrap_or(Utc::now());
-            let end_dt: DateTime<Utc> =
-                DateTime::from_timestamp(end_ts / 1_000_000_000, (end_ts % 1_000_000_000) as u32)
-                    .unwrap_or(Utc::now());
-            let mut current_date = start_dt.date_naive();
-            let end_date = end_dt.date_naive();
-            while current_date <= end_date {
-                if calendar.is_trading_day(current_date).unwrap_or(false) {
-                    let year = current_date.year();
-                    let month = current_date.month();
-                    let day = current_date.day();
-                    let path = format!(
-                        "us_stocks_sip/quotes_v1/{}/{:02}/{}-{:02}-{:02}.csv.gz",
-                        year, month, year, month, day
-                    );
-                    info!("Checking path for equity quotes: {}", path);
-                    process_nbbo_stream(
-                        &self_clone,
-                        &path,
-                        &scope_clone,
-                        tx.clone(),
-                        self_clone.ingest_batch_size,
-                        self_clone.progress_update_ms,
-                        self_clone.metrics.clone(),
-                    )
-                    .await;
-                }
-                current_date += TimeDelta::try_days(1).unwrap();
-            }
-        });
-        Box::pin(ReceiverStream::new(rx))
+        self.nbbo_stream_for_dataset(scope, "us_stocks_sip/quotes_v1", "equity")
+    }
+
+    async fn get_option_nbbo(
+        &self,
+        scope: QueryScope,
+    ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>> {
+        self.nbbo_stream_for_dataset(scope, "us_options_opra/quotes_v1", "options")
     }
 }
 
@@ -759,6 +774,16 @@ async fn process_nbbo_stream<S: SourceTrait>(
         }
     }
 }
+
+fn build_quote_path(dataset: &str, date: NaiveDate) -> String {
+    let year = date.year();
+    let month = date.month();
+    let day = date.day();
+    format!(
+        "{}/{}/{:02}/{}-{:02}-{:02}.csv.gz",
+        dataset, year, month, year, month, day
+    )
+}
 async fn process_option_trades_stream<S: SourceTrait>(
     source: &S,
     path: &str,
@@ -983,6 +1008,13 @@ mod tests {
         }
 
         async fn get_nbbo(
+            &self,
+            _scope: QueryScope,
+        ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>> {
+            Box::pin(futures::stream::empty())
+        }
+
+        async fn get_option_nbbo(
             &self,
             _scope: QueryScope,
         ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>> {

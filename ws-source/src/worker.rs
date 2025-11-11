@@ -42,6 +42,7 @@ pub type WsStream = Pin<Box<dyn Stream<Item = WsMessage> + Send>>;
 pub enum ResourceKind {
     EquityQuotes,
     EquityTrades,
+    OptionsQuotes,
     OptionsTrades,
 }
 
@@ -152,7 +153,8 @@ async fn handle_connection(
     }
 
     let current = subscriptions.snapshot();
-    send_subscriptions(&writer, &current, "subscribe").await?;
+    let formatted = format_symbols(resource, &current);
+    send_subscriptions(&writer, &formatted, "subscribe").await?;
 
     let mut sub_task = None;
     if let Some(mut rx) = subscriptions.dynamic_receiver() {
@@ -167,12 +169,14 @@ async fn handle_connection(
                 let latest = rx.borrow().clone();
                 let (adds, removes) = diff_lists(&active, &latest);
                 if !adds.is_empty() {
+                    let adds = format_symbols(resource, &adds);
                     if let Err(e) = send_subscriptions(&writer_clone, &adds, "subscribe").await {
                         warn!("ws subscribe update failed: {}", e);
                         break;
                     }
                 }
                 if !removes.is_empty() {
+                    let removes = format_symbols(resource, &removes);
                     if let Err(e) = send_subscriptions(&writer_clone, &removes, "unsubscribe").await
                     {
                         warn!("ws unsubscribe update failed: {}", e);
@@ -232,6 +236,27 @@ fn diff_lists(old: &[String], new: &[String]) -> (Vec<String>, Vec<String>) {
         .cloned()
         .collect();
     (adds, removes)
+}
+
+fn format_symbols(resource: ResourceKind, symbols: &[String]) -> Vec<String> {
+    match resource {
+        ResourceKind::OptionsTrades => prefix_symbols("T.", symbols),
+        ResourceKind::OptionsQuotes => prefix_symbols("Q.", symbols),
+        _ => symbols.to_vec(),
+    }
+}
+
+fn prefix_symbols(prefix: &str, symbols: &[String]) -> Vec<String> {
+    symbols
+        .iter()
+        .map(|sym| {
+            if sym.starts_with(prefix) {
+                sym.clone()
+            } else {
+                format!("{}{}", prefix, sym)
+            }
+        })
+        .collect()
 }
 
 async fn send_text(writer: &Arc<Mutex<SocketSink>>, msg: String) -> Result<(), WsError> {
@@ -297,7 +322,7 @@ async fn handle_incoming_text(
 fn decode_value(value: &Value, resource: ResourceKind) -> Option<WsMessage> {
     let ev = value.get("ev").and_then(Value::as_str)?;
     match resource {
-        ResourceKind::EquityQuotes if ev == "Q" => {
+        ResourceKind::EquityQuotes | ResourceKind::OptionsQuotes if ev == "Q" => {
             serde_json::from_value::<RawQuote>(value.clone())
                 .ok()
                 .and_then(raw_quote_to_nbbo)

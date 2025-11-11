@@ -310,6 +310,21 @@ impl FlatfileIngestionService {
                 guard.prune_before(ts.saturating_sub(2_000_000_000));
             }
         }
+        info!("Seeding option NBBO for day: {}", date.format("%Y-%m-%d"));
+        let mut opt_nbbo_stream = source.get_option_nbbo(scope.clone()).await;
+        let mut last_opt_ts = None;
+        while let Some(batch) = opt_nbbo_stream.next().await {
+            let mut guard = nbbo_store.write().await;
+            for q in batch.rows.iter() {
+                guard.put(q);
+            }
+            if let Some(q) = batch.rows.last() {
+                last_opt_ts = Some(q.quote_ts_ns);
+            }
+            if let Some(ts) = last_opt_ts {
+                guard.prune_before(ts.saturating_sub(2_000_000_000));
+            }
+        }
         info!("Processing options (OPRA) day: {}", date.format("%Y-%m-%d"));
         let day_curve_state = {
             let state = treasury.curve_state_for_date(date).await;

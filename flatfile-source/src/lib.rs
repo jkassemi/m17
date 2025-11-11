@@ -7,6 +7,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Datelike, TimeDelta, Utc};
 use core_types::config::FlatfileConfig;
 use core_types::opra::parse_opra_contract;
+use core_types::retry::RetryPolicy;
 use core_types::types::{
     AggressorSide, ClassMethod, Completeness, DataBatch, DataBatchMeta, EquityTrade, Nbbo,
     OptionTrade, Quality, QueryScope, Source, Watermark,
@@ -68,6 +69,7 @@ pub struct FlatfileSource {
     metrics: Option<Arc<Metrics>>,
     ingest_batch_size: usize,
     progress_update_ms: u64,
+    retry: RetryPolicy,
 }
 
 impl FlatfileSource {
@@ -102,6 +104,7 @@ impl FlatfileSource {
             metrics,
             ingest_batch_size,
             progress_update_ms,
+            retry: RetryPolicy::default_network(),
         }
     }
 
@@ -113,11 +116,15 @@ impl FlatfileSource {
         let local_path = local_dir.join(path);
         fs::create_dir_all(local_path.parent().unwrap()).await?;
         let resp = self
-            .client
-            .get_object()
-            .bucket(self.config.massive_flatfiles_bucket.clone())
-            .key(path)
-            .send()
+            .retry
+            .retry_async(|_| async {
+                self.client
+                    .get_object()
+                    .bucket(self.config.massive_flatfiles_bucket.clone())
+                    .key(path)
+                    .send()
+                    .await
+            })
             .await?;
         let data = resp.body.collect().await?;
         fs::write(&local_path, data.into_bytes()).await?;
@@ -176,11 +183,15 @@ impl SourceTrait for FlatfileSource {
             Ok(stream)
         } else {
             let resp = self
-                .client
-                .get_object()
-                .bucket(self.config.massive_flatfiles_bucket.clone())
-                .key(path)
-                .send()
+                .retry
+                .retry_async(|_| async {
+                    self.client
+                        .get_object()
+                        .bucket(self.config.massive_flatfiles_bucket.clone())
+                        .key(path)
+                        .send()
+                        .await
+                })
                 .await?;
             let body: ByteStream = resp.body;
             let reader = body.into_async_read();

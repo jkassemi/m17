@@ -15,8 +15,8 @@ use thiserror::Error;
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 const BOX_COX_EPSILON: f64 = 1e-6;
 const BOX_COX_LAMBDAS: [f64; 17] = [
-    -2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5,
-    1.75, 2.0,
+    -2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75,
+    2.0,
 ];
 
 /// Input event for streaming aggregation.

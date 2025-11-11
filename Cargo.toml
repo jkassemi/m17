@@ -8,14 +8,18 @@ members = [
   "core-types",
   "data-client",
   "flatfile-source",
+  "flatfile-ingestion-service",
   "aggregations",
   "diptest",
   "metrics",
   "nbbo-cache",
+  "options-universe-ingestion-service",
+  "realtime-ws-ingestion-service",
   "orchestrator",
   "replayer",
   "rest-source",
   "storage",
+  "treasury-ingestion-service",
   "tui",
   "ws-source"
 ]

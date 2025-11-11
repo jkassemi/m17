@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     pub ws: WsConfig,
+    #[serde(default)]
     pub staleness: StalenessConfig,
     pub classifier: ClassifierConfig,
     pub greeks: GreeksConfig,
@@ -77,8 +78,6 @@ pub struct AggregationsConfig {
     pub symbol: String,
     #[serde(default = "default_contract_size")]
     pub contract_size: u32,
-    #[serde(default = "default_agg_rfr")]
-    pub risk_free_rate: f64,
     #[serde(default = "default_agg_dividend")]
     pub dividend_yield: f64,
     #[serde(default = "default_diptest_draws")]
@@ -100,10 +99,6 @@ fn default_agg_symbol() -> String {
 
 fn default_contract_size() -> u32 {
     100
-}
-
-fn default_agg_rfr() -> f64 {
-    0.02
 }
 
 fn default_agg_dividend() -> f64 {
@@ -146,8 +141,6 @@ pub struct GreeksConfig {
     pub notional_threshold: f64,
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
-    #[serde(default = "default_risk_free_rate")]
-    pub risk_free_rate: f64,
     #[serde(default = "default_dividend_yield")]
     pub dividend_yield: f64,
     #[serde(default = "default_flatfile_underlying_staleness_us")]
@@ -166,10 +159,6 @@ fn default_notional_threshold() -> f64 {
 
 fn default_pool_size() -> usize {
     4
-}
-
-fn default_risk_free_rate() -> f64 {
-    0.02
 }
 
 fn default_dividend_yield() -> f64 {
@@ -312,8 +301,7 @@ impl DateRange {
 impl AppConfig {
     pub fn load() -> Result<Self, ConfigError> {
         let settings = Config::builder()
-            .add_source(config::File::with_name("config.toml").required(false))
-            .add_source(config::Environment::default())
+            .add_source(config::File::with_name("config.toml").required(true))
             .build()?;
         let config: Self = settings.try_deserialize()?;
         Ok(config)

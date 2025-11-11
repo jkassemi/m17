@@ -1,0 +1,17 @@
+[package]
+name = "flatfile-ingestion-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+flatfile-source = { path = "../flatfile-source" }
+core-types = { path = "../core-types" }
+metrics = { path = "../metrics" }
+storage = { path = "../storage" }
+nbbo-cache = { path = "../nbbo-cache" }
+classifier = { path = "../classifier" }
+treasury-ingestion-service = { path = "../treasury-ingestion-service" }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"

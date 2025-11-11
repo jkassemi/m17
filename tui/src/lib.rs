@@ -2,18 +2,18 @@
 
 //! TUI component status dashboard using ratatui.
 
+use core_types::status::{OverallStatus, ServiceStatusSnapshot};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::widgets::Gauge;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout},
-    style::{Color, Style},
+    style::{Color, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Gauge, Paragraph},
     Frame, Terminal,
 };
 use std::io;
@@ -82,13 +82,17 @@ impl Tui {
 
     fn ui(&self, f: &mut Frame) {
         let size = f.size();
+        let service_statuses = self.metrics.service_status_snapshots();
+        let status_block_height =
+            std::cmp::max(4, (service_statuses.len() as u16).saturating_mul(3));
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(
                 [
-                    Constraint::Length(3),       // ingestion progress
-                    Constraint::Length(3),       // current file progress
+                    Constraint::Length(3), // ingestion progress
+                    Constraint::Length(3), // current file progress
+                    Constraint::Length(status_block_height),
                     Constraint::Percentage(100), // details
                 ]
                 .as_ref(),
@@ -151,6 +155,15 @@ impl Tui {
                 f.render_widget(cf_gauge, chunks[1]);
             }
         }
+
+        // Service health
+        let status_lines = Self::format_status_lines(&service_statuses);
+        let status_block = Paragraph::new(Text::from(status_lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Service health"),
+        );
+        f.render_widget(status_block, chunks[2]);
 
         // Metrics
         let now_ns = SystemTime::now()
@@ -218,6 +231,77 @@ impl Tui {
         let paragraph = Paragraph::new(status_text)
             .block(Block::default().borders(Borders::ALL).title("Dashboard"))
             .alignment(Alignment::Left);
-        f.render_widget(paragraph, chunks[2]);
+        f.render_widget(paragraph, chunks[3]);
+    }
+
+    fn format_status_lines(statuses: &[ServiceStatusSnapshot]) -> Vec<Line<'static>> {
+        if statuses.is_empty() {
+            return vec![Line::from(Span::raw("No managed services registered"))];
+        }
+        let mut lines = Vec::new();
+        for snapshot in statuses {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<18}", snapshot.name),
+                    Style::default().fg(Color::White).bold(),
+                ),
+                Span::styled(
+                    Self::status_label(snapshot.overall),
+                    Style::default().fg(Self::status_color(snapshot.overall)),
+                ),
+            ]));
+            for warn in &snapshot.warnings {
+                lines.push(Line::from(vec![
+                    Span::styled("  warn: ", Style::default().fg(Color::Yellow)),
+                    Span::raw(warn.clone()),
+                ]));
+            }
+            for err in &snapshot.errors {
+                lines.push(Line::from(vec![
+                    Span::styled("  error: ", Style::default().fg(Color::Red)),
+                    Span::raw(err.clone()),
+                ]));
+            }
+            for gauge in &snapshot.gauges {
+                let detail = if let Some(max) = gauge.max {
+                    format!(
+                        "{}: {:.1}/{:.1} {}",
+                        gauge.label,
+                        gauge.value,
+                        max,
+                        gauge.unit.clone().unwrap_or_default()
+                    )
+                } else {
+                    format!(
+                        "{}: {:.1} {}",
+                        gauge.label,
+                        gauge.value,
+                        gauge.unit.clone().unwrap_or_default()
+                    )
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  gauge: ", Style::default().fg(Color::Cyan)),
+                    Span::raw(detail),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
+        lines
+    }
+
+    fn status_label(status: OverallStatus) -> &'static str {
+        match status {
+            OverallStatus::Ok => "OK",
+            OverallStatus::Warn => "WARN",
+            OverallStatus::Crit => "CRIT",
+        }
+    }
+
+    fn status_color(status: OverallStatus) -> Color {
+        match status {
+            OverallStatus::Ok => Color::Green,
+            OverallStatus::Warn => Color::Yellow,
+            OverallStatus::Crit => Color::Red,
+        }
     }
 }

@@ -1,0 +1,19 @@
+[package]
+name = "realtime-ws-ingestion-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aggregations = { path = "../aggregations" }
+classifier = { path = "../classifier" }
+core-types = { path = "../core-types" }
+metrics = { path = "../metrics" }
+nbbo-cache = { path = "../nbbo-cache" }
+options-universe-ingestion-service = { path = "../options-universe-ingestion-service" }
+storage = { path = "../storage" }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+log = "0.4"
+ws-source = { path = "../ws-source" }
+treasury-ingestion-service = { path = "../treasury-ingestion-service" }
+reqwest = { version = "0.12", features = ["rustls-tls"] }

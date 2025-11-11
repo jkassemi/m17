@@ -1,53 +1,136 @@
+# Massive Orchestrator configuration.
+# Think of this file as the “control plane” for every service the binary spins up:
+#   - Flatfile ingestion → historical replay + Greeks recomputation.
+#   - Realtime websocket ingestion → live Greeks, aggregations, storage.
+#   - Treasury/universe helpers → REST fetches using the same credentials.
+#   - Metrics/TUI → surface whatever limits you set here.
+# Copy to config.toml and override the fields that differ in your deployment.
+
 [greeks]
+# Maximum number of option-batch tasks allowed in-flight when GreeksEngine::enrich_batch runs.
+# Both the flatfile service and the realtime WS service respect this limit, so raising it increases
+# CPU pressure everywhere Greeks are computed.
 pool_size = 4
-risk_free_rate = 0.02
+# Constant dividend yield applied when we cannot locate the underlying’s explicit distribution.
+# Treasury data is mandatory for risk-free inputs; missing curves will put the service in CRIT.
 dividend_yield = 0.0
+# Oldest acceptable NBBO age (microseconds) when flatfile replay looks up underlyings in NbboStore.
+# If the cached quote is older than this, the option gets FLAG_NO_UNDERLYING and Greeks are skipped.
 flatfile_underlying_staleness_us = 1_000_000
+# Same staleness guard but for the live websocket pipeline. Keeps realtime Greeks aligned with the
+# fresh underlying quotes powering the AggregationsEngine and storage.
 realtime_underlying_staleness_us = 1_000_000
 
+[staleness]
+# Adaptive NBBO limits feed the aggressor classifier: it rolls p99(age) per instrument and clamps the
+# result inside these bounds. First number = “warn” (metrics/tui), second = “hard drop” when deciding
+# whether NbboStore::get_best_before may be used.
+bounds.options = [100000, 300000]
+bounds.stocks = [50000, 150000]
+# Percentile pulled from the staleness histogram when computing the adaptive window (p99 by default).
+# Lowering this (say p95) makes classifier + Greeks more conservative because they’ll reject quotes
+# sooner; raising it tolerates more latency but risks stale aggressor tags.
+quantile = "p99"
+
 [ws]
+# Shared Massive API key; used for websocket handshake, options-universe REST calls, and Treasury
+# refreshes. If this is missing, realtime and treasury ingestion refuse to start.
 api_key = "YOUR_WS_API_KEY"
+# Direct hosts for the stock (+NBBO) socket and the options trades socket. Swap to staging URLs to
+# bring up the stack against non-prod Massive infrastructure.
 stocks_ws_url = "wss://socket.massive.com/stocks"
 options_ws_url = "wss://socket.massive.com/options"
+# REST base passed to both OptionsUniverseIngestionService and TreasuryIngestionService. Every helper
+# that makes HTTP calls uses this root plus resource-specific paths.
 rest_base_url = "https://api.massive.com"
+# Underlying that anchors realtime: the websocket service only spawns workers if this is populated,
+# and AggregationsEngine ignores trades whose `underlying` differs from this symbol.
 underlying_symbol = "SPY"
+# Maximum number of option contracts OptionsUniverseIngestionService keeps subscribed at once. When
+# this cap is hit the scheduler starts evicting the coldest names, so set it high enough to cover
+# your latency/CPU budget.
 options_contract_limit = 800
+# How often (seconds) the options universe is refreshed through the REST helper. Shorter intervals
+# tighten responsiveness to newly active contracts but add REST load.
 options_refresh_interval_s = 900
+# Buffer size for realtime option trades before they’re flushed to Greeks + storage. Higher values
+# favor throughput (fewer parquet writes) at the expense of per-trade latency in realtime metrics.
 batch_size = 512
+# Uncomment to override shard counts per resource (e.g. split quotes across multiple sockets).
+# shards.options_quotes = 2
 
 [aggregations]
+# Only trades whose underlying matches this symbol are fed into the aggregation engine; leave empty
+# to disable aggregations entirely (the orchestrator will skip wiring the channel).
 symbol = "SPY"
+# Rolling windows emitted by AggregationsEngine; each label must use <integer><s|m|h>. Windows drive
+# how long data stays in the in-memory buffer before Storage::write_aggregations flushes it out.
 windows = ["1m", "5m", "15m", "30m"]
+# Contract size controls notional math for option trades. Set to 100 for OCC-listed equity options,
+# 1 for mini-contracts, etc.
 contract_size = 100
-risk_free_rate = 0.02
+# Dip test relies on the same financial inputs as Greeks; keep dividend_yield consistent so reports
+# stay aligned when treasury data is available.
 dividend_yield = 0.0
+# Number of bootstrap samples each window uses when running Hartigan’s dip test. Raising this smooths
+# the test but makes aggregations heavier; lowering it speeds things up at the cost of noisier scores.
 diptest_bootstrap_draws = 2000
 
 [ingest]
+# FlatfileSource page size per request. Larger batches reduce HTTP overhead but also increase peak
+# memory because we stage the batch until Greeks + storage have finished with it.
 batch_size = 20000
+# Maximum number of calendar days processed concurrently while backfilling. Enforced via a semaphore
+# shared by equity + option workers, so each day consumes two permits (one per asset class).
 concurrent_days = 4
+# Frequency (milliseconds) at which FlatfileIngestionService updates metrics/TUI progress bars. If
+# you lengthen this, the UI will look stagnant but you’ll cut down on chatter.
 progress_update_ms = 250
 
 [storage]
+# Target parquet size before rolling to the next file. This drives both historical and realtime
+# writers because Storage::write_* respects the same limit for every dataset.
 file_size_mb_target = 128
+# Storage roots for parquet outputs. Setting paths.base redirects the entire tree (equities, options,
+# nbbo snapshots, aggregations, etc.) under the provided directory.
 paths.base = "data"
 
 [flatfile]
+# Massive-issued credentials for the flatfile S3-compatible endpoint; used by FlatfileSource to sign
+# every request. Keep these in sync with whatever bucket/endpoint you point at below.
 massive_key = "YOUR_MASSIVE_KEY"
 massive_access_key_id = "YOUR_ACCESS_KEY_ID"
 massive_secret_access_key = "YOUR_SECRET_ACCESS_KEY"
+# Network coordinates for flatfile sync. Endpoint is the S3-compatible URL, region is whatever the
+# SDK expects for SigV4, and bucket is the logical dataset that hosts historical dumps.
 massive_flatfiles_endpoint = "https://s3.massive.example"
 massive_flatfiles_region = "custom"
 massive_flatfiles_bucket = "massive-flatfiles"
 
-# Example date ranges
+# Each range instructs FlatfileIngestionService which UTC window to hydrate. Ranges are inclusive,
+# and the service walks them day-by-day honoring ingest.concurrent_days. Omit end_ts to stream all
+# future data after start_ts (useful for “follow-the-tail” backfills).
 [[flatfile.date_ranges]]
 start_ts = "2023-03-27T00:00:00Z"
 end_ts = "2023-03-27T23:59:59Z"
 
-# Greeks staleness settings (microseconds)
-# Use up to 1s old underlying NBBO bid for S when computing greeks
-## deprecated: see [greeks]
-# [greeks_staleness]
-# flatfile_underlying_staleness_us = 1_000_000
-# realtime_underlying_staleness_us = 1_000_000
+[classifier]
+# Enable the tick-rule fallback for live data when NBBO is missing. Keep this false unless you are
+# comfortable inferring aggressor side from price movements during realtime outages.
+use_tick_rule_rt = false
+# Same fallback but for the T+1 / flatfile path. Default true to recover classifications when old
+# Massive dumps are missing quotes; set to false for purist NBBO-only labeling.
+use_tick_rule_t1 = true
+
+[scheduler]
+# Parameters for the dynamic options subscription scheduler (OptionsUniverseIngestionService).
+# These are not all wired yet but documenting them here keeps the contract obvious.
+top_n = 100
+exploration_fraction = 0.1
+rebalance_interval_s = 300
+hysteresis = 0.05
+
+[rest]
+# Optional per-endpoint rate limits enforced by helper clients before they fire off HTTP calls.
+# Example: cap /v1/options/universe to 60 req/min by setting rate_limits."options.universe" = 60.
+rate_limits."options.universe" = 120

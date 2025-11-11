@@ -10,6 +10,7 @@ classifier = { path = "../classifier" }
 core-types = { path = "../core-types" }
 data-client = { path = "../data-client" }
 flatfile-source = { path = "../flatfile-source" }
+flatfile-ingestion-service = { path = "../flatfile-ingestion-service" }
 aggregations = { path = "../aggregations" }
 futures = "0.3"
 log = "0.4"
@@ -23,3 +24,6 @@ tui = { path = "../tui" }
 ws-source = { path = "../ws-source" }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
+treasury-ingestion-service = { path = "../treasury-ingestion-service" }
+options-universe-ingestion-service = { path = "../options-universe-ingestion-service" }
+realtime-ws-ingestion-service = { path = "../realtime-ws-ingestion-service" }

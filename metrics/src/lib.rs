@@ -1,5 +1,8 @@
 // Copyright (c) James Kassemi, SC, US. All rights reserved.
 //! Prometheus metrics. hyper v1.+
+use core_types::status::{
+    MetricSample, ServiceMetricsReporter, ServiceStatusHandle, ServiceStatusSnapshot,
+};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming}; // Removed 'Body' from import
 use hyper::server::conn::http1;
@@ -7,12 +10,15 @@ use hyper::service::service_fn;
 use hyper::Request;
 use hyper::Response;
 use hyper_util::rt::TokioIo;
-use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, TextEncoder};
+use prometheus::{
+    register_gauge_vec, Encoder, GaugeVec, Histogram, HistogramOpts, IntCounter, TextEncoder,
+};
 use std::error::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
+use tokio::time::{self, Duration};
 
 pub struct Metrics {
     classify_unknown_rate: IntCounter,
@@ -29,10 +35,19 @@ pub struct Metrics {
     current_file_total: AtomicU64,
     current_file_read: AtomicU64,
     current_file_started_ts_ns: AtomicU64,
+    service_statuses: Arc<Mutex<Vec<ServiceStatusHandle>>>,
+    service_metrics: Arc<RwLock<Vec<Arc<dyn ServiceMetricsReporter>>>>,
+    service_gauges: GaugeVec,
 }
 
 impl Metrics {
     pub fn new() -> Self {
+        let service_gauges = register_gauge_vec!(
+            "service_gauge",
+            "Service supplied gauges exposed by orchestrator-managed components",
+            &["service", "metric"]
+        )
+        .unwrap();
         Self {
             classify_unknown_rate: IntCounter::new("classify_unknown_rate", "Unknown rate")
                 .unwrap(),
@@ -49,6 +64,9 @@ impl Metrics {
             current_file_total: AtomicU64::new(0),
             current_file_read: AtomicU64::new(0),
             current_file_started_ts_ns: AtomicU64::new(0),
+            service_statuses: Arc::new(Mutex::new(Vec::new())),
+            service_metrics: Arc::new(RwLock::new(Vec::new())),
+            service_gauges,
         }
     }
 
@@ -129,6 +147,61 @@ impl Metrics {
         let total = self.current_file_total.load(Ordering::Relaxed);
         let started = self.current_file_started_ts_ns.load(Ordering::Relaxed) as i64;
         Some((read, total, started))
+    }
+
+    pub fn register_service_status(&self, handle: ServiceStatusHandle) {
+        self.service_statuses.lock().unwrap().push(handle.clone());
+        let reporter: Arc<dyn ServiceMetricsReporter> = Arc::new(handle);
+        self.register_service_metrics(reporter);
+    }
+
+    pub fn service_status_snapshots(&self) -> Vec<ServiceStatusSnapshot> {
+        self.service_statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|handle| handle.snapshot())
+            .collect()
+    }
+
+    pub fn register_service_metrics(&self, reporter: Arc<dyn ServiceMetricsReporter>) {
+        self.service_metrics.write().unwrap().push(reporter);
+    }
+
+    pub fn spawn_service_metric_task(
+        self: &Arc<Self>,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let metrics = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = time::interval(interval);
+            loop {
+                ticker.tick().await;
+                metrics.collect_service_metrics();
+            }
+        })
+    }
+
+    fn collect_service_metrics(&self) {
+        let reporters = {
+            let guard = self.service_metrics.read().unwrap();
+            guard.clone()
+        };
+        for reporter in reporters {
+            let samples = reporter.collect_metrics();
+            let service = reporter.service_name().to_string();
+            for sample in samples {
+                self.record_metric(&service, &sample);
+            }
+        }
+    }
+
+    fn record_metric(&self, service: &str, sample: &MetricSample) {
+        let gauge = self
+            .service_gauges
+            .with_label_values(&[service, sample.metric.as_str()]);
+        gauge.set(sample.value);
+        // Additional labels are not exposed yet; keep metric cardinality bounded.
     }
 
     async fn handle_metrics(

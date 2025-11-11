@@ -10,6 +10,7 @@ use tokio::sync::{RwLock, Semaphore};
 pub const FLAG_NO_UNDERLYING: u32 = 0b0001;
 pub const FLAG_NO_IV: u32 = 0b0010;
 pub const FLAG_TIME_EXPIRED: u32 = 0b0100;
+pub const FLAG_NO_TREASURY: u32 = 0b1000;
 
 #[derive(Clone)]
 pub struct GreeksEngine {
@@ -44,6 +45,13 @@ impl GreeksEngine {
             let guard = self.treasury_curve.read().await;
             guard.clone()
         };
+        if curve.is_none() {
+            for trade in trades.iter_mut() {
+                trade.greeks_flags |= FLAG_NO_TREASURY;
+            }
+            return;
+        }
+        let curve = curve.unwrap();
         // simple sequential for now; hook pool for heavy work like IV root-finding in future
         for t in trades.iter_mut() {
             let mut flags = 0u32;
@@ -74,10 +82,7 @@ impl GreeksEngine {
             if t_years <= 0.0 {
                 flags |= FLAG_TIME_EXPIRED;
             }
-            let r = curve
-                .as_ref()
-                .map(|curve| curve.rate_for(t_years))
-                .unwrap_or(self.cfg.risk_free_rate);
+            let r = curve.rate_for(t_years);
 
             // Sigma (IV) optional; if None, skip for now
             let sigma = t.iv;
@@ -189,7 +194,6 @@ mod tests {
     async fn test_enrich_batch_populates_greeks_and_snapshots() {
         let cfg = GreeksConfig {
             pool_size: 2,
-            risk_free_rate: 0.02,
             dividend_yield: 0.0,
             flatfile_underlying_staleness_us: 1_000_000,
             realtime_underlying_staleness_us: 1_000_000,
@@ -201,6 +205,10 @@ mod tests {
             w.put(&mk_nbbo("SPY", 1_000_000_000, 400.0, 400.1));
         }
         let curve_state = Arc::new(RwLock::new(None));
+        {
+            let mut guard = curve_state.write().await;
+            *guard = TreasuryCurve::from_pairs(vec![(0.5, 0.01), (1.0, 0.02)]).map(Arc::new);
+        }
         let engine = GreeksEngine::new(cfg.clone(), store.clone(), 1_000_000, curve_state);
         let mut trades = vec![OptionTrade {
             contract: "O:SPY250101C00400000".to_string(),

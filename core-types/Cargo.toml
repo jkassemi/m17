@@ -12,3 +12,4 @@ parquet = { version = "57.0", features = ["arrow"] }
 futures = "0.3"
 tokio = { version = "1.0", features = ["full"] }
 async-trait = "0.1"
+rand = "0.8"

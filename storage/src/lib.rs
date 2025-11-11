@@ -69,6 +69,43 @@ enum WalPayload {
     Aggregations { rows: Vec<AggregationRow> },
 }
 
+fn normalize_prefix(raw: &str, len: usize) -> String {
+    let mut prefix: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(len.max(1))
+        .collect();
+    if prefix.is_empty() {
+        prefix.push('X');
+    }
+    prefix.to_ascii_uppercase()
+}
+
+fn option_partition_prefix(contract: &str) -> String {
+    if let Some(rest) = contract.strip_prefix("O:") {
+        let root: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
+        if !root.is_empty() {
+            return normalize_prefix(&root, 3);
+        }
+    }
+    normalize_prefix(contract, 3)
+}
+
+fn equity_partition_prefix(symbol: &str) -> String {
+    normalize_prefix(symbol, 2)
+}
+
+fn instrument_partition_prefix(instrument: &str) -> String {
+    if instrument.starts_with("O:") {
+        option_partition_prefix(instrument)
+    } else {
+        normalize_prefix(instrument, 2)
+    }
+}
+
 impl From<&DataBatchMeta> for WalMeta {
     fn from(meta: &DataBatchMeta) -> Self {
         Self {
@@ -387,14 +424,15 @@ impl Storage {
             }
 
             let dt_str = date.to_string();
-            let prefix = "prefix"; // TODO: derive from contract prefix
-            let rel_partition = format!("options_trades/dt={}/{}/", dt_str, prefix);
-            self.write_option_partition_from_rows(
-                &rel_partition,
-                deduped_trades,
-                &batch.meta,
-                true,
-            )?;
+            let mut per_prefix: HashMap<String, Vec<OptionTrade>> = HashMap::new();
+            for trade in deduped_trades.into_iter() {
+                let prefix = option_partition_prefix(&trade.contract);
+                per_prefix.entry(prefix).or_default().push(trade);
+            }
+            for (prefix, trades) in per_prefix {
+                let rel_partition = format!("options_trades/dt={}/root={}/", dt_str, prefix);
+                self.write_option_partition_from_rows(&rel_partition, trades, &batch.meta, true)?;
+            }
         }
         Ok(())
     }
@@ -449,14 +487,16 @@ impl Storage {
             }
 
             let dt_str = date.to_string();
-            let prefix = "prefix"; // TODO: derive from instrument_id prefix
-            let rel_partition = format!("equity_trades/dt={}/{}/", dt_str, prefix);
-            self.write_equity_partition_from_rows(
-                &rel_partition,
-                deduped_trades,
-                &batch.meta,
-                true,
-            )?;
+            let mut per_prefix: HashMap<String, Vec<EquityTrade>> = HashMap::new();
+            for trade in deduped_trades.into_iter() {
+                let prefix = equity_partition_prefix(&trade.symbol);
+                per_prefix.entry(prefix).or_default().push(trade);
+            }
+            for (prefix, trades) in per_prefix {
+                let rel_partition =
+                    format!("equity_trades/dt={}/symbol_prefix={}/", dt_str, prefix);
+                self.write_equity_partition_from_rows(&rel_partition, trades, &batch.meta, true)?;
+            }
         }
         Ok(())
     }
@@ -471,9 +511,15 @@ impl Storage {
         .naive_utc()
         .date();
         let dt_str = dt.to_string();
-        let prefix = "prefix"; // TODO: derive from instrument prefix
-        let rel_partition = format!("nbbo/dt={}/{}/", dt_str, prefix);
-        self.write_nbbo_from_rows(&rel_partition, batch.rows.clone(), &batch.meta, true)?;
+        let mut per_prefix: HashMap<String, Vec<Nbbo>> = HashMap::new();
+        for quote in batch.rows.clone().into_iter() {
+            let prefix = instrument_partition_prefix(&quote.instrument_id);
+            per_prefix.entry(prefix).or_default().push(quote);
+        }
+        for (prefix, quotes) in per_prefix {
+            let rel_partition = format!("nbbo/dt={}/prefix={}/", dt_str, prefix);
+            self.write_nbbo_from_rows(&rel_partition, quotes, &batch.meta, true)?;
+        }
         Ok(())
     }
 
@@ -576,6 +622,7 @@ impl Storage {
         let mut class_method = Vec::new();
         let mut aggressor_offset_mid_bp = Vec::new();
         let mut aggressor_offset_touch_ticks = Vec::new();
+        let mut aggressor_confidence: Vec<Option<f64>> = Vec::new();
         let mut nbbo_bid = Vec::new();
         let mut nbbo_ask = Vec::new();
         let mut nbbo_bid_sz: Vec<Option<u32>> = Vec::new();
@@ -609,6 +656,7 @@ impl Storage {
             class_method.push(format!("{:?}", trade.class_method));
             aggressor_offset_mid_bp.push(trade.aggressor_offset_mid_bp);
             aggressor_offset_touch_ticks.push(trade.aggressor_offset_touch_ticks);
+            aggressor_confidence.push(trade.aggressor_confidence);
             nbbo_bid.push(trade.nbbo_bid);
             nbbo_ask.push(trade.nbbo_ask);
             nbbo_bid_sz.push(trade.nbbo_bid_sz);
@@ -649,6 +697,7 @@ impl Storage {
             Arc::new(StringArray::from(class_method)),
             Arc::new(Int32Array::from(aggressor_offset_mid_bp)),
             Arc::new(Int32Array::from(aggressor_offset_touch_ticks)),
+            Arc::new(Float64Array::from(aggressor_confidence)),
             Arc::new(Float64Array::from(nbbo_bid)),
             Arc::new(Float64Array::from(nbbo_ask)),
             Arc::new(UInt32Array::from(nbbo_bid_sz)),
@@ -686,6 +735,7 @@ impl Storage {
         let mut class_method = Vec::new();
         let mut aggressor_offset_mid_bp = Vec::new();
         let mut aggressor_offset_touch_ticks = Vec::new();
+        let mut aggressor_confidence: Vec<Option<f64>> = Vec::new();
         let mut nbbo_bid = Vec::new();
         let mut nbbo_ask = Vec::new();
         let mut nbbo_bid_sz = Vec::new();
@@ -716,6 +766,7 @@ impl Storage {
             class_method.push(format!("{:?}", trade.class_method));
             aggressor_offset_mid_bp.push(trade.aggressor_offset_mid_bp);
             aggressor_offset_touch_ticks.push(trade.aggressor_offset_touch_ticks);
+            aggressor_confidence.push(trade.aggressor_confidence);
             nbbo_bid.push(trade.nbbo_bid);
             nbbo_ask.push(trade.nbbo_ask);
             nbbo_bid_sz.push(trade.nbbo_bid_sz);
@@ -753,6 +804,7 @@ impl Storage {
             Arc::new(StringArray::from(class_method)),
             Arc::new(Int32Array::from(aggressor_offset_mid_bp)),
             Arc::new(Int32Array::from(aggressor_offset_touch_ticks)),
+            Arc::new(Float64Array::from(aggressor_confidence)),
             Arc::new(Float64Array::from(nbbo_bid)),
             Arc::new(Float64Array::from(nbbo_ask)),
             Arc::new(UInt32Array::from(nbbo_bid_sz)),
@@ -778,11 +830,57 @@ impl Storage {
 
     fn nbbo_to_record_batch(
         &self,
-        _nbbos: &[Nbbo],
+        nbbos: &[Nbbo],
         _meta: &DataBatchMeta,
     ) -> Result<RecordBatch, StorageError> {
+        let len = nbbos.len();
+        let mut instrument_id = Vec::with_capacity(len);
+        let mut quote_ts_ns = Vec::with_capacity(len);
+        let mut bid = Vec::with_capacity(len);
+        let mut ask = Vec::with_capacity(len);
+        let mut bid_sz = Vec::with_capacity(len);
+        let mut ask_sz = Vec::with_capacity(len);
+        let mut state = Vec::with_capacity(len);
+        let mut condition = Vec::with_capacity(len);
+        let mut best_bid_venue = Vec::with_capacity(len);
+        let mut best_ask_venue = Vec::with_capacity(len);
+        let mut source = Vec::with_capacity(len);
+        let mut quality = Vec::with_capacity(len);
+        let mut watermark_ts_ns = Vec::with_capacity(len);
+
+        for quote in nbbos {
+            instrument_id.push(quote.instrument_id.clone());
+            quote_ts_ns.push(quote.quote_ts_ns);
+            bid.push(quote.bid);
+            ask.push(quote.ask);
+            bid_sz.push(quote.bid_sz);
+            ask_sz.push(quote.ask_sz);
+            state.push(format!("{:?}", quote.state));
+            condition.push(quote.condition);
+            best_bid_venue.push(quote.best_bid_venue);
+            best_ask_venue.push(quote.best_ask_venue);
+            source.push(format!("{:?}", quote.source));
+            quality.push(format!("{:?}", quote.quality));
+            watermark_ts_ns.push(quote.watermark_ts_ns);
+        }
+
         let schema: SchemaRef = Arc::new(nbbo_schema());
-        Ok(RecordBatch::new_empty(schema))
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(instrument_id)),
+            Arc::new(Int64Array::from(quote_ts_ns)),
+            Arc::new(Float64Array::from(bid)),
+            Arc::new(Float64Array::from(ask)),
+            Arc::new(UInt32Array::from(bid_sz)),
+            Arc::new(UInt32Array::from(ask_sz)),
+            Arc::new(StringArray::from(state)),
+            Arc::new(Int32Array::from(condition)),
+            Arc::new(Int32Array::from(best_bid_venue)),
+            Arc::new(Int32Array::from(best_ask_venue)),
+            Arc::new(StringArray::from(source)),
+            Arc::new(StringArray::from(quality)),
+            Arc::new(Int64Array::from(watermark_ts_ns)),
+        ];
+        Ok(RecordBatch::try_new(schema, arrays)?)
     }
 
     fn aggregations_to_record_batch(
@@ -821,6 +919,11 @@ impl Storage {
             underlying_dollar_value_kde_peaks,
             puts_below_intrinsic_pct,
             puts_above_intrinsic_pct,
+            puts_aggressor_unknown_pct,
+            puts_classifier_touch_pct,
+            puts_classifier_at_or_beyond_pct,
+            puts_classifier_tick_rule_pct,
+            puts_classifier_unknown_pct,
             puts_dadvv_total,
             puts_dadvv_minimum,
             puts_dadvv_maximum,
@@ -835,6 +938,20 @@ impl Storage {
             puts_dadvv_bc,
             puts_dadvv_dip_pval,
             puts_dadvv_kde_peaks,
+            puts_signed_dadvv_total,
+            puts_signed_dadvv_minimum,
+            puts_signed_dadvv_maximum,
+            puts_signed_dadvv_mean,
+            puts_signed_dadvv_stddev,
+            puts_signed_dadvv_skew,
+            puts_signed_dadvv_kurtosis,
+            puts_signed_dadvv_iqr,
+            puts_signed_dadvv_mad,
+            puts_signed_dadvv_cv,
+            puts_signed_dadvv_mode,
+            puts_signed_dadvv_bc,
+            puts_signed_dadvv_dip_pval,
+            puts_signed_dadvv_kde_peaks,
             puts_gadvv_total,
             puts_gadvv_minimum,
             puts_gadvv_maximum,
@@ -849,8 +966,27 @@ impl Storage {
             puts_gadvv_bc,
             puts_gadvv_dip_pval,
             puts_gadvv_kde_peaks,
+            puts_signed_gadvv_total,
+            puts_signed_gadvv_minimum,
+            puts_signed_gadvv_maximum,
+            puts_signed_gadvv_mean,
+            puts_signed_gadvv_stddev,
+            puts_signed_gadvv_skew,
+            puts_signed_gadvv_kurtosis,
+            puts_signed_gadvv_iqr,
+            puts_signed_gadvv_mad,
+            puts_signed_gadvv_cv,
+            puts_signed_gadvv_mode,
+            puts_signed_gadvv_bc,
+            puts_signed_gadvv_dip_pval,
+            puts_signed_gadvv_kde_peaks,
             calls_dollar_value,
             calls_above_intrinsic_pct,
+            calls_aggressor_unknown_pct,
+            calls_classifier_touch_pct,
+            calls_classifier_at_or_beyond_pct,
+            calls_classifier_tick_rule_pct,
+            calls_classifier_unknown_pct,
             calls_dadvv_total,
             calls_dadvv_minimum,
             calls_dadvv_maximum,
@@ -865,6 +1001,20 @@ impl Storage {
             calls_dadvv_bc,
             calls_dadvv_dip_pval,
             calls_dadvv_kde_peaks,
+            calls_signed_dadvv_total,
+            calls_signed_dadvv_minimum,
+            calls_signed_dadvv_maximum,
+            calls_signed_dadvv_mean,
+            calls_signed_dadvv_stddev,
+            calls_signed_dadvv_skew,
+            calls_signed_dadvv_kurtosis,
+            calls_signed_dadvv_iqr,
+            calls_signed_dadvv_mad,
+            calls_signed_dadvv_cv,
+            calls_signed_dadvv_mode,
+            calls_signed_dadvv_bc,
+            calls_signed_dadvv_dip_pval,
+            calls_signed_dadvv_kde_peaks,
             calls_gadvv_total,
             calls_gadvv_minimum,
             calls_gadvv_q1,
@@ -881,7 +1031,24 @@ impl Storage {
             calls_gadvv_mode,
             calls_gadvv_bc,
             calls_gadvv_dip_pval,
-            calls_gadvv_kde_peaks
+            calls_gadvv_kde_peaks,
+            calls_signed_gadvv_total,
+            calls_signed_gadvv_minimum,
+            calls_signed_gadvv_q1,
+            calls_signed_gadvv_q2,
+            calls_signed_gadvv_q3,
+            calls_signed_gadvv_maximum,
+            calls_signed_gadvv_mean,
+            calls_signed_gadvv_stddev,
+            calls_signed_gadvv_skew,
+            calls_signed_gadvv_kurtosis,
+            calls_signed_gadvv_iqr,
+            calls_signed_gadvv_mad,
+            calls_signed_gadvv_cv,
+            calls_signed_gadvv_mode,
+            calls_signed_gadvv_bc,
+            calls_signed_gadvv_dip_pval,
+            calls_signed_gadvv_kde_peaks
         );
         for row in rows {
             symbols.push(row.symbol.clone());
@@ -908,6 +1075,11 @@ impl Storage {
             underlying_dollar_value_kde_peaks.push(row.underlying_dollar_value_kde_peaks);
             puts_below_intrinsic_pct.push(row.puts_below_intrinsic_pct);
             puts_above_intrinsic_pct.push(row.puts_above_intrinsic_pct);
+            puts_aggressor_unknown_pct.push(row.puts_aggressor_unknown_pct);
+            puts_classifier_touch_pct.push(row.puts_classifier_touch_pct);
+            puts_classifier_at_or_beyond_pct.push(row.puts_classifier_at_or_beyond_pct);
+            puts_classifier_tick_rule_pct.push(row.puts_classifier_tick_rule_pct);
+            puts_classifier_unknown_pct.push(row.puts_classifier_unknown_pct);
             puts_dadvv_total.push(row.puts_dadvv_total);
             puts_dadvv_minimum.push(row.puts_dadvv_minimum);
             puts_dadvv_maximum.push(row.puts_dadvv_maximum);
@@ -922,6 +1094,20 @@ impl Storage {
             puts_dadvv_bc.push(row.puts_dadvv_bc);
             puts_dadvv_dip_pval.push(row.puts_dadvv_dip_pval);
             puts_dadvv_kde_peaks.push(row.puts_dadvv_kde_peaks);
+            puts_signed_dadvv_total.push(row.puts_signed_dadvv_total);
+            puts_signed_dadvv_minimum.push(row.puts_signed_dadvv_minimum);
+            puts_signed_dadvv_maximum.push(row.puts_signed_dadvv_maximum);
+            puts_signed_dadvv_mean.push(row.puts_signed_dadvv_mean);
+            puts_signed_dadvv_stddev.push(row.puts_signed_dadvv_stddev);
+            puts_signed_dadvv_skew.push(row.puts_signed_dadvv_skew);
+            puts_signed_dadvv_kurtosis.push(row.puts_signed_dadvv_kurtosis);
+            puts_signed_dadvv_iqr.push(row.puts_signed_dadvv_iqr);
+            puts_signed_dadvv_mad.push(row.puts_signed_dadvv_mad);
+            puts_signed_dadvv_cv.push(row.puts_signed_dadvv_cv);
+            puts_signed_dadvv_mode.push(row.puts_signed_dadvv_mode);
+            puts_signed_dadvv_bc.push(row.puts_signed_dadvv_bc);
+            puts_signed_dadvv_dip_pval.push(row.puts_signed_dadvv_dip_pval);
+            puts_signed_dadvv_kde_peaks.push(row.puts_signed_dadvv_kde_peaks);
             puts_gadvv_total.push(row.puts_gadvv_total);
             puts_gadvv_minimum.push(row.puts_gadvv_minimum);
             puts_gadvv_maximum.push(row.puts_gadvv_maximum);
@@ -936,8 +1122,27 @@ impl Storage {
             puts_gadvv_bc.push(row.puts_gadvv_bc);
             puts_gadvv_dip_pval.push(row.puts_gadvv_dip_pval);
             puts_gadvv_kde_peaks.push(row.puts_gadvv_kde_peaks);
+            puts_signed_gadvv_total.push(row.puts_signed_gadvv_total);
+            puts_signed_gadvv_minimum.push(row.puts_signed_gadvv_minimum);
+            puts_signed_gadvv_maximum.push(row.puts_signed_gadvv_maximum);
+            puts_signed_gadvv_mean.push(row.puts_signed_gadvv_mean);
+            puts_signed_gadvv_stddev.push(row.puts_signed_gadvv_stddev);
+            puts_signed_gadvv_skew.push(row.puts_signed_gadvv_skew);
+            puts_signed_gadvv_kurtosis.push(row.puts_signed_gadvv_kurtosis);
+            puts_signed_gadvv_iqr.push(row.puts_signed_gadvv_iqr);
+            puts_signed_gadvv_mad.push(row.puts_signed_gadvv_mad);
+            puts_signed_gadvv_cv.push(row.puts_signed_gadvv_cv);
+            puts_signed_gadvv_mode.push(row.puts_signed_gadvv_mode);
+            puts_signed_gadvv_bc.push(row.puts_signed_gadvv_bc);
+            puts_signed_gadvv_dip_pval.push(row.puts_signed_gadvv_dip_pval);
+            puts_signed_gadvv_kde_peaks.push(row.puts_signed_gadvv_kde_peaks);
             calls_dollar_value.push(row.calls_dollar_value);
             calls_above_intrinsic_pct.push(row.calls_above_intrinsic_pct);
+            calls_aggressor_unknown_pct.push(row.calls_aggressor_unknown_pct);
+            calls_classifier_touch_pct.push(row.calls_classifier_touch_pct);
+            calls_classifier_at_or_beyond_pct.push(row.calls_classifier_at_or_beyond_pct);
+            calls_classifier_tick_rule_pct.push(row.calls_classifier_tick_rule_pct);
+            calls_classifier_unknown_pct.push(row.calls_classifier_unknown_pct);
             calls_dadvv_total.push(row.calls_dadvv_total);
             calls_dadvv_minimum.push(row.calls_dadvv_minimum);
             calls_dadvv_maximum.push(row.calls_dadvv_maximum);
@@ -952,6 +1157,20 @@ impl Storage {
             calls_dadvv_bc.push(row.calls_dadvv_bc);
             calls_dadvv_dip_pval.push(row.calls_dadvv_dip_pval);
             calls_dadvv_kde_peaks.push(row.calls_dadvv_kde_peaks);
+            calls_signed_dadvv_total.push(row.calls_signed_dadvv_total);
+            calls_signed_dadvv_minimum.push(row.calls_signed_dadvv_minimum);
+            calls_signed_dadvv_maximum.push(row.calls_signed_dadvv_maximum);
+            calls_signed_dadvv_mean.push(row.calls_signed_dadvv_mean);
+            calls_signed_dadvv_stddev.push(row.calls_signed_dadvv_stddev);
+            calls_signed_dadvv_skew.push(row.calls_signed_dadvv_skew);
+            calls_signed_dadvv_kurtosis.push(row.calls_signed_dadvv_kurtosis);
+            calls_signed_dadvv_iqr.push(row.calls_signed_dadvv_iqr);
+            calls_signed_dadvv_mad.push(row.calls_signed_dadvv_mad);
+            calls_signed_dadvv_cv.push(row.calls_signed_dadvv_cv);
+            calls_signed_dadvv_mode.push(row.calls_signed_dadvv_mode);
+            calls_signed_dadvv_bc.push(row.calls_signed_dadvv_bc);
+            calls_signed_dadvv_dip_pval.push(row.calls_signed_dadvv_dip_pval);
+            calls_signed_dadvv_kde_peaks.push(row.calls_signed_dadvv_kde_peaks);
             calls_gadvv_total.push(row.calls_gadvv_total);
             calls_gadvv_minimum.push(row.calls_gadvv_minimum);
             calls_gadvv_q1.push(row.calls_gadvv_q1);
@@ -969,6 +1188,23 @@ impl Storage {
             calls_gadvv_bc.push(row.calls_gadvv_bc);
             calls_gadvv_dip_pval.push(row.calls_gadvv_dip_pval);
             calls_gadvv_kde_peaks.push(row.calls_gadvv_kde_peaks);
+            calls_signed_gadvv_total.push(row.calls_signed_gadvv_total);
+            calls_signed_gadvv_minimum.push(row.calls_signed_gadvv_minimum);
+            calls_signed_gadvv_q1.push(row.calls_signed_gadvv_q1);
+            calls_signed_gadvv_q2.push(row.calls_signed_gadvv_q2);
+            calls_signed_gadvv_q3.push(row.calls_signed_gadvv_q3);
+            calls_signed_gadvv_maximum.push(row.calls_signed_gadvv_maximum);
+            calls_signed_gadvv_mean.push(row.calls_signed_gadvv_mean);
+            calls_signed_gadvv_stddev.push(row.calls_signed_gadvv_stddev);
+            calls_signed_gadvv_skew.push(row.calls_signed_gadvv_skew);
+            calls_signed_gadvv_kurtosis.push(row.calls_signed_gadvv_kurtosis);
+            calls_signed_gadvv_iqr.push(row.calls_signed_gadvv_iqr);
+            calls_signed_gadvv_mad.push(row.calls_signed_gadvv_mad);
+            calls_signed_gadvv_cv.push(row.calls_signed_gadvv_cv);
+            calls_signed_gadvv_mode.push(row.calls_signed_gadvv_mode);
+            calls_signed_gadvv_bc.push(row.calls_signed_gadvv_bc);
+            calls_signed_gadvv_dip_pval.push(row.calls_signed_gadvv_dip_pval);
+            calls_signed_gadvv_kde_peaks.push(row.calls_signed_gadvv_kde_peaks);
         }
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(symbols)),
@@ -995,6 +1231,11 @@ impl Storage {
             Arc::new(Float64Array::from(underlying_dollar_value_kde_peaks)),
             Arc::new(Float64Array::from(puts_below_intrinsic_pct)),
             Arc::new(Float64Array::from(puts_above_intrinsic_pct)),
+            Arc::new(Float64Array::from(puts_aggressor_unknown_pct)),
+            Arc::new(Float64Array::from(puts_classifier_touch_pct)),
+            Arc::new(Float64Array::from(puts_classifier_at_or_beyond_pct)),
+            Arc::new(Float64Array::from(puts_classifier_tick_rule_pct)),
+            Arc::new(Float64Array::from(puts_classifier_unknown_pct)),
             Arc::new(Float64Array::from(puts_dadvv_total)),
             Arc::new(Float64Array::from(puts_dadvv_minimum)),
             Arc::new(Float64Array::from(puts_dadvv_maximum)),
@@ -1009,6 +1250,20 @@ impl Storage {
             Arc::new(Float64Array::from(puts_dadvv_bc)),
             Arc::new(Float64Array::from(puts_dadvv_dip_pval)),
             Arc::new(Float64Array::from(puts_dadvv_kde_peaks)),
+            Arc::new(Float64Array::from(puts_signed_dadvv_total)),
+            Arc::new(Float64Array::from(puts_signed_dadvv_minimum)),
+            Arc::new(Float64Array::from(puts_signed_dadvv_maximum)),
+            Arc::new(Float64Array::from(puts_signed_dadvv_mean)),
+            Arc::new(Float64Array::from(puts_signed_dadvv_stddev)),
+            Arc::new(Float64Array::from(puts_signed_dadvv_skew)),
+            Arc::new(Float64Array::from(puts_signed_dadvv_kurtosis)),
+            Arc::new(Float64Array::from(puts_signed_dadvv_iqr)),
+            Arc::new(Float64Array::from(puts_signed_dadvv_mad)),
+            Arc::new(Float64Array::from(puts_signed_dadvv_cv)),
+            Arc::new(Float64Array::from(puts_signed_dadvv_mode)),
+            Arc::new(Float64Array::from(puts_signed_dadvv_bc)),
+            Arc::new(Float64Array::from(puts_signed_dadvv_dip_pval)),
+            Arc::new(Float64Array::from(puts_signed_dadvv_kde_peaks)),
             Arc::new(Float64Array::from(puts_gadvv_total)),
             Arc::new(Float64Array::from(puts_gadvv_minimum)),
             Arc::new(Float64Array::from(puts_gadvv_maximum)),
@@ -1023,8 +1278,27 @@ impl Storage {
             Arc::new(Float64Array::from(puts_gadvv_bc)),
             Arc::new(Float64Array::from(puts_gadvv_dip_pval)),
             Arc::new(Float64Array::from(puts_gadvv_kde_peaks)),
+            Arc::new(Float64Array::from(puts_signed_gadvv_total)),
+            Arc::new(Float64Array::from(puts_signed_gadvv_minimum)),
+            Arc::new(Float64Array::from(puts_signed_gadvv_maximum)),
+            Arc::new(Float64Array::from(puts_signed_gadvv_mean)),
+            Arc::new(Float64Array::from(puts_signed_gadvv_stddev)),
+            Arc::new(Float64Array::from(puts_signed_gadvv_skew)),
+            Arc::new(Float64Array::from(puts_signed_gadvv_kurtosis)),
+            Arc::new(Float64Array::from(puts_signed_gadvv_iqr)),
+            Arc::new(Float64Array::from(puts_signed_gadvv_mad)),
+            Arc::new(Float64Array::from(puts_signed_gadvv_cv)),
+            Arc::new(Float64Array::from(puts_signed_gadvv_mode)),
+            Arc::new(Float64Array::from(puts_signed_gadvv_bc)),
+            Arc::new(Float64Array::from(puts_signed_gadvv_dip_pval)),
+            Arc::new(Float64Array::from(puts_signed_gadvv_kde_peaks)),
             Arc::new(Float64Array::from(calls_dollar_value)),
             Arc::new(Float64Array::from(calls_above_intrinsic_pct)),
+            Arc::new(Float64Array::from(calls_aggressor_unknown_pct)),
+            Arc::new(Float64Array::from(calls_classifier_touch_pct)),
+            Arc::new(Float64Array::from(calls_classifier_at_or_beyond_pct)),
+            Arc::new(Float64Array::from(calls_classifier_tick_rule_pct)),
+            Arc::new(Float64Array::from(calls_classifier_unknown_pct)),
             Arc::new(Float64Array::from(calls_dadvv_total)),
             Arc::new(Float64Array::from(calls_dadvv_minimum)),
             Arc::new(Float64Array::from(calls_dadvv_maximum)),
@@ -1039,6 +1313,20 @@ impl Storage {
             Arc::new(Float64Array::from(calls_dadvv_bc)),
             Arc::new(Float64Array::from(calls_dadvv_dip_pval)),
             Arc::new(Float64Array::from(calls_dadvv_kde_peaks)),
+            Arc::new(Float64Array::from(calls_signed_dadvv_total)),
+            Arc::new(Float64Array::from(calls_signed_dadvv_minimum)),
+            Arc::new(Float64Array::from(calls_signed_dadvv_maximum)),
+            Arc::new(Float64Array::from(calls_signed_dadvv_mean)),
+            Arc::new(Float64Array::from(calls_signed_dadvv_stddev)),
+            Arc::new(Float64Array::from(calls_signed_dadvv_skew)),
+            Arc::new(Float64Array::from(calls_signed_dadvv_kurtosis)),
+            Arc::new(Float64Array::from(calls_signed_dadvv_iqr)),
+            Arc::new(Float64Array::from(calls_signed_dadvv_mad)),
+            Arc::new(Float64Array::from(calls_signed_dadvv_cv)),
+            Arc::new(Float64Array::from(calls_signed_dadvv_mode)),
+            Arc::new(Float64Array::from(calls_signed_dadvv_bc)),
+            Arc::new(Float64Array::from(calls_signed_dadvv_dip_pval)),
+            Arc::new(Float64Array::from(calls_signed_dadvv_kde_peaks)),
             Arc::new(Float64Array::from(calls_gadvv_total)),
             Arc::new(Float64Array::from(calls_gadvv_minimum)),
             Arc::new(Float64Array::from(calls_gadvv_q1)),
@@ -1056,6 +1344,23 @@ impl Storage {
             Arc::new(Float64Array::from(calls_gadvv_bc)),
             Arc::new(Float64Array::from(calls_gadvv_dip_pval)),
             Arc::new(Float64Array::from(calls_gadvv_kde_peaks)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_total)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_minimum)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_q1)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_q2)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_q3)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_maximum)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_mean)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_stddev)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_skew)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_kurtosis)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_iqr)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_mad)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_cv)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_mode)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_bc)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_dip_pval)),
+            Arc::new(Float64Array::from(calls_signed_gadvv_kde_peaks)),
         ];
         RecordBatch::try_new(Arc::new(aggregation_schema()), arrays).map_err(StorageError::from)
     }
@@ -1162,6 +1467,8 @@ mod tests {
             class_method: ClassMethod::NbboTouch,
             aggressor_offset_mid_bp: Some(10),
             aggressor_offset_touch_ticks: Some(5),
+            aggressor_confidence: Some(1.0),
+            aggressor_confidence: Some(1.0),
             nbbo_bid: Some(149.0),
             nbbo_ask: Some(151.0),
             nbbo_bid_sz: Some(200),
@@ -1200,7 +1507,7 @@ mod tests {
             .equity_trades_to_record_batch(&batch.rows, &batch.meta)
             .unwrap();
         assert_eq!(record_batch.num_rows(), 1);
-        assert_eq!(record_batch.num_columns(), 28);
+        assert_eq!(record_batch.num_columns(), 29);
     }
 
     #[test]

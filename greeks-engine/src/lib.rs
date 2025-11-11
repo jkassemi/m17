@@ -1,12 +1,23 @@
 // Copyright (c) James Kassemi, SC, US. All rights reserved.
-use black_scholes::*;
 use core_types::config::GreeksConfig;
 use core_types::types::OptionTrade;
+use futures::{stream, StreamExt};
+use libm::erf;
 use nbbo_cache::NbboStore;
 use num_cpus;
 use std::cmp::Ordering;
+use std::f64::consts::SQRT_2;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
+
+const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
+const SECONDS_PER_YEAR: f64 = 31_536_000.0;
+const MIN_TAU_YEARS: f64 = 1.0 / SECONDS_PER_YEAR;
+const MIN_VOL: f64 = 1e-4;
+const MAX_VOL: f64 = 5.0;
+const IV_TOLERANCE: f64 = 1e-4;
+const IV_MAX_ITERS: usize = 50;
+const INV_SQRT_TWO_PI: f64 = 0.3989422804014327;
 
 // Flags bitfield
 pub const FLAG_NO_UNDERLYING: u32 = 0b0001;
@@ -16,12 +27,10 @@ pub const FLAG_NO_TREASURY: u32 = 0b1000;
 
 fn resolve_pool_permits(configured: usize, detected_cores: usize) -> usize {
     let detected = detected_cores.max(1);
-    if configured == 0 {
-        detected
-    } else {
-        configured
+    match configured {
+        0 => detected,
+        n => n.max(1).min(detected),
     }
-    .max(1)
 }
 
 fn runtime_pool_permits(configured: usize) -> usize {
@@ -56,8 +65,9 @@ impl GreeksEngine {
     }
 
     pub async fn enrich_batch(&self, trades: &mut [OptionTrade]) {
-        let _permits = self.pool.clone();
-        let _q = self.cfg.dividend_yield;
+        if trades.is_empty() {
+            return;
+        }
         let curve = {
             let guard = self.treasury_curve.read().await;
             guard.clone()
@@ -69,75 +79,234 @@ impl GreeksEngine {
             return;
         }
         let curve = curve.unwrap();
-        // simple sequential for now; hook pool for heavy work like IV root-finding in future
-        for t in trades.iter_mut() {
-            let mut flags = 0u32;
-            // Underlying S from NBBO bid
-            let und = &t.underlying;
-            let quote = {
-                let store = self.nbbo.read().await;
-                store.get_best_before(und, t.trade_ts_ns, self.staleness_us)
-            };
-            if quote.is_none() || quote.as_ref().unwrap().bid <= 0.0 {
-                flags |= FLAG_NO_UNDERLYING;
-            }
-            let s = quote.as_ref().map(|q| q.bid).unwrap_or(0.0);
-            if let Some(qte) = quote.as_ref() {
-                t.nbbo_bid = Some(qte.bid);
-                t.nbbo_ask = Some(qte.ask);
-                t.nbbo_bid_sz = Some(qte.bid_sz);
-                t.nbbo_ask_sz = Some(qte.ask_sz);
-                t.nbbo_ts_ns = Some(qte.quote_ts_ns);
-                t.nbbo_age_us = Some(((t.trade_ts_ns - qte.quote_ts_ns) / 1_000) as u32);
-                t.nbbo_state = Some(qte.state.clone());
-            }
-            // Inputs
-            let k = t.strike_price;
-            let t_years =
-                ((t.expiry_ts_ns - t.trade_ts_ns) as f64 / 1_000_000_000f64 / 31_536_000f64)
-                    .max(0.0);
-            if t_years <= 0.0 {
-                flags |= FLAG_TIME_EXPIRED;
-            }
-            let r = curve.rate_for(t_years);
+        let cfg = Arc::new(self.cfg.clone());
+        let nbbo = self.nbbo.clone();
+        let pool = self.pool.clone();
+        let staleness_us = self.staleness_us;
 
-            // Sigma (IV) optional; if None, skip for now
-            let sigma = t.iv;
-            if quote.is_none() || sigma.is_none() || t_years <= 0.0 {
-                t.greeks_flags |= flags | if sigma.is_none() { FLAG_NO_IV } else { 0 };
-                continue;
-            }
-            let sigma = sigma.unwrap();
-
-            // Compute greeks via black_scholes crate
-            let is_call = t.contract_direction == 'C';
-            let delta = if is_call {
-                call_delta(s, k, r, sigma, t_years)
-            } else {
-                put_delta(s, k, r, sigma, t_years)
-            };
-            let gamma = if is_call {
-                call_gamma(s, k, r, sigma, t_years)
-            } else {
-                put_gamma(s, k, r, sigma, t_years)
-            };
-            let vega = if is_call {
-                call_vega(s, k, r, sigma, t_years)
-            } else {
-                put_vega(s, k, r, sigma, t_years)
-            };
-            let theta = if is_call {
-                call_theta(s, k, r, sigma, t_years)
-            } else {
-                put_theta(s, k, r, sigma, t_years)
-            };
-            t.delta = Some(delta);
-            t.gamma = Some(gamma);
-            t.vega = Some(vega);
-            t.theta = Some(theta);
-            t.greeks_flags |= flags;
-        }
+        stream::iter(trades.iter_mut())
+            .for_each_concurrent(None, |trade| {
+                let cfg = Arc::clone(&cfg);
+                let nbbo = nbbo.clone();
+                let curve = curve.clone();
+                let pool = pool.clone();
+                async move {
+                    if let Ok(_permit) = pool.acquire_owned().await {
+                        enrich_single_trade(trade, cfg.as_ref(), nbbo, curve, staleness_us).await;
+                    } else {
+                        enrich_single_trade(trade, cfg.as_ref(), nbbo, curve, staleness_us).await;
+                    }
+                }
+            })
+            .await;
     }
+}
+
+async fn enrich_single_trade(
+    trade: &mut OptionTrade,
+    cfg: &GreeksConfig,
+    nbbo: Arc<RwLock<NbboStore>>,
+    curve: Arc<TreasuryCurve>,
+    staleness_us: u32,
+) {
+    trade.delta = None;
+    trade.gamma = None;
+    trade.vega = None;
+    trade.theta = None;
+    let quote = {
+        let store = nbbo.read().await;
+        store.get_best_before(&trade.underlying, trade.trade_ts_ns, staleness_us)
+    };
+    let Some(qte) = quote else {
+        trade.greeks_flags |= FLAG_NO_UNDERLYING;
+        return;
+    };
+    let mid = if qte.ask.is_finite() && qte.ask > 0.0 {
+        0.5 * (qte.bid + qte.ask)
+    } else {
+        qte.bid
+    };
+    if !mid.is_finite() || mid <= 0.0 {
+        trade.greeks_flags |= FLAG_NO_UNDERLYING;
+        return;
+    }
+    let age_ns = trade.trade_ts_ns.saturating_sub(qte.quote_ts_ns);
+    let age_us = (age_ns / 1_000).max(0) as u64;
+    trade.nbbo_bid = Some(qte.bid);
+    trade.nbbo_ask = Some(qte.ask);
+    trade.nbbo_bid_sz = Some(qte.bid_sz);
+    trade.nbbo_ask_sz = Some(qte.ask_sz);
+    trade.nbbo_ts_ns = Some(qte.quote_ts_ns);
+    trade.nbbo_age_us = Some(age_us.min(u32::MAX as u64) as u32);
+    trade.nbbo_state = Some(qte.state.clone());
+
+    let time_to_expiry_ns = trade.expiry_ts_ns.saturating_sub(trade.trade_ts_ns);
+    if time_to_expiry_ns <= 0 {
+        trade.greeks_flags |= FLAG_TIME_EXPIRED;
+        return;
+    }
+    let tau_years =
+        ((time_to_expiry_ns as f64) / NANOS_PER_SECOND / SECONDS_PER_YEAR).max(MIN_TAU_YEARS);
+    let rate = curve.rate_for(tau_years);
+    let dividend_yield = cfg.dividend_yield;
+    let is_call = matches!(trade.contract_direction, 'C' | 'c');
+    let mut sigma = trade
+        .iv
+        .filter(|iv| iv.is_finite() && *iv >= MIN_VOL && *iv <= MAX_VOL);
+    if sigma.is_none() {
+        sigma = solve_implied_vol(
+            trade.price,
+            is_call,
+            mid,
+            trade.strike_price,
+            rate,
+            dividend_yield,
+            tau_years,
+        );
+    }
+    let Some(vol) = sigma else {
+        trade.greeks_flags |= FLAG_NO_IV;
+        return;
+    };
+    let Some(greeks) = bs_price_and_greeks(
+        is_call,
+        mid,
+        trade.strike_price,
+        rate,
+        dividend_yield,
+        vol,
+        tau_years,
+    ) else {
+        trade.greeks_flags |= FLAG_NO_IV;
+        return;
+    };
+    trade.iv = Some(vol);
+    trade.delta = Some(greeks.delta);
+    trade.gamma = Some(greeks.gamma);
+    trade.vega = Some(greeks.vega);
+    trade.theta = Some(greeks.theta);
+}
+
+struct GreeksResult {
+    price: f64,
+    delta: f64,
+    gamma: f64,
+    vega: f64,
+    theta: f64,
+}
+
+fn bs_price_and_greeks(
+    is_call: bool,
+    spot: f64,
+    strike: f64,
+    rate: f64,
+    dividend_yield: f64,
+    vol: f64,
+    tau: f64,
+) -> Option<GreeksResult> {
+    if !(spot > 0.0 && strike > 0.0 && vol > 0.0 && tau > 0.0) {
+        return None;
+    }
+    let sqrt_tau = tau.sqrt();
+    if !sqrt_tau.is_finite() || sqrt_tau == 0.0 {
+        return None;
+    }
+    let denom = vol * sqrt_tau;
+    if denom <= 0.0 {
+        return None;
+    }
+    let log_term = (spot / strike).ln();
+    if !log_term.is_finite() {
+        return None;
+    }
+    let drift = rate - dividend_yield + 0.5 * vol * vol;
+    let d1 = (log_term + drift * tau) / denom;
+    let d2 = d1 - denom;
+    let disc_r = (-rate * tau).exp();
+    let disc_q = (-dividend_yield * tau).exp();
+    let pdf_d1 = norm_pdf(d1);
+    let nd1 = norm_cdf(d1);
+    let nd2 = norm_cdf(d2);
+    let nneg_d1 = norm_cdf(-d1);
+    let nneg_d2 = norm_cdf(-d2);
+    let gamma = disc_q * pdf_d1 / (spot * denom);
+    let vega = spot * disc_q * pdf_d1 * sqrt_tau;
+    if !gamma.is_finite() || !vega.is_finite() {
+        return None;
+    }
+    let (price, delta, theta) = if is_call {
+        let price = spot * disc_q * nd1 - strike * disc_r * nd2;
+        let delta = disc_q * nd1;
+        let theta = -spot * disc_q * pdf_d1 * vol / (2.0 * sqrt_tau)
+            + dividend_yield * spot * disc_q * nd1
+            - rate * strike * disc_r * nd2;
+        (price, delta, theta)
+    } else {
+        let price = strike * disc_r * nneg_d2 - spot * disc_q * nneg_d1;
+        let delta = disc_q * (nd1 - 1.0);
+        let theta = -spot * disc_q * pdf_d1 * vol / (2.0 * sqrt_tau)
+            - dividend_yield * spot * disc_q * nneg_d1
+            + rate * strike * disc_r * nneg_d2;
+        (price, delta, theta)
+    };
+    Some(GreeksResult {
+        price,
+        delta,
+        gamma,
+        vega,
+        theta,
+    })
+}
+
+fn solve_implied_vol(
+    target: f64,
+    is_call: bool,
+    spot: f64,
+    strike: f64,
+    rate: f64,
+    dividend_yield: f64,
+    tau: f64,
+) -> Option<f64> {
+    if !target.is_finite() || target <= 0.0 || spot <= 0.0 || strike <= 0.0 {
+        return None;
+    }
+    let intrinsic = if is_call {
+        (spot - strike).max(0.0)
+    } else {
+        (strike - spot).max(0.0)
+    };
+    if target < intrinsic - 1e-6 {
+        return None;
+    }
+    let mut sigma = 0.3f64;
+    for _ in 0..IV_MAX_ITERS {
+        let Some(res) =
+            bs_price_and_greeks(is_call, spot, strike, rate, dividend_yield, sigma, tau)
+        else {
+            break;
+        };
+        let diff = res.price - target;
+        if diff.abs() < IV_TOLERANCE {
+            return Some(sigma);
+        }
+        if res.vega.abs() < 1e-8 {
+            break;
+        }
+        sigma -= diff / res.vega;
+        if !sigma.is_finite() {
+            break;
+        }
+        sigma = sigma.clamp(MIN_VOL, MAX_VOL);
+    }
+    None
+}
+
+fn norm_pdf(x: f64) -> f64 {
+    INV_SQRT_TWO_PI * (-0.5 * x * x).exp()
+}
+
+fn norm_cdf(x: f64) -> f64 {
+    0.5 * (1.0 + erf(x / SQRT_2))
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +328,15 @@ impl TreasuryCurve {
             return None;
         }
         points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        points.dedup_by(|a, b| (a.0 - b.0).abs() < f64::EPSILON);
+        if points.len() < 1 {
+            return None;
+        }
+        for window in points.windows(2) {
+            if window[1].0 <= window[0].0 {
+                return None;
+            }
+        }
         Some(Self { points })
     }
 
@@ -232,16 +410,17 @@ mod tests {
             contract_direction: 'C',
             strike_price: 400.0,
             underlying: "SPY".to_string(),
-            trade_ts_ns: 1_000_100_000, // 100us later
+            trade_ts_ns: 1_000_100_000,
             price: 1.0,
             size: 1,
             conditions: vec![],
             exchange: 11,
-            expiry_ts_ns: 1_000_000_000 + 31_536_000_000, // +1 year
+            expiry_ts_ns: 1_000_000_000 + 31_536_000_000,
             aggressor_side: core_types::types::AggressorSide::Unknown,
             class_method: core_types::types::ClassMethod::Unknown,
             aggressor_offset_mid_bp: None,
             aggressor_offset_touch_ticks: None,
+            aggressor_confidence: None,
             nbbo_bid: None,
             nbbo_ask: None,
             nbbo_bid_sz: None,
@@ -282,8 +461,8 @@ mod tests {
     }
 
     #[test]
-    fn pool_resolution_uses_config_when_nonzero() {
-        assert_eq!(super::resolve_pool_permits(8, 2), 8);
+    fn pool_resolution_respects_cpu_cap() {
+        assert_eq!(super::resolve_pool_permits(8, 2), 2);
     }
 
     #[test]

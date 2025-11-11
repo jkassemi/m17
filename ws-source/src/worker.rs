@@ -13,7 +13,6 @@ use futures::{
 use log::{error, info, warn};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -218,16 +217,18 @@ async fn handle_connection(
 }
 
 fn diff_lists(old: &[String], new: &[String]) -> (Vec<String>, Vec<String>) {
-    let old_set: HashSet<_> = old.iter().collect();
-    let new_set: HashSet<_> = new.iter().collect();
+    use std::collections::HashSet;
+
+    let old_set: HashSet<&String> = old.iter().collect();
+    let new_set: HashSet<&String> = new.iter().collect();
     let adds = new
         .iter()
-        .filter(|s| !old_set.contains(s))
+        .filter(|s| !old_set.contains(*s))
         .cloned()
         .collect();
     let removes = old
         .iter()
-        .filter(|s| !new_set.contains(s))
+        .filter(|s| !new_set.contains(*s))
         .cloned()
         .collect();
     (adds, removes)
@@ -369,6 +370,7 @@ fn raw_option_trade_to_row(raw: RawOptionTrade) -> Option<OptionTrade> {
         class_method: ClassMethod::Unknown,
         aggressor_offset_mid_bp: None,
         aggressor_offset_touch_ticks: None,
+        aggressor_confidence: None,
         nbbo_bid: None,
         nbbo_ask: None,
         nbbo_bid_sz: None,
@@ -406,6 +408,7 @@ fn raw_equity_trade_to_row(raw: RawEquityTrade) -> Option<EquityTrade> {
         class_method: ClassMethod::Unknown,
         aggressor_offset_mid_bp: None,
         aggressor_offset_touch_ticks: None,
+        aggressor_confidence: None,
         nbbo_bid: None,
         nbbo_ask: None,
         nbbo_bid_sz: None,

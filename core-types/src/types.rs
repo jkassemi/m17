@@ -84,6 +84,7 @@ pub struct OptionTrade {
     pub class_method: ClassMethod,
     pub aggressor_offset_mid_bp: Option<i32>,
     pub aggressor_offset_touch_ticks: Option<i32>,
+    pub aggressor_confidence: Option<f64>,
     pub nbbo_bid: Option<f64>,
     pub nbbo_ask: Option<f64>,
     pub nbbo_bid_sz: Option<u32>,
@@ -116,6 +117,7 @@ pub struct EquityTrade {
     pub class_method: ClassMethod,
     pub aggressor_offset_mid_bp: Option<i32>,
     pub aggressor_offset_touch_ticks: Option<i32>,
+    pub aggressor_confidence: Option<f64>,
     pub nbbo_bid: Option<f64>,
     pub nbbo_ask: Option<f64>,
     pub nbbo_bid_sz: Option<u32>,
@@ -205,6 +207,11 @@ pub struct AggregationRow {
     pub underlying_dollar_value_kde_peaks: Option<f64>,
     pub puts_below_intrinsic_pct: Option<f64>,
     pub puts_above_intrinsic_pct: Option<f64>,
+    pub puts_aggressor_unknown_pct: Option<f64>,
+    pub puts_classifier_touch_pct: Option<f64>,
+    pub puts_classifier_at_or_beyond_pct: Option<f64>,
+    pub puts_classifier_tick_rule_pct: Option<f64>,
+    pub puts_classifier_unknown_pct: Option<f64>,
     pub puts_dadvv_total: Option<f64>,
     pub puts_dadvv_minimum: Option<f64>,
     pub puts_dadvv_maximum: Option<f64>,
@@ -219,6 +226,20 @@ pub struct AggregationRow {
     pub puts_dadvv_bc: Option<f64>,
     pub puts_dadvv_dip_pval: Option<f64>,
     pub puts_dadvv_kde_peaks: Option<f64>,
+    pub puts_signed_dadvv_total: Option<f64>,
+    pub puts_signed_dadvv_minimum: Option<f64>,
+    pub puts_signed_dadvv_maximum: Option<f64>,
+    pub puts_signed_dadvv_mean: Option<f64>,
+    pub puts_signed_dadvv_stddev: Option<f64>,
+    pub puts_signed_dadvv_skew: Option<f64>,
+    pub puts_signed_dadvv_kurtosis: Option<f64>,
+    pub puts_signed_dadvv_iqr: Option<f64>,
+    pub puts_signed_dadvv_mad: Option<f64>,
+    pub puts_signed_dadvv_cv: Option<f64>,
+    pub puts_signed_dadvv_mode: Option<f64>,
+    pub puts_signed_dadvv_bc: Option<f64>,
+    pub puts_signed_dadvv_dip_pval: Option<f64>,
+    pub puts_signed_dadvv_kde_peaks: Option<f64>,
     pub puts_gadvv_total: Option<f64>,
     pub puts_gadvv_minimum: Option<f64>,
     pub puts_gadvv_maximum: Option<f64>,
@@ -233,8 +254,27 @@ pub struct AggregationRow {
     pub puts_gadvv_bc: Option<f64>,
     pub puts_gadvv_dip_pval: Option<f64>,
     pub puts_gadvv_kde_peaks: Option<f64>,
+    pub puts_signed_gadvv_total: Option<f64>,
+    pub puts_signed_gadvv_minimum: Option<f64>,
+    pub puts_signed_gadvv_maximum: Option<f64>,
+    pub puts_signed_gadvv_mean: Option<f64>,
+    pub puts_signed_gadvv_stddev: Option<f64>,
+    pub puts_signed_gadvv_skew: Option<f64>,
+    pub puts_signed_gadvv_kurtosis: Option<f64>,
+    pub puts_signed_gadvv_iqr: Option<f64>,
+    pub puts_signed_gadvv_mad: Option<f64>,
+    pub puts_signed_gadvv_cv: Option<f64>,
+    pub puts_signed_gadvv_mode: Option<f64>,
+    pub puts_signed_gadvv_bc: Option<f64>,
+    pub puts_signed_gadvv_dip_pval: Option<f64>,
+    pub puts_signed_gadvv_kde_peaks: Option<f64>,
     pub calls_dollar_value: Option<f64>,
     pub calls_above_intrinsic_pct: Option<f64>,
+    pub calls_aggressor_unknown_pct: Option<f64>,
+    pub calls_classifier_touch_pct: Option<f64>,
+    pub calls_classifier_at_or_beyond_pct: Option<f64>,
+    pub calls_classifier_tick_rule_pct: Option<f64>,
+    pub calls_classifier_unknown_pct: Option<f64>,
     pub calls_dadvv_total: Option<f64>,
     pub calls_dadvv_minimum: Option<f64>,
     pub calls_dadvv_maximum: Option<f64>,
@@ -249,6 +289,20 @@ pub struct AggregationRow {
     pub calls_dadvv_bc: Option<f64>,
     pub calls_dadvv_dip_pval: Option<f64>,
     pub calls_dadvv_kde_peaks: Option<f64>,
+    pub calls_signed_dadvv_total: Option<f64>,
+    pub calls_signed_dadvv_minimum: Option<f64>,
+    pub calls_signed_dadvv_maximum: Option<f64>,
+    pub calls_signed_dadvv_mean: Option<f64>,
+    pub calls_signed_dadvv_stddev: Option<f64>,
+    pub calls_signed_dadvv_skew: Option<f64>,
+    pub calls_signed_dadvv_kurtosis: Option<f64>,
+    pub calls_signed_dadvv_iqr: Option<f64>,
+    pub calls_signed_dadvv_mad: Option<f64>,
+    pub calls_signed_dadvv_cv: Option<f64>,
+    pub calls_signed_dadvv_mode: Option<f64>,
+    pub calls_signed_dadvv_bc: Option<f64>,
+    pub calls_signed_dadvv_dip_pval: Option<f64>,
+    pub calls_signed_dadvv_kde_peaks: Option<f64>,
     pub calls_gadvv_total: Option<f64>,
     pub calls_gadvv_minimum: Option<f64>,
     pub calls_gadvv_q1: Option<f64>,
@@ -266,6 +320,23 @@ pub struct AggregationRow {
     pub calls_gadvv_bc: Option<f64>,
     pub calls_gadvv_dip_pval: Option<f64>,
     pub calls_gadvv_kde_peaks: Option<f64>,
+    pub calls_signed_gadvv_total: Option<f64>,
+    pub calls_signed_gadvv_minimum: Option<f64>,
+    pub calls_signed_gadvv_q1: Option<f64>,
+    pub calls_signed_gadvv_q2: Option<f64>,
+    pub calls_signed_gadvv_q3: Option<f64>,
+    pub calls_signed_gadvv_maximum: Option<f64>,
+    pub calls_signed_gadvv_mean: Option<f64>,
+    pub calls_signed_gadvv_stddev: Option<f64>,
+    pub calls_signed_gadvv_skew: Option<f64>,
+    pub calls_signed_gadvv_kurtosis: Option<f64>,
+    pub calls_signed_gadvv_iqr: Option<f64>,
+    pub calls_signed_gadvv_mad: Option<f64>,
+    pub calls_signed_gadvv_cv: Option<f64>,
+    pub calls_signed_gadvv_mode: Option<f64>,
+    pub calls_signed_gadvv_bc: Option<f64>,
+    pub calls_signed_gadvv_dip_pval: Option<f64>,
+    pub calls_signed_gadvv_kde_peaks: Option<f64>,
 }
 
 /// ClassParams (stub).
@@ -290,6 +361,7 @@ pub trait TradeLike {
     fn set_aggressor_side(&mut self, side: AggressorSide);
     fn set_class_method(&mut self, method: ClassMethod);
     fn set_aggressor_offset_mid_bp(&mut self, offset: Option<i32>);
+    fn set_aggressor_confidence(&mut self, confidence: Option<f64>);
     fn set_nbbo_snapshot(
         &mut self,
         bid: Option<f64>,
@@ -301,6 +373,18 @@ pub trait TradeLike {
         state: Option<NbboState>,
     );
     fn set_tick_size_used(&mut self, size: Option<f64>);
+    fn aggressor_confidence(&self) -> Option<f64> {
+        None
+    }
+    fn option_delta(&self) -> Option<f64> {
+        None
+    }
+    fn underlying_symbol(&self) -> Option<&str> {
+        None
+    }
+    fn is_option(&self) -> bool {
+        false
+    }
 }
 
 impl TradeLike for OptionTrade {
@@ -322,6 +406,9 @@ impl TradeLike for OptionTrade {
     fn set_aggressor_offset_mid_bp(&mut self, offset: Option<i32>) {
         self.aggressor_offset_mid_bp = offset;
     }
+    fn set_aggressor_confidence(&mut self, confidence: Option<f64>) {
+        self.aggressor_confidence = confidence;
+    }
     fn set_nbbo_snapshot(
         &mut self,
         bid: Option<f64>,
@@ -342,6 +429,18 @@ impl TradeLike for OptionTrade {
     }
     fn set_tick_size_used(&mut self, size: Option<f64>) {
         self.tick_size_used = size;
+    }
+    fn aggressor_confidence(&self) -> Option<f64> {
+        self.aggressor_confidence
+    }
+    fn option_delta(&self) -> Option<f64> {
+        self.delta
+    }
+    fn underlying_symbol(&self) -> Option<&str> {
+        Some(&self.underlying)
+    }
+    fn is_option(&self) -> bool {
+        true
     }
 }
 
@@ -364,6 +463,9 @@ impl TradeLike for EquityTrade {
     fn set_aggressor_offset_mid_bp(&mut self, offset: Option<i32>) {
         self.aggressor_offset_mid_bp = offset;
     }
+    fn set_aggressor_confidence(&mut self, confidence: Option<f64>) {
+        self.aggressor_confidence = confidence;
+    }
     fn set_nbbo_snapshot(
         &mut self,
         bid: Option<f64>,
@@ -384,5 +486,11 @@ impl TradeLike for EquityTrade {
     }
     fn set_tick_size_used(&mut self, size: Option<f64>) {
         self.tick_size_used = size;
+    }
+    fn aggressor_confidence(&self) -> Option<f64> {
+        self.aggressor_confidence
+    }
+    fn underlying_symbol(&self) -> Option<&str> {
+        Some(&self.symbol)
     }
 }

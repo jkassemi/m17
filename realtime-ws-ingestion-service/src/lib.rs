@@ -222,7 +222,13 @@ impl RealtimeWsIngestionService {
                                             trade.trade_ts_ns,
                                             staleness_us,
                                         )
-                                        .map(|q| q.bid)
+                                        .map(|q| {
+                                            if q.ask.is_finite() && q.ask > 0.0 {
+                                                0.5 * (q.bid + q.ask)
+                                            } else {
+                                                q.bid
+                                            }
+                                        })
                                 };
                                 let _ = sender
                                     .send(AggregationEvent::OptionTrade {

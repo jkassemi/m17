@@ -3,7 +3,7 @@
 //! Streaming windowed aggregations for options + underlying trades.
 
 use core_types::config::AggregationsConfig;
-use core_types::types::{AggregationRow, EquityTrade, OptionTrade};
+use core_types::types::{AggregationRow, AggressorSide, ClassMethod, EquityTrade, OptionTrade};
 use diptest::{
     diptest_with_options, BootstrapConfig, DipStatOptions, DipTestOptions, PValueMethod,
 };
@@ -220,11 +220,54 @@ struct WindowState {
     calls_above_intrinsic: u64,
     calls_total: u64,
     calls_notional: f64,
+    puts_unknown: u64,
+    calls_unknown: u64,
+    puts_method_mix: MethodMix,
+    calls_method_mix: MethodMix,
     puts_dadvv: Vec<f64>,
     puts_gadvv: Vec<f64>,
+    puts_signed_dadvv: Vec<f64>,
+    puts_signed_gadvv: Vec<f64>,
     calls_dadvv: Vec<f64>,
     calls_gadvv: Vec<f64>,
+    calls_signed_dadvv: Vec<f64>,
+    calls_signed_gadvv: Vec<f64>,
     diptest_draws: usize,
+}
+
+#[derive(Default, Clone)]
+struct MethodMix {
+    touch: u64,
+    at_or_beyond: u64,
+    tick: u64,
+    unknown: u64,
+}
+
+impl MethodMix {
+    fn record(&mut self, method: &ClassMethod) {
+        match method {
+            ClassMethod::NbboTouch => self.touch += 1,
+            ClassMethod::NbboAtOrBeyond => self.at_or_beyond += 1,
+            ClassMethod::TickRule => self.tick += 1,
+            ClassMethod::Unknown => self.unknown += 1,
+        }
+    }
+
+    fn touch_pct(&self, total: u64) -> Option<f64> {
+        pct(self.touch, total)
+    }
+
+    fn at_or_beyond_pct(&self, total: u64) -> Option<f64> {
+        pct(self.at_or_beyond, total)
+    }
+
+    fn tick_pct(&self, total: u64) -> Option<f64> {
+        pct(self.tick, total)
+    }
+
+    fn unknown_pct(&self, total: u64) -> Option<f64> {
+        pct(self.unknown, total)
+    }
 }
 
 impl WindowState {
@@ -251,10 +294,18 @@ impl WindowState {
             calls_above_intrinsic: 0,
             calls_total: 0,
             calls_notional: 0.0,
+            puts_unknown: 0,
+            calls_unknown: 0,
+            puts_method_mix: MethodMix::default(),
+            calls_method_mix: MethodMix::default(),
             puts_dadvv: Vec::new(),
             puts_gadvv: Vec::new(),
+            puts_signed_dadvv: Vec::new(),
+            puts_signed_gadvv: Vec::new(),
             calls_dadvv: Vec::new(),
             calls_gadvv: Vec::new(),
+            calls_signed_dadvv: Vec::new(),
+            calls_signed_gadvv: Vec::new(),
             diptest_draws,
         }
     }
@@ -292,14 +343,23 @@ impl WindowState {
                 let notional = trade.price * trade.size as f64 * contract_size;
                 let intrinsic = intrinsic_value(&trade, s);
                 let above_intrinsic = trade.price > intrinsic;
-                if trade.contract_direction == 'C' {
+                let is_call = matches!(trade.contract_direction, 'C' | 'c');
+                if is_call {
                     self.calls_total += 1;
+                    self.calls_method_mix.record(&trade.class_method);
+                    if matches!(trade.aggressor_side, AggressorSide::Unknown) {
+                        self.calls_unknown += 1;
+                    }
                     if above_intrinsic {
                         self.calls_above_intrinsic += 1;
                     }
                     self.calls_notional += notional;
                 } else {
                     self.puts_total += 1;
+                    self.puts_method_mix.record(&trade.class_method);
+                    if matches!(trade.aggressor_side, AggressorSide::Unknown) {
+                        self.puts_unknown += 1;
+                    }
                     if trade.price < intrinsic {
                         self.puts_below_intrinsic += 1;
                     }
@@ -307,23 +367,42 @@ impl WindowState {
                         self.puts_above_intrinsic += 1;
                     }
                 }
-                let delta = trade.delta.unwrap_or(0.0).abs();
-                let gamma = trade.gamma.unwrap_or(0.0).abs();
-                let dadvv = delta * s * trade.size as f64 * contract_size;
-                let gadvv = gamma * s * s * trade.size as f64 * contract_size;
-                if trade.contract_direction == 'C' {
+                let raw_delta = trade.delta.unwrap_or(0.0);
+                let raw_gamma = trade.gamma.unwrap_or(0.0);
+                let unsigned_delta = raw_delta.abs();
+                let unsigned_gamma = raw_gamma.abs();
+                let p_buy = buy_probability(&trade);
+                let signed_factor = 2.0 * p_buy - 1.0;
+                let contract_qty = trade.size as f64 * contract_size;
+                let dadvv = unsigned_delta * s * contract_qty;
+                let signed_dadvv = signed_factor * dadvv;
+                let gadvv = unsigned_gamma * s * s * contract_qty;
+                let signed_gadvv = signed_factor * gadvv;
+                if is_call {
                     if dadvv.is_finite() {
                         self.calls_dadvv.push(dadvv);
                     }
+                    if signed_dadvv.is_finite() {
+                        self.calls_signed_dadvv.push(signed_dadvv);
+                    }
                     if gadvv.is_finite() {
                         self.calls_gadvv.push(gadvv);
+                    }
+                    if signed_gadvv.is_finite() {
+                        self.calls_signed_gadvv.push(signed_gadvv);
                     }
                 } else {
                     if dadvv.is_finite() {
                         self.puts_dadvv.push(dadvv);
                     }
+                    if signed_dadvv.is_finite() {
+                        self.puts_signed_dadvv.push(signed_dadvv);
+                    }
                     if gadvv.is_finite() {
                         self.puts_gadvv.push(gadvv);
+                    }
+                    if signed_gadvv.is_finite() {
+                        self.puts_signed_gadvv.push(signed_gadvv);
                     }
                 }
             }
@@ -340,9 +419,13 @@ impl WindowState {
         }
         let underline_stats = compute_stats(&self.underlying_dv, self.diptest_draws);
         let puts_dadvv_stats = compute_stats(&self.puts_dadvv, self.diptest_draws);
+        let puts_signed_dadvv_stats = compute_stats(&self.puts_signed_dadvv, self.diptest_draws);
         let puts_gadvv_stats = compute_stats(&self.puts_gadvv, self.diptest_draws);
+        let puts_signed_gadvv_stats = compute_stats(&self.puts_signed_gadvv, self.diptest_draws);
         let calls_dadvv_stats = compute_stats(&self.calls_dadvv, self.diptest_draws);
+        let calls_signed_dadvv_stats = compute_stats(&self.calls_signed_dadvv, self.diptest_draws);
         let calls_gadvv_stats = compute_stats(&self.calls_gadvv, self.diptest_draws);
+        let calls_signed_gadvv_stats = compute_stats(&self.calls_signed_gadvv, self.diptest_draws);
 
         Some(AggregationRow {
             symbol: self.symbol.clone(),
@@ -369,6 +452,13 @@ impl WindowState {
             underlying_dollar_value_kde_peaks: underline_stats.kde_peaks,
             puts_below_intrinsic_pct: pct(self.puts_below_intrinsic, self.puts_total),
             puts_above_intrinsic_pct: pct(self.puts_above_intrinsic, self.puts_total),
+            puts_aggressor_unknown_pct: pct(self.puts_unknown, self.puts_total),
+            puts_classifier_touch_pct: self.puts_method_mix.touch_pct(self.puts_total),
+            puts_classifier_at_or_beyond_pct: self
+                .puts_method_mix
+                .at_or_beyond_pct(self.puts_total),
+            puts_classifier_tick_rule_pct: self.puts_method_mix.tick_pct(self.puts_total),
+            puts_classifier_unknown_pct: self.puts_method_mix.unknown_pct(self.puts_total),
             puts_dadvv_total: puts_dadvv_stats.total,
             puts_dadvv_minimum: puts_dadvv_stats.min,
             puts_dadvv_maximum: puts_dadvv_stats.max,
@@ -383,6 +473,20 @@ impl WindowState {
             puts_dadvv_bc: puts_dadvv_stats.bc,
             puts_dadvv_dip_pval: puts_dadvv_stats.dip_pval,
             puts_dadvv_kde_peaks: puts_dadvv_stats.kde_peaks,
+            puts_signed_dadvv_total: puts_signed_dadvv_stats.total,
+            puts_signed_dadvv_minimum: puts_signed_dadvv_stats.min,
+            puts_signed_dadvv_maximum: puts_signed_dadvv_stats.max,
+            puts_signed_dadvv_mean: puts_signed_dadvv_stats.mean,
+            puts_signed_dadvv_stddev: puts_signed_dadvv_stats.stddev,
+            puts_signed_dadvv_skew: puts_signed_dadvv_stats.skew,
+            puts_signed_dadvv_kurtosis: puts_signed_dadvv_stats.kurtosis,
+            puts_signed_dadvv_iqr: puts_signed_dadvv_stats.iqr,
+            puts_signed_dadvv_mad: puts_signed_dadvv_stats.mad,
+            puts_signed_dadvv_cv: puts_signed_dadvv_stats.cv,
+            puts_signed_dadvv_mode: puts_signed_dadvv_stats.mode,
+            puts_signed_dadvv_bc: puts_signed_dadvv_stats.bc,
+            puts_signed_dadvv_dip_pval: puts_signed_dadvv_stats.dip_pval,
+            puts_signed_dadvv_kde_peaks: puts_signed_dadvv_stats.kde_peaks,
             puts_gadvv_total: puts_gadvv_stats.total,
             puts_gadvv_minimum: puts_gadvv_stats.min,
             puts_gadvv_maximum: puts_gadvv_stats.max,
@@ -397,8 +501,29 @@ impl WindowState {
             puts_gadvv_bc: puts_gadvv_stats.bc,
             puts_gadvv_dip_pval: puts_gadvv_stats.dip_pval,
             puts_gadvv_kde_peaks: puts_gadvv_stats.kde_peaks,
+            puts_signed_gadvv_total: puts_signed_gadvv_stats.total,
+            puts_signed_gadvv_minimum: puts_signed_gadvv_stats.min,
+            puts_signed_gadvv_maximum: puts_signed_gadvv_stats.max,
+            puts_signed_gadvv_mean: puts_signed_gadvv_stats.mean,
+            puts_signed_gadvv_stddev: puts_signed_gadvv_stats.stddev,
+            puts_signed_gadvv_skew: puts_signed_gadvv_stats.skew,
+            puts_signed_gadvv_kurtosis: puts_signed_gadvv_stats.kurtosis,
+            puts_signed_gadvv_iqr: puts_signed_gadvv_stats.iqr,
+            puts_signed_gadvv_mad: puts_signed_gadvv_stats.mad,
+            puts_signed_gadvv_cv: puts_signed_gadvv_stats.cv,
+            puts_signed_gadvv_mode: puts_signed_gadvv_stats.mode,
+            puts_signed_gadvv_bc: puts_signed_gadvv_stats.bc,
+            puts_signed_gadvv_dip_pval: puts_signed_gadvv_stats.dip_pval,
+            puts_signed_gadvv_kde_peaks: puts_signed_gadvv_stats.kde_peaks,
             calls_dollar_value: Some(self.calls_notional).filter(|v| *v > 0.0),
             calls_above_intrinsic_pct: pct(self.calls_above_intrinsic, self.calls_total),
+            calls_aggressor_unknown_pct: pct(self.calls_unknown, self.calls_total),
+            calls_classifier_touch_pct: self.calls_method_mix.touch_pct(self.calls_total),
+            calls_classifier_at_or_beyond_pct: self
+                .calls_method_mix
+                .at_or_beyond_pct(self.calls_total),
+            calls_classifier_tick_rule_pct: self.calls_method_mix.tick_pct(self.calls_total),
+            calls_classifier_unknown_pct: self.calls_method_mix.unknown_pct(self.calls_total),
             calls_dadvv_total: calls_dadvv_stats.total,
             calls_dadvv_minimum: calls_dadvv_stats.min,
             calls_dadvv_maximum: calls_dadvv_stats.max,
@@ -413,6 +538,20 @@ impl WindowState {
             calls_dadvv_bc: calls_dadvv_stats.bc,
             calls_dadvv_dip_pval: calls_dadvv_stats.dip_pval,
             calls_dadvv_kde_peaks: calls_dadvv_stats.kde_peaks,
+            calls_signed_dadvv_total: calls_signed_dadvv_stats.total,
+            calls_signed_dadvv_minimum: calls_signed_dadvv_stats.min,
+            calls_signed_dadvv_maximum: calls_signed_dadvv_stats.max,
+            calls_signed_dadvv_mean: calls_signed_dadvv_stats.mean,
+            calls_signed_dadvv_stddev: calls_signed_dadvv_stats.stddev,
+            calls_signed_dadvv_skew: calls_signed_dadvv_stats.skew,
+            calls_signed_dadvv_kurtosis: calls_signed_dadvv_stats.kurtosis,
+            calls_signed_dadvv_iqr: calls_signed_dadvv_stats.iqr,
+            calls_signed_dadvv_mad: calls_signed_dadvv_stats.mad,
+            calls_signed_dadvv_cv: calls_signed_dadvv_stats.cv,
+            calls_signed_dadvv_mode: calls_signed_dadvv_stats.mode,
+            calls_signed_dadvv_bc: calls_signed_dadvv_stats.bc,
+            calls_signed_dadvv_dip_pval: calls_signed_dadvv_stats.dip_pval,
+            calls_signed_dadvv_kde_peaks: calls_signed_dadvv_stats.kde_peaks,
             calls_gadvv_total: calls_gadvv_stats.total,
             calls_gadvv_minimum: calls_gadvv_stats.min,
             calls_gadvv_q1: calls_gadvv_stats.q1,
@@ -430,6 +569,23 @@ impl WindowState {
             calls_gadvv_bc: calls_gadvv_stats.bc,
             calls_gadvv_dip_pval: calls_gadvv_stats.dip_pval,
             calls_gadvv_kde_peaks: calls_gadvv_stats.kde_peaks,
+            calls_signed_gadvv_total: calls_signed_gadvv_stats.total,
+            calls_signed_gadvv_minimum: calls_signed_gadvv_stats.min,
+            calls_signed_gadvv_q1: calls_signed_gadvv_stats.q1,
+            calls_signed_gadvv_q2: calls_signed_gadvv_stats.median,
+            calls_signed_gadvv_q3: calls_signed_gadvv_stats.q3,
+            calls_signed_gadvv_maximum: calls_signed_gadvv_stats.max,
+            calls_signed_gadvv_mean: calls_signed_gadvv_stats.mean,
+            calls_signed_gadvv_stddev: calls_signed_gadvv_stats.stddev,
+            calls_signed_gadvv_skew: calls_signed_gadvv_stats.skew,
+            calls_signed_gadvv_kurtosis: calls_signed_gadvv_stats.kurtosis,
+            calls_signed_gadvv_iqr: calls_signed_gadvv_stats.iqr,
+            calls_signed_gadvv_mad: calls_signed_gadvv_stats.mad,
+            calls_signed_gadvv_cv: calls_signed_gadvv_stats.cv,
+            calls_signed_gadvv_mode: calls_signed_gadvv_stats.mode,
+            calls_signed_gadvv_bc: calls_signed_gadvv_stats.bc,
+            calls_signed_gadvv_dip_pval: calls_signed_gadvv_stats.dip_pval,
+            calls_signed_gadvv_kde_peaks: calls_signed_gadvv_stats.kde_peaks,
         })
     }
 }
@@ -454,6 +610,15 @@ fn intrinsic_value(trade: &OptionTrade, s: f64) -> f64 {
     match trade.contract_direction {
         'C' | 'c' => (s - trade.strike_price).max(0.0),
         _ => (trade.strike_price - s).max(0.0),
+    }
+}
+
+fn buy_probability(trade: &OptionTrade) -> f64 {
+    let confidence = trade.aggressor_confidence.unwrap_or(1.0).clamp(0.0, 1.0);
+    match trade.aggressor_side {
+        AggressorSide::Buyer => confidence,
+        AggressorSide::Seller => 1.0 - confidence,
+        AggressorSide::Unknown => 0.5,
     }
 }
 

@@ -17,9 +17,8 @@ members = [
   "realtime-ws-ingestion-service",
   "orchestrator",
   "replayer",
-  "rest-source",
   "storage",
   "treasury-ingestion-service",
   "tui",
-  "ws-source"
+  "ws-source",
 ]

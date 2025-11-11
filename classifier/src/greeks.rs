@@ -1,3 +1,4 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 use black_scholes::*;
 use core_types::config::GreeksConfig;
 use core_types::types::OptionTrade;

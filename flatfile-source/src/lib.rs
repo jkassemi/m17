@@ -1,3 +1,4 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 use async_compression::tokio::bufread::GzipDecoder;
 use async_trait::async_trait;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
@@ -911,9 +912,7 @@ mod tests {
 
     impl LocalFileSource {
         pub fn new(base_path: PathBuf) -> Self {
-            Self {
-                base_path,
-            }
+            Self { base_path }
         }
     }
 

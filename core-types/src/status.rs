@@ -1,3 +1,4 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 

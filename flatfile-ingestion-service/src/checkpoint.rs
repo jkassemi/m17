@@ -1,3 +1,4 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 use arrow::array::{Int16Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;

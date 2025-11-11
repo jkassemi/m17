@@ -1,3 +1,4 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 use chrono::{DateTime, Utc};
 use config::{Config, ConfigError};
 use serde::{Deserialize, Serialize};

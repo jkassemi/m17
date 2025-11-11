@@ -1,3 +1,4 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 #[path = "data/sample_data.rs"]
 mod sample_data;
 

@@ -1,3 +1,4 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use classifier::greeks::GreeksEngine;
 use core_types::config::{DateRange, FlatfileConfig, GreeksConfig, IngestConfig};

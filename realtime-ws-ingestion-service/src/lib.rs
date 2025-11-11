@@ -1,3 +1,4 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 use aggregations::AggregationEvent;
 use classifier::greeks::GreeksEngine;
 use core_types::config::WsConfig;

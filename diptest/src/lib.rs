@@ -1,3 +1,4 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 mod algorithm;
 mod bootstrap;
 mod consts;

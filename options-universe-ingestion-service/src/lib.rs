@@ -1,3 +1,4 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 //! Options universe ingestion service: periodically fetches most-active contracts via Massive REST.
 
 use log::error;

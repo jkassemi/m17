@@ -1,3 +1,4 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 pub const TEST_SAMPLE: [f64; 1000] = [
     1.5102432896829778,
     0.7273900228268068,

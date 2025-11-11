@@ -1,3 +1,4 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 use std::cmp::Ordering;
 
 #[derive(Clone, Copy, PartialEq, Eq)]

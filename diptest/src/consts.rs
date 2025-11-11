@@ -1,3 +1,4 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 // Auto-generated from src/diptest/consts.py; do not edit manually.
 pub(crate) const MAX_SAMPLE_SIZE: usize = 72_000;
 

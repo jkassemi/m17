@@ -1,3 +1,4 @@
+// Copyright (c) James Kassemi, SC, US. All rights reserved.
 //! Treasury ingestion service: fetches Massive treasury yields, caches per-day curves, and refreshes latest data.
 
 use async_trait::async_trait;

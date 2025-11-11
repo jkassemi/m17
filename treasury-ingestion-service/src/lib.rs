@@ -1,5 +1,6 @@
 //! Treasury ingestion service: fetches Massive treasury yields, caches per-day curves, and refreshes latest data.
 
+use async_trait::async_trait;
 use chrono::{NaiveDate, Utc};
 use classifier::greeks::TreasuryCurve;
 use core_types::retry::RetryPolicy;
@@ -15,6 +16,51 @@ use tokio::sync::RwLock;
 
 type CurveCache = Arc<RwLock<HashMap<NaiveDate, Arc<TreasuryCurve>>>>;
 type LatestCurve = Arc<RwLock<Option<Arc<TreasuryCurve>>>>;
+
+#[async_trait]
+pub trait TreasuryCurveFetcher: Send + Sync {
+    async fn fetch_latest(
+        &self,
+        client: &Client,
+        rest_base_url: &str,
+        api_key: &str,
+    ) -> Result<Option<(NaiveDate, TreasuryCurve)>, TreasuryServiceError>;
+
+    async fn fetch_range(
+        &self,
+        client: &Client,
+        rest_base_url: &str,
+        api_key: &str,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+    ) -> Result<Vec<(NaiveDate, TreasuryCurve)>, TreasuryServiceError>;
+}
+
+#[derive(Clone, Default)]
+struct HttpTreasuryCurveFetcher;
+
+#[async_trait]
+impl TreasuryCurveFetcher for HttpTreasuryCurveFetcher {
+    async fn fetch_latest(
+        &self,
+        client: &Client,
+        rest_base_url: &str,
+        api_key: &str,
+    ) -> Result<Option<(NaiveDate, TreasuryCurve)>, TreasuryServiceError> {
+        fetch_latest_treasury_curve(client, rest_base_url, api_key).await
+    }
+
+    async fn fetch_range(
+        &self,
+        client: &Client,
+        rest_base_url: &str,
+        api_key: &str,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+    ) -> Result<Vec<(NaiveDate, TreasuryCurve)>, TreasuryServiceError> {
+        fetch_treasury_curve_range(client, rest_base_url, api_key, start_date, end_date).await
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum TreasuryServiceError {
@@ -36,6 +82,7 @@ pub struct TreasuryIngestionService {
     latest_date: Arc<RwLock<Option<NaiveDate>>>,
     status: ServiceStatusHandle,
     retry: RetryPolicy,
+    fetcher: Arc<dyn TreasuryCurveFetcher>,
 }
 
 #[derive(Clone)]
@@ -52,6 +99,20 @@ impl TreasuryIngestionService {
         rest_base_url: impl Into<String>,
         api_key: impl Into<String>,
     ) -> Self {
+        Self::with_fetcher(
+            client,
+            rest_base_url,
+            api_key,
+            Arc::new(HttpTreasuryCurveFetcher::default()),
+        )
+    }
+
+    pub fn with_fetcher(
+        client: Client,
+        rest_base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        fetcher: Arc<dyn TreasuryCurveFetcher>,
+    ) -> Self {
         let status = ServiceStatusHandle::new("treasury_ingestion");
         status.set_overall(OverallStatus::Crit);
         status.push_warning("waiting for Massive treasury curves");
@@ -64,6 +125,7 @@ impl TreasuryIngestionService {
             latest_date: Arc::new(RwLock::new(None)),
             status,
             retry: RetryPolicy::default_network(),
+            fetcher,
         }
     }
 
@@ -85,24 +147,31 @@ impl TreasuryIngestionService {
         start_date: NaiveDate,
         end_date: NaiveDate,
     ) -> Result<(), TreasuryServiceError> {
+        let rest_base_url = self.rest_base_url.clone();
+        let api_key = self.api_key.clone();
+        let client = self.client.clone();
+        let fetcher = Arc::clone(&self.fetcher);
         match self
             .retry
-            .retry_async(|_| async {
-                fetch_treasury_curve_range(
-                    &self.client,
-                    &self.rest_base_url,
-                    &self.api_key,
-                    start_date,
-                    end_date,
-                )
-                .await
+            .retry_async(move |_| {
+                let client = client.clone();
+                let rest_base_url = rest_base_url.clone();
+                let api_key = api_key.clone();
+                let fetcher = Arc::clone(&fetcher);
+                async move {
+                    fetcher
+                        .fetch_range(&client, &rest_base_url, &api_key, start_date, end_date)
+                        .await
+                }
             })
             .await
         {
             Ok(curves) => {
-                let mut cache = self.cache.write().await;
-                for (date, curve) in curves {
-                    cache.insert(date, Arc::new(curve));
+                {
+                    let mut cache = self.cache.write().await;
+                    for (date, curve) in curves {
+                        cache.insert(date, Arc::new(curve));
+                    }
                 }
                 self.status.set_overall(OverallStatus::Ok);
                 self.status.clear_errors_matching(|_| true);
@@ -121,10 +190,22 @@ impl TreasuryIngestionService {
     }
 
     pub async fn refresh_latest(&self) -> Result<Option<NaiveDate>, TreasuryServiceError> {
+        let rest_base_url = self.rest_base_url.clone();
+        let api_key = self.api_key.clone();
+        let client = self.client.clone();
+        let fetcher = Arc::clone(&self.fetcher);
         match self
             .retry
-            .retry_async(|_| async {
-                fetch_latest_treasury_curve(&self.client, &self.rest_base_url, &self.api_key).await
+            .retry_async(move |_| {
+                let client = client.clone();
+                let rest_base_url = rest_base_url.clone();
+                let api_key = api_key.clone();
+                let fetcher = Arc::clone(&fetcher);
+                async move {
+                    fetcher
+                        .fetch_latest(&client, &rest_base_url, &api_key)
+                        .await
+                }
             })
             .await?
         {
@@ -365,4 +446,170 @@ struct TreasuryYieldRecord {
 pub fn default_prefetch_range() -> (NaiveDate, NaiveDate) {
     let today = Utc::now().naive_utc().date();
     (today - chrono::Duration::days(30), today)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct StubFetcher {
+        range_results:
+            Mutex<VecDeque<Result<Vec<(NaiveDate, TreasuryCurve)>, TreasuryServiceError>>>,
+        latest_results:
+            Mutex<VecDeque<Result<Option<(NaiveDate, TreasuryCurve)>, TreasuryServiceError>>>,
+    }
+
+    impl StubFetcher {
+        fn push_range_result(
+            &self,
+            result: Result<Vec<(NaiveDate, TreasuryCurve)>, TreasuryServiceError>,
+        ) {
+            self.range_results.lock().unwrap().push_back(result);
+        }
+
+        fn push_latest_result(
+            &self,
+            result: Result<Option<(NaiveDate, TreasuryCurve)>, TreasuryServiceError>,
+        ) {
+            self.latest_results.lock().unwrap().push_back(result);
+        }
+    }
+
+    #[async_trait]
+    impl TreasuryCurveFetcher for StubFetcher {
+        async fn fetch_latest(
+            &self,
+            _client: &Client,
+            _rest_base_url: &str,
+            _api_key: &str,
+        ) -> Result<Option<(NaiveDate, TreasuryCurve)>, TreasuryServiceError> {
+            self.latest_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("latest result not stubbed")
+        }
+
+        async fn fetch_range(
+            &self,
+            _client: &Client,
+            _rest_base_url: &str,
+            _api_key: &str,
+            _start_date: NaiveDate,
+            _end_date: NaiveDate,
+        ) -> Result<Vec<(NaiveDate, TreasuryCurve)>, TreasuryServiceError> {
+            self.range_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("range result not stubbed")
+        }
+    }
+
+    fn make_service_with_fetcher(fetcher: Arc<StubFetcher>) -> TreasuryIngestionService {
+        let fetcher_trait: Arc<dyn TreasuryCurveFetcher> = fetcher;
+        TreasuryIngestionService::with_fetcher(
+            Client::new(),
+            "https://example.com",
+            "test-api-key",
+            fetcher_trait,
+        )
+    }
+
+    fn sample_curve(rate: f64) -> TreasuryCurve {
+        TreasuryCurve::from_pairs(vec![(1.0, rate)]).expect("valid curve")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prefetch_range_populates_cache_and_clears_warning() {
+        let stub = Arc::new(StubFetcher::default());
+        let start = NaiveDate::from_ymd_opt(2024, 1, 10).unwrap();
+        let end = NaiveDate::from_ymd_opt(2024, 1, 11).unwrap();
+        stub.push_range_result(Ok(vec![
+            (start, sample_curve(0.04)),
+            (end, sample_curve(0.042)),
+        ]));
+        let svc = make_service_with_fetcher(stub);
+        svc.prefetch_range(start, end)
+            .await
+            .expect("prefetch succeeds");
+        let handle = svc.handle();
+        assert!(handle.curve_for_date(start).await.is_some());
+        assert!(handle.curve_for_date(end).await.is_some());
+
+        let snapshot = svc.status_handle().snapshot();
+        assert_eq!(snapshot.overall, OverallStatus::Ok);
+        assert!(snapshot.warnings.iter().all(|w| !w.contains("waiting")));
+        let cached = snapshot
+            .gauges
+            .iter()
+            .find(|g| g.label == "cached_curve_days")
+            .expect("cached gauge");
+        assert_eq!(cached.value, 2.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_latest_updates_latest_curve_and_status() {
+        let stub = Arc::new(StubFetcher::default());
+        let today = NaiveDate::from_ymd_opt(2024, 2, 5).unwrap();
+        stub.push_latest_result(Ok(Some((today, sample_curve(0.035)))));
+        let svc = make_service_with_fetcher(stub);
+        let returned = svc
+            .refresh_latest()
+            .await
+            .expect("refresh succeeds")
+            .expect("latest date");
+        assert_eq!(returned, today);
+
+        let handle = svc.handle();
+        assert_eq!(handle.latest_curve_date().await, Some(today));
+        let curve = handle.latest_curve().await.expect("latest curve present");
+        assert!((curve.rate_for(1.0) - 0.035).abs() < 1e-9);
+
+        let snapshot = svc.status_handle().snapshot();
+        assert_eq!(snapshot.overall, OverallStatus::Ok);
+        assert!(snapshot
+            .gauges
+            .iter()
+            .any(|g| g.label == "latest_curve_age_days"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_latest_sets_crit_when_no_data_returned() {
+        let stub = Arc::new(StubFetcher::default());
+        stub.push_latest_result(Ok(None));
+        let svc = make_service_with_fetcher(stub);
+        let result = svc.refresh_latest().await.expect("call succeeds");
+        assert!(result.is_none());
+
+        let snapshot = svc.status_handle().snapshot();
+        assert_eq!(snapshot.overall, OverallStatus::Crit);
+        assert!(snapshot
+            .errors
+            .iter()
+            .any(|msg| msg.contains("treasury endpoint returned no data")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prefetch_range_sets_crit_on_http_errors() {
+        let stub = Arc::new(StubFetcher::default());
+        stub.push_range_result(Err(TreasuryServiceError::InvalidCurve));
+        let mut svc = make_service_with_fetcher(stub);
+        svc.retry = RetryPolicy::new(1, 1, 1, 0.0);
+        let start = NaiveDate::from_ymd_opt(2024, 1, 10).unwrap();
+        let end = NaiveDate::from_ymd_opt(2024, 1, 10).unwrap();
+        let err = svc.prefetch_range(start, end).await.expect_err("fails");
+        assert!(matches!(err, TreasuryServiceError::InvalidCurve));
+
+        let snapshot = svc.status_handle().snapshot();
+        assert_eq!(snapshot.overall, OverallStatus::Crit);
+        assert!(snapshot
+            .errors
+            .iter()
+            .any(|msg| msg.contains("treasury prefetch failed")));
+    }
 }

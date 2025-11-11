@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 aggregations = { path = "../aggregations" }
-classifier = { path = "../classifier" }
+greeks-engine = { path = "../greeks-engine" }
 core-types = { path = "../core-types" }
 metrics = { path = "../metrics" }
 nbbo-cache = { path = "../nbbo-cache" }

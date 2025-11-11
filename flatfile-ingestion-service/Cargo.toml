@@ -9,7 +9,7 @@ core-types = { path = "../core-types" }
 metrics = { path = "../metrics" }
 storage = { path = "../storage" }
 nbbo-cache = { path = "../nbbo-cache" }
-classifier = { path = "../classifier" }
+greeks-engine = { path = "../greeks-engine" }
 treasury-ingestion-service = { path = "../treasury-ingestion-service" }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"

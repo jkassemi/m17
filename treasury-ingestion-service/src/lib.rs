@@ -3,9 +3,9 @@
 
 use async_trait::async_trait;
 use chrono::{NaiveDate, Utc};
-use classifier::greeks::TreasuryCurve;
 use core_types::retry::RetryPolicy;
 use core_types::status::{OverallStatus, ServiceStatusHandle, StatusGauge};
+use greeks_engine::TreasuryCurve;
 use log::{error, info};
 use reqwest::{Client, Url};
 use serde::Deserialize;

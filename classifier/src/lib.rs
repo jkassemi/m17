@@ -23,5 +23,3 @@ impl Classifier {
         // Stub: No-op for now
     }
 }
-
-pub mod greeks;

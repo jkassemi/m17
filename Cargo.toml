@@ -19,4 +19,5 @@ members = [
   "treasury-ingestion-service",
   "tui",
   "ws-source",
+  "greeks-engine",
 ]

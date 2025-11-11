@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 async-trait = "0.1"
 chrono = "0.4.42"
-classifier = { path = "../classifier" }
+greeks-engine = { path = "../greeks-engine" }
 core-types = { path = "../core-types" }
 log = "0.4"
 reqwest = { version = "0.12.24", features = ["json"] }

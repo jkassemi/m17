@@ -1,8 +1,9 @@
 // Copyright (c) James Kassemi, SC, US. All rights reserved.
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
+use classifier::Classifier;
 use core_types::config::{DateRange, FlatfileConfig, GreeksConfig, IngestConfig};
 use core_types::status::{OverallStatus, ServiceStatusHandle, StatusGauge};
-use core_types::types::{EnrichmentDataset, QueryScope};
+use core_types::types::{ClassParams, EnrichmentDataset, OptionTrade, QueryScope};
 use flatfile_source::{FlatfileSource, SourceTrait};
 use futures::StreamExt;
 use greeks_engine::GreeksEngine;
@@ -37,6 +38,8 @@ pub struct FlatfileIngestionService {
     status: ServiceStatusHandle,
     checkpoints: Arc<CheckpointManager>,
     greeks_handle: Option<GreeksEnrichmentHandle>,
+    classifier: Arc<Classifier>,
+    class_params: ClassParams,
 }
 
 impl FlatfileIngestionService {
@@ -51,6 +54,7 @@ impl FlatfileIngestionService {
         flatfile_staleness_us: u32,
         concurrent_permits: usize,
         treasury: TreasuryServiceHandle,
+        class_params: ClassParams,
         greeks_handle: Option<GreeksEnrichmentHandle>,
     ) -> Self {
         let source = FlatfileSource::new(
@@ -76,6 +80,8 @@ impl FlatfileIngestionService {
             status,
             checkpoints,
             greeks_handle,
+            classifier: Arc::new(Classifier::new()),
+            class_params,
         }
     }
 
@@ -158,6 +164,8 @@ impl FlatfileIngestionService {
             let status_opt = status.clone();
             let checkpoint_opt = checkpoint_manager.clone();
             let greeks_handle = self.greeks_handle.clone();
+            let classifier = self.classifier.clone();
+            let class_params = self.class_params.clone();
             tokio::spawn(async move {
                 Self::process_options_day(
                     current_date,
@@ -172,6 +180,8 @@ impl FlatfileIngestionService {
                     treasury,
                     status_opt,
                     checkpoint_opt,
+                    classifier,
+                    class_params,
                     greeks_handle,
                 )
                 .await;
@@ -315,6 +325,8 @@ impl FlatfileIngestionService {
         treasury: TreasuryServiceHandle,
         status: ServiceStatusHandle,
         checkpoint: Arc<CheckpointManager>,
+        classifier: Arc<Classifier>,
+        class_params: ClassParams,
         greeks_handle: Option<GreeksEnrichmentHandle>,
     ) {
         info!("Seeding NBBO for options day: {}", date.format("%Y-%m-%d"));
@@ -389,7 +401,7 @@ impl FlatfileIngestionService {
         }
         let greeks_engine = GreeksEngine::new(
             greeks_cfg,
-            nbbo_store,
+            nbbo_store.clone(),
             flatfile_staleness_us,
             day_curve_state,
         );
@@ -427,6 +439,7 @@ impl FlatfileIngestionService {
             metrics.inc_rows(batch.rows.len() as u64);
             let start = Instant::now();
             greeks_engine.enrich_batch(&mut batch.rows).await;
+            classify_option_trades(&classifier, &class_params, &nbbo_store, &mut batch.rows).await;
             metrics.observe_enrichment(batch.rows.len(), start.elapsed());
             if let Err(e) = storage.lock().unwrap().write_option_trades(&batch) {
                 error!("Failed to write option trades batch: {}", e);
@@ -471,6 +484,21 @@ impl FlatfileIngestionService {
                 );
             }
         }
+    }
+}
+
+async fn classify_option_trades(
+    classifier: &Arc<Classifier>,
+    params: &ClassParams,
+    nbbo_store: &Arc<TokioRwLock<NbboStore>>,
+    rows: &mut [OptionTrade],
+) {
+    if rows.is_empty() {
+        return;
+    }
+    let guard = nbbo_store.read().await;
+    for trade in rows.iter_mut() {
+        classifier.classify_trade(trade, &*guard, params);
     }
 }
 

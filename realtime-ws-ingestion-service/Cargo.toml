@@ -11,6 +11,7 @@ metrics = { path = "../metrics" }
 nbbo-cache = { path = "../nbbo-cache" }
 options-universe-ingestion-service = { path = "../options-universe-ingestion-service" }
 storage = { path = "../storage" }
+classifier = { path = "../classifier" }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 log = "0.4"

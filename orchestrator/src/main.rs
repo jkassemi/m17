@@ -17,10 +17,11 @@
 
 use aggregations::AggregationsEngine;
 use chrono::{DateTime, NaiveDate, Utc};
-use classifier::Classifier;
 use core_types::config::AppConfig;
 use core_types::status::{OverallStatus, ServiceStatusHandle, StatusGauge};
-use core_types::types::{Completeness, DataBatch, DataBatchMeta, Quality, Source, Watermark};
+use core_types::types::{
+    ClassParams, Completeness, DataBatch, DataBatchMeta, Quality, Source, Watermark,
+};
 use flatfile_ingestion_service::FlatfileIngestionService;
 use greeks_enrichment_service::{
     CurveStateProvider, GreeksEnrichmentService, ManifestParquetSource, StorageGreeksWriter,
@@ -46,6 +47,7 @@ use tokio::time::sleep;
 use treasury_ingestion_service::TreasuryIngestionService;
 use tui::Tui;
 const TREASURY_REFRESH_INTERVAL_SECS: u64 = 86_400;
+const DEFAULT_CLASSIFIER_EPSILON: f64 = 1e-4;
 
 #[tokio::main]
 async fn main() {
@@ -141,7 +143,6 @@ async fn main() {
     }
     let nbbo_flatfile = Arc::new(TokioRwLock::new(NbboStore::new()));
     let nbbo_realtime = Arc::new(TokioRwLock::new(NbboStore::new()));
-    let _classifier = Classifier::new();
     let storage_base_path = config
         .storage
         .paths
@@ -149,6 +150,14 @@ async fn main() {
         .cloned()
         .unwrap_or_else(|| "data".to_string());
     let storage = Arc::new(Mutex::new(Storage::new(config.storage)));
+    let flatfile_class_params = build_class_params(
+        config.classifier.use_tick_rule_t1,
+        config.greeks.flatfile_underlying_staleness_us,
+    );
+    let realtime_class_params = build_class_params(
+        config.classifier.use_tick_rule_rt,
+        config.greeks.realtime_underlying_staleness_us,
+    );
 
     let greeks_source = Arc::new(ManifestParquetSource::new(storage_base_path.clone()));
     let greeks_writer = Arc::new(StorageGreeksWriter::new(storage.clone()));
@@ -218,6 +227,7 @@ async fn main() {
         config.greeks.flatfile_underlying_staleness_us,
         config.ingest.concurrent_permits,
         treasury_handle.clone(),
+        flatfile_class_params.clone(),
         Some(greeks_handle.clone()),
     )
     .await;
@@ -306,6 +316,7 @@ async fn main() {
         config.greeks.realtime_underlying_staleness_us,
         treasury_handle.clone(),
         aggregator_sender.clone(),
+        realtime_class_params.clone(),
     );
     let realtime_status = realtime_service.status_handle();
     metrics.register_service_status(realtime_status);
@@ -342,6 +353,15 @@ async fn main() {
                 Some(format!("Shutdown complete with TUI join error: {}", e)),
             );
         }
+    }
+}
+
+fn build_class_params(use_tick_rule: bool, staleness_us: u32) -> ClassParams {
+    let lateness_ms = (staleness_us / 1_000).max(1);
+    ClassParams {
+        use_tick_rule_fallback: use_tick_rule,
+        epsilon_price: DEFAULT_CLASSIFIER_EPSILON,
+        allowed_lateness_ms: lateness_ms,
     }
 }
 

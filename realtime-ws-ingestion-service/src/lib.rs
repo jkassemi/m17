@@ -1,9 +1,10 @@
 // Copyright (c) James Kassemi, SC, US. All rights reserved.
 use aggregations::AggregationEvent;
+use classifier::Classifier;
 use core_types::config::WsConfig;
 use core_types::status::{OverallStatus, ServiceStatusHandle, StatusGauge};
 use core_types::types::{
-    Completeness, DataBatch, DataBatchMeta, OptionTrade, Quality, Source, Watermark,
+    ClassParams, Completeness, DataBatch, DataBatchMeta, OptionTrade, Quality, Source, Watermark,
 };
 use futures::StreamExt;
 use greeks_engine::GreeksEngine;
@@ -29,6 +30,8 @@ pub struct RealtimeWsIngestionService {
     treasury: TreasuryServiceHandle,
     agg_sender: Option<mpsc::Sender<AggregationEvent>>,
     status: ServiceStatusHandle,
+    classifier: Arc<Classifier>,
+    class_params: ClassParams,
 }
 
 impl RealtimeWsIngestionService {
@@ -42,6 +45,7 @@ impl RealtimeWsIngestionService {
         staleness_us: u32,
         treasury: TreasuryServiceHandle,
         agg_sender: Option<mpsc::Sender<AggregationEvent>>,
+        class_params: ClassParams,
     ) -> Self {
         let status = ServiceStatusHandle::new("realtime_ws");
         status.set_overall(OverallStatus::Warn);
@@ -56,6 +60,8 @@ impl RealtimeWsIngestionService {
             treasury,
             agg_sender,
             status,
+            classifier: Arc::new(Classifier::new()),
+            class_params,
         }
     }
 
@@ -194,6 +200,8 @@ impl RealtimeWsIngestionService {
         );
         let options_rx = service.spawn();
         self.spawn_options_quotes_worker(options_rx.clone());
+        let classifier = self.classifier.clone();
+        let class_params = self.class_params.clone();
         let options_worker = WsWorker::new(
             &self.ws_cfg.options_ws_url,
             ResourceKind::OptionsTrades,
@@ -230,7 +238,7 @@ impl RealtimeWsIngestionService {
                     status.clear_errors_matching(|m| m.contains("options stream"));
                     let mut pending: Vec<OptionTrade> = Vec::with_capacity(batch_cap);
                     while let Some(msg) = stream.next().await {
-                        if let WsMessage::OptionTrade(trade) = msg {
+                        if let WsMessage::OptionTrade(mut trade) = msg {
                             if treasury.latest_curve().await.is_none() {
                                 status
                                     .clear_errors_matching(|m| m.contains("treasury unavailable"));
@@ -244,6 +252,10 @@ impl RealtimeWsIngestionService {
                                 status
                                     .clear_errors_matching(|m| m.contains("treasury unavailable"));
                                 status.set_overall(OverallStatus::Ok);
+                            }
+                            {
+                                let guard = nbbo_lookup.read().await;
+                                classifier.classify_trade(&mut trade, &*guard, &class_params);
                             }
                             if let Some(sender) = &agg_sender {
                                 let underlying_price = {
@@ -283,6 +295,9 @@ impl RealtimeWsIngestionService {
                                     &greeks_engine,
                                     &storage,
                                     &metrics,
+                                    &classifier,
+                                    &class_params,
+                                    &nbbo_lookup,
                                 )
                                 .await;
                                 status.set_gauges(vec![StatusGauge {
@@ -296,8 +311,16 @@ impl RealtimeWsIngestionService {
                         }
                     }
                     if !pending.is_empty() {
-                        persist_realtime_options(&mut pending, &greeks_engine, &storage, &metrics)
-                            .await;
+                        persist_realtime_options(
+                            &mut pending,
+                            &greeks_engine,
+                            &storage,
+                            &metrics,
+                            &classifier,
+                            &class_params,
+                            &nbbo_lookup,
+                        )
+                        .await;
                         status.set_gauges(vec![StatusGauge {
                             label: "pending_ws_batch".to_string(),
                             value: 0.0,
@@ -322,11 +345,15 @@ async fn persist_realtime_options(
     greeks: &GreeksEngine,
     storage: &Arc<Mutex<Storage>>,
     metrics: &Arc<Metrics>,
+    classifier: &Arc<Classifier>,
+    class_params: &ClassParams,
+    nbbo: &Arc<TokioRwLock<NbboStore>>,
 ) {
     if rows.is_empty() {
         return;
     }
     greeks.enrich_batch(rows).await;
+    classify_option_batch(classifier, class_params, nbbo, rows).await;
     let watermark = rows.last().map(|t| t.trade_ts_ns).unwrap_or(0);
     let meta = DataBatchMeta {
         source: Source::Ws,
@@ -347,5 +374,20 @@ async fn persist_realtime_options(
     metrics.inc_rows(batch.rows.len() as u64);
     if let Err(e) = storage.lock().unwrap().write_option_trades(&batch) {
         error!("Failed to write realtime option trades: {}", e);
+    }
+}
+
+async fn classify_option_batch(
+    classifier: &Arc<Classifier>,
+    params: &ClassParams,
+    nbbo: &Arc<TokioRwLock<NbboStore>>,
+    rows: &mut [OptionTrade],
+) {
+    if rows.is_empty() {
+        return;
+    }
+    let guard = nbbo.read().await;
+    for trade in rows.iter_mut() {
+        classifier.classify_trade(trade, &*guard, params);
     }
 }

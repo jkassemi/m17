@@ -506,9 +506,9 @@ async fn process_equity_trades_stream<S: SourceTrait>(
     match source.get_stream(path).await {
         Ok(stream) => {
             let total_len = source.object_len(path).await;
-            if let Some(m) = metrics.as_ref() {
-                m.set_current_file(path.to_string(), total_len.unwrap_or(0));
-            }
+            let progress = metrics
+                .as_ref()
+                .map(|m| m.track_current_file(path.to_string(), total_len.unwrap_or(0)));
             let bytes_read = Arc::new(AtomicU64::new(0));
             let reader = StreamReader::new(stream);
             let counting = CountingReader::new(reader, bytes_read.clone());
@@ -529,9 +529,9 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                     let symbol = record[0].to_string();
                     if !instruments.is_empty() && !instruments.contains(&symbol) {
                         // update progress periodically even if filtered out
-                        if let Some(m) = metrics.as_ref() {
+                        if let Some(progress) = progress.as_ref() {
                             if last_update.elapsed() >= Duration::from_millis(progress_update_ms) {
-                                m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
+                                progress.update_read(bytes_read.load(Ordering::Relaxed));
                                 last_update = Instant::now();
                             }
                         }
@@ -590,9 +590,9 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                         });
                     }
                 }
-                if let Some(m) = metrics.as_ref() {
+                if let Some(progress) = progress.as_ref() {
                     if last_update.elapsed() >= Duration::from_millis(progress_update_ms) {
-                        m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
+                        progress.update_read(bytes_read.load(Ordering::Relaxed));
                         last_update = Instant::now();
                     }
                 }
@@ -613,17 +613,13 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                 let _ = tx.try_send(DataBatch { rows: batch, meta });
             }
 
-            if let Some(m) = metrics.as_ref() {
-                if let Some(total) = total_len {
-                    let read = bytes_read.load(Ordering::Relaxed);
-                    if read < total {
-                        m.set_current_file_read(total);
-                    } else {
-                        m.set_current_file_read(read);
-                    }
-                } else {
-                    m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
-                }
+            if let Some(progress) = progress.as_ref() {
+                let read = bytes_read.load(Ordering::Relaxed);
+                let final_read = match total_len {
+                    Some(total) => read.max(total),
+                    None => read,
+                };
+                progress.update_read(final_read);
             }
 
             info!(
@@ -650,9 +646,9 @@ async fn process_nbbo_stream<S: SourceTrait>(
     match source.get_stream(path).await {
         Ok(stream) => {
             let total_len = source.object_len(path).await;
-            if let Some(m) = metrics.as_ref() {
-                m.set_current_file(path.to_string(), total_len.unwrap_or(0));
-            }
+            let progress = metrics
+                .as_ref()
+                .map(|m| m.track_current_file(path.to_string(), total_len.unwrap_or(0)));
             let bytes_read = Arc::new(AtomicU64::new(0));
             let reader = StreamReader::new(stream);
             let counting = CountingReader::new(reader, bytes_read.clone());
@@ -668,9 +664,9 @@ async fn process_nbbo_stream<S: SourceTrait>(
                     // Ticker,ask_exchange,ask_price,ask_size,bid_exchange,bid_price,bid_size,conditions,indicators,participant_timestamp,sequence_number,sip_timestamp,tape,trf_timestamp
                     let symbol = record[0].to_string();
                     if !instruments.is_empty() && !instruments.contains(&symbol) {
-                        if let Some(m) = metrics.as_ref() {
+                        if let Some(progress) = progress.as_ref() {
                             if last_update.elapsed() >= Duration::from_millis(progress_update_ms) {
-                                m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
+                                progress.update_read(bytes_read.load(Ordering::Relaxed));
                                 last_update = Instant::now();
                             }
                         }
@@ -734,9 +730,9 @@ async fn process_nbbo_stream<S: SourceTrait>(
                         });
                     }
                 }
-                if let Some(m) = metrics.as_ref() {
+                if let Some(progress) = progress.as_ref() {
                     if last_update.elapsed() >= Duration::from_millis(progress_update_ms) {
-                        m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
+                        progress.update_read(bytes_read.load(Ordering::Relaxed));
                         last_update = Instant::now();
                     }
                 }
@@ -756,17 +752,13 @@ async fn process_nbbo_stream<S: SourceTrait>(
                 let _ = tx.try_send(DataBatch { rows: batch, meta });
             }
 
-            if let Some(m) = metrics.as_ref() {
-                if let Some(total) = total_len {
-                    let read = bytes_read.load(Ordering::Relaxed);
-                    if read < total {
-                        m.set_current_file_read(total);
-                    } else {
-                        m.set_current_file_read(read);
-                    }
-                } else {
-                    m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
-                }
+            if let Some(progress) = progress.as_ref() {
+                let read = bytes_read.load(Ordering::Relaxed);
+                let final_read = match total_len {
+                    Some(total) => read.max(total),
+                    None => read,
+                };
+                progress.update_read(final_read);
             }
         }
         Err(e) => {
@@ -797,9 +789,9 @@ async fn process_option_trades_stream<S: SourceTrait>(
     match source.get_stream(path).await {
         Ok(stream) => {
             let total_len = source.object_len(path).await;
-            if let Some(m) = metrics.as_ref() {
-                m.set_current_file(path.to_string(), total_len.unwrap_or(0));
-            }
+            let progress = metrics
+                .as_ref()
+                .map(|m| m.track_current_file(path.to_string(), total_len.unwrap_or(0)));
             let bytes_read = Arc::new(AtomicU64::new(0));
             let reader = StreamReader::new(stream);
             let counting = CountingReader::new(reader, bytes_read.clone());
@@ -815,9 +807,9 @@ async fn process_option_trades_stream<S: SourceTrait>(
                     // ticker,conditions,correction,exchange,participant_timestamp,price,sip_timestamp,size
                     let contract = record[0].to_string();
                     if !instruments.is_empty() && !instruments.contains(&contract) {
-                        if let Some(m) = metrics.as_ref() {
+                        if let Some(progress) = progress.as_ref() {
                             if last_update.elapsed() >= Duration::from_millis(progress_update_ms) {
-                                m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
+                                progress.update_read(bytes_read.load(Ordering::Relaxed));
                                 last_update = Instant::now();
                             }
                         }
@@ -885,9 +877,9 @@ async fn process_option_trades_stream<S: SourceTrait>(
                         });
                     }
                 }
-                if let Some(m) = metrics.as_ref() {
+                if let Some(progress) = progress.as_ref() {
                     if last_update.elapsed() >= Duration::from_millis(progress_update_ms) {
-                        m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
+                        progress.update_read(bytes_read.load(Ordering::Relaxed));
                         last_update = Instant::now();
                     }
                 }
@@ -907,17 +899,13 @@ async fn process_option_trades_stream<S: SourceTrait>(
                 let _ = tx.try_send(DataBatch { rows: batch, meta });
             }
 
-            if let Some(m) = metrics.as_ref() {
-                if let Some(total) = total_len {
-                    let read = bytes_read.load(Ordering::Relaxed);
-                    if read < total {
-                        m.set_current_file_read(total);
-                    } else {
-                        m.set_current_file_read(read);
-                    }
-                } else {
-                    m.set_current_file_read(bytes_read.load(Ordering::Relaxed));
-                }
+            if let Some(progress) = progress.as_ref() {
+                let read = bytes_read.load(Ordering::Relaxed);
+                let final_read = match total_len {
+                    Some(total) => read.max(total),
+                    None => read,
+                };
+                progress.update_read(final_read);
             }
         }
         Err(e) => {

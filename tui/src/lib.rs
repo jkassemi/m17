@@ -83,15 +83,18 @@ impl Tui {
     fn ui(&self, f: &mut Frame) {
         let size = f.size();
         let service_statuses = self.metrics.service_status_snapshots();
+        let current_files = self.metrics.current_files();
         let status_block_height =
             std::cmp::max(4, (service_statuses.len() as u16).saturating_mul(3));
+        let current_file_block_height =
+            std::cmp::max(3, (current_files.len() as u16).saturating_mul(3));
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(
                 [
-                    Constraint::Length(3), // ingestion progress
-                    Constraint::Length(3), // current file progress
+                    Constraint::Length(3),                         // ingestion progress
+                    Constraint::Length(current_file_block_height), // current file progress
                     Constraint::Length(status_block_height),
                     Constraint::Percentage(100), // details
                 ]
@@ -106,7 +109,8 @@ impl Tui {
             (completed as f64) / (planned as f64)
         } else {
             0.0
-        };
+        }
+        .clamp(0.0, 1.0);
         let gauge = Gauge::default()
             .block(
                 Block::default()
@@ -120,39 +124,56 @@ impl Tui {
             ));
         f.render_widget(gauge, chunks[0]);
 
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+
         // Current file progress
-        if let Some(name) = self.metrics.current_file_name() {
-            if let Some((read, total, started_ns)) = self.metrics.current_file_progress() {
-                let now_ns_cf = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as i64;
-                let elapsed_ns = (now_ns_cf - started_ns).max(1);
-                let read_mb = (read as f64) / (1024.0 * 1024.0);
-                let total_mb = (total as f64) / (1024.0 * 1024.0);
+        if current_files.is_empty() {
+            let placeholder = Paragraph::new("No active file downloads")
+                .block(Block::default().borders(Borders::ALL).title("Current file"))
+                .alignment(Alignment::Center);
+            f.render_widget(placeholder, chunks[1]);
+        } else {
+            let cf_constraints = vec![Constraint::Length(3); current_files.len()];
+            let cf_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(cf_constraints)
+                .split(chunks[1]);
+            for (idx, file) in current_files.iter().enumerate() {
+                let elapsed_ns = (now_ns - file.started_ns).max(1);
+                let read_mb = (file.read as f64) / (1024.0 * 1024.0);
+                let total_mb = (file.total as f64) / (1024.0 * 1024.0);
                 let throughput_mb_s = if elapsed_ns > 0 {
                     read_mb / ((elapsed_ns as f64) / 1_000_000_000.0)
                 } else {
                     0.0
                 };
-                let ratio = if total > 0 {
-                    (read as f64) / (total as f64)
+                let ratio = if file.total > 0 {
+                    (file.read as f64) / (file.total as f64)
                 } else {
                     0.0
-                };
-                let label = if total > 0 {
+                }
+                .clamp(0.0, 1.0);
+                let label = if file.total > 0 {
                     format!(
                         "{}  {:.1}/{:.1} MB  {:.1} MB/s",
-                        name, read_mb, total_mb, throughput_mb_s
+                        file.name, read_mb, total_mb, throughput_mb_s
                     )
                 } else {
-                    format!("{}  {:.1} MB read  (unknown total)", name, read_mb)
+                    format!("{}  {:.1} MB read  (unknown total)", file.name, read_mb)
+                };
+                let title = if current_files.len() == 1 {
+                    "Current file".to_string()
+                } else {
+                    format!("Current file {} of {}", idx + 1, current_files.len())
                 };
                 let cf_gauge = Gauge::default()
-                    .block(Block::default().borders(Borders::ALL).title("Current file"))
+                    .block(Block::default().borders(Borders::ALL).title(title))
                     .ratio(ratio)
                     .label(Span::styled(label, Style::default().fg(Color::White)));
-                f.render_widget(cf_gauge, chunks[1]);
+                f.render_widget(cf_gauge, cf_chunks[idx]);
             }
         }
 
@@ -166,11 +187,6 @@ impl Tui {
         f.render_widget(status_block, chunks[2]);
 
         // Metrics
-        let now_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
-
         let last_request = self.metrics.last_request_ts_ns();
         let last_request_str = match last_request {
             Some(ts) => format!("Last request: {} ms ago", (now_ns - ts) / 1_000_000),

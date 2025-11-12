@@ -11,6 +11,7 @@ use hyper::Request;
 use hyper::Response;
 use hyper_util::rt::TokioIo;
 use prometheus::{register_gauge_vec, Encoder, GaugeVec, TextEncoder};
+use std::collections::HashMap;
 use std::error::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -26,14 +27,32 @@ pub struct Metrics {
     completed_days: AtomicU64,
     ingested_batches: AtomicU64,
     ingested_rows: AtomicU64,
-    // Current file progress
-    current_file_name: Arc<Mutex<Option<String>>>,
-    current_file_total: AtomicU64,
-    current_file_read: AtomicU64,
-    current_file_started_ts_ns: AtomicU64,
+    current_files: Arc<Mutex<HashMap<u64, CurrentFileState>>>,
+    current_file_seq: AtomicU64,
     service_statuses: Arc<Mutex<Vec<ServiceStatusHandle>>>,
     service_metrics: Arc<RwLock<Vec<Arc<dyn ServiceMetricsReporter>>>>,
     service_gauges: GaugeVec,
+}
+
+#[derive(Clone)]
+pub struct CurrentFileSnapshot {
+    pub id: u64,
+    pub name: String,
+    pub total: u64,
+    pub read: u64,
+    pub started_ns: i64,
+}
+
+pub struct FileProgressGuard {
+    metrics: Arc<Metrics>,
+    id: u64,
+}
+
+struct CurrentFileState {
+    name: String,
+    total: u64,
+    read: u64,
+    started_ns: i64,
 }
 
 impl Metrics {
@@ -52,10 +71,8 @@ impl Metrics {
             completed_days: AtomicU64::new(0),
             ingested_batches: AtomicU64::new(0),
             ingested_rows: AtomicU64::new(0),
-            current_file_name: Arc::new(Mutex::new(None)),
-            current_file_total: AtomicU64::new(0),
-            current_file_read: AtomicU64::new(0),
-            current_file_started_ts_ns: AtomicU64::new(0),
+            current_files: Arc::new(Mutex::new(HashMap::new())),
+            current_file_seq: AtomicU64::new(0),
             service_statuses: Arc::new(Mutex::new(Vec::new())),
             service_metrics: Arc::new(RwLock::new(Vec::new())),
             service_gauges,
@@ -110,35 +127,52 @@ impl Metrics {
         self.ingested_rows.load(Ordering::Relaxed)
     }
 
-    // current file progress
-    pub fn set_current_file(&self, name: String, total: u64) {
-        *self.current_file_name.lock().unwrap() = Some(name);
-        self.current_file_total.store(total, Ordering::Relaxed);
-        self.current_file_read.store(0, Ordering::Relaxed);
+    pub fn current_files(&self) -> Vec<CurrentFileSnapshot> {
+        let files = self.current_files.lock().unwrap();
+        let mut snapshots: Vec<_> = files
+            .iter()
+            .map(|(id, state)| CurrentFileSnapshot {
+                id: *id,
+                name: state.name.clone(),
+                total: state.total,
+                read: state.read,
+                started_ns: state.started_ns,
+            })
+            .collect();
+        snapshots.sort_by_key(|snapshot| snapshot.started_ns);
+        snapshots
+    }
+
+    pub fn track_current_file(self: &Arc<Self>, name: String, total: u64) -> FileProgressGuard {
+        let id = self.current_file_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos() as i64;
-        self.current_file_started_ts_ns
-            .store(now as u64, Ordering::Relaxed);
-    }
-
-    pub fn set_current_file_read(&self, read: u64) {
-        self.current_file_read.store(read, Ordering::Relaxed);
-    }
-
-    pub fn current_file_name(&self) -> Option<String> {
-        self.current_file_name.lock().unwrap().clone()
-    }
-
-    pub fn current_file_progress(&self) -> Option<(u64, u64, i64)> {
-        if self.current_file_name.lock().unwrap().is_none() {
-            return None;
+        let mut files = self.current_files.lock().unwrap();
+        files.insert(
+            id,
+            CurrentFileState {
+                name,
+                total,
+                read: 0,
+                started_ns: now,
+            },
+        );
+        FileProgressGuard {
+            metrics: Arc::clone(self),
+            id,
         }
-        let read = self.current_file_read.load(Ordering::Relaxed);
-        let total = self.current_file_total.load(Ordering::Relaxed);
-        let started = self.current_file_started_ts_ns.load(Ordering::Relaxed) as i64;
-        Some((read, total, started))
+    }
+
+    fn update_current_file_read(&self, id: u64, read: u64) {
+        if let Some(entry) = self.current_files.lock().unwrap().get_mut(&id) {
+            entry.read = read;
+        }
+    }
+
+    fn finish_current_file(&self, id: u64) {
+        self.current_files.lock().unwrap().remove(&id);
     }
 
     pub fn register_service_status(&self, handle: ServiceStatusHandle) {
@@ -232,5 +266,21 @@ impl Metrics {
                 }
             });
         }
+    }
+}
+
+impl FileProgressGuard {
+    pub fn update_read(&self, read: u64) {
+        self.metrics.update_current_file_read(self.id, read);
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for FileProgressGuard {
+    fn drop(&mut self) {
+        self.metrics.finish_current_file(self.id);
     }
 }

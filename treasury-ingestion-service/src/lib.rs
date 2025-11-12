@@ -289,7 +289,7 @@ impl TreasuryServiceHandle {
 
     pub async fn curve_for_date(&self, date: NaiveDate) -> Option<Arc<TreasuryCurve>> {
         let cache = self.cache.read().await;
-        cache.get(&date).cloned()
+        lookup_curve_on_or_before(&cache, date)
     }
 
     pub async fn latest_curve(&self) -> Option<Arc<TreasuryCurve>> {
@@ -309,6 +309,20 @@ impl TreasuryServiceHandle {
     pub async fn latest_curve_date(&self) -> Option<NaiveDate> {
         *self.latest_date.read().await
     }
+}
+
+fn lookup_curve_on_or_before(
+    cache: &HashMap<NaiveDate, Arc<TreasuryCurve>>,
+    date: NaiveDate,
+) -> Option<Arc<TreasuryCurve>> {
+    if let Some(curve) = cache.get(&date) {
+        return Some(curve.clone());
+    }
+    cache
+        .iter()
+        .filter(|(candidate, _)| **candidate <= date)
+        .max_by_key(|(candidate, _)| *candidate)
+        .map(|(_, curve)| curve.clone())
 }
 
 async fn fetch_latest_treasury_curve(
@@ -612,5 +626,21 @@ mod tests {
             .errors
             .iter()
             .any(|msg| msg.contains("treasury prefetch failed")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn curve_for_date_backfills_with_latest_prior_curve() {
+        let stub = Arc::new(StubFetcher::default());
+        let friday = NaiveDate::from_ymd_opt(2025, 11, 7).unwrap();
+        stub.push_range_result(Ok(vec![(friday, sample_curve(0.04))]));
+        let svc = make_service_with_fetcher(stub);
+        svc.prefetch_range(friday, friday)
+            .await
+            .expect("prefetch succeeds");
+        let handle = svc.handle();
+
+        let weekend = friday.succ_opt().unwrap();
+        let curve = handle.curve_for_date(weekend).await.expect("curve present");
+        assert!((curve.rate_for(1.0) - 0.04).abs() < 1e-9);
     }
 }

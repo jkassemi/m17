@@ -268,27 +268,37 @@ Use `[ ]` / `[x]` to track progress.
 - [x] Implement payload mapping stores with append-only allocation, checksum validation, and snapshot hooks.
 - [x] Add unit/integration tests covering mutation, replay, and CAS contention semantics.
 
-### First Engine Crate
+• Ledger & Controller Implementation Summary
+
+- Built a reusable ledger crate with dense TradeLedger/EnrichmentLedger row
+    structures, slot semantics (PayloadType, SlotStatus, CAS checks), and a
+    WindowSpace helper for precomputing the 390-minute lattice plus timestamp→minute
+    lookups.
+- Added a persistent SymbolMap (JSON-backed) and append-only mapping stores
+    (rf_rate.map, trades.map, quotes.map, aggressor.map, greeks.map, aggregate.map)
+    with well-defined payload schemas (TradeBatchPayload, QuoteBatchPayload, etc.) and
+    automatic payload-id generation.
+- Implemented LedgerController to bootstrap state, resolve symbols, expose all
+    setter APIs (set_trade_ref, set_quote_ref, set_greeks_ref, etc.), handle pending/
+    clear operations, provide minute_idx_for_timestamp, and gate access to the payload
+    stores via mutexes.
+- Added unit tests covering slot type enforcement, version conflicts, window lookup
+    accuracy, and controller write/read flows; cargo test -p ledger passes.
+
+### Orchestrator (`m17`)
+
+- [ ] Construct the `m17` crate that boots ledgers, loads snapshots, and registers engines as modules.
+- [ ] Define the shared `Engine` trait (start/stop, health probes, priority-region hooks) plus orchestration context objects (handles to `LedgerController`, payload stores, priority store, metrics emitters).
+- [ ] Implement supervision logic for backpressure, repairs, and graceful shutdown.
+- [ ] Integrate the first real engine (treasury or trade-flatfile) to validate the registration APIs before wiring the remaining engines.
+
+### Engine Crates (implemented once the orchestrator skeleton is in place)
 
 #### `trade-flatfile-engine`
 
 - [ ] Scaffold crate focused on historical/flatfile inputs and a batching pipeline keyed by `(symbol_id, minute_idx)`.
 - [ ] Append `TradeBatchPayload` records, write `trade_ref` slots, and expose repair helpers (`clear_slot`, rewind hooks) for backfills.
 - [ ] Instrument ingestion latency, record counts, file offsets, and retry counters.
-
-### Orchestrator (`m17`)
-
-- [ ] Construct the `m17` crate that boots ledgers, loads snapshots, and registers engines as modules.
-- [ ] Define engine traits (start/stop, health probes, priority-region hooks) and shared instrumentation wiring.
-- [ ] Implement supervision logic for backpressure, repairs, and graceful shutdown.
-
-### Remaining Engine Crates
-
-#### `treasury-engine`
-
-- [ ] Scaffold crate with engine trait implementation, config structs, and ingestion entrypoint.
-- [ ] Implement treasury feed client (or adapters) plus carry-forward logic that writes `rf_rate_ref` slots per symbol/minute.
-- [ ] Emit metrics/logs for curve lag, version churn, and per-symbol update counts.
 
 #### `treasury-engine`
 

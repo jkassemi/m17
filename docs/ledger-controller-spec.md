@@ -13,6 +13,8 @@
 - Approach: treat this effort as a ground-up replacement; legacy checkpoints/workers will not be dual-written or retrofitted.
 - Treat this document as a live checklist. As milestones are completed, mark the corresponding items below to maintain shared progress awareness.
 
+Development guidance: it is fine to inspect existing crates for reference, but all new work must land inside the crates defined below (`m17`, `ledger`, and the new engines). Legacy crates remain untouched during development and will be deleted once the greenfield stack reaches feature parity.
+
 Let's not worry yet about backup/restoration outside of a manual shell script executed by cron. We should be able to run the script to back up the ledger and mapping files. Let's target a configurable directory named "ledger.state" by default for all files. Backup/restore should be as simple as archiving the directory and restoring its contents when needed.
 
 ## Ledger Data Model
@@ -23,7 +25,7 @@ Let's not worry yet about backup/restoration outside of a manual shell script ex
 - Introduce a dense symbol axis: each tradable instrument is assigned a `SymbolId` (u16) the first time it appears, capped at 10 000 per active year. The controller maintains a compact `SymbolMap { symbol_id → symbol }` plus the inverse map for lookups.
 - Every ledger now stores `num_symbols × 390` rows per trading day. We allocate the entire matrix upfront so each `(symbol_id, minute_idx)` slot has a deterministic offset in the memory-mapped file.
 - `window_id = <year>:<session_seq>:<minute_seq>` still exists for bookkeeping, but runtime addressing uses `(symbol_id, minute_idx)` with the knowledge that minute `idx` corresponds to `[start_ts, start_ts + 60s)`.
-- Keep active year resident in memory; persist full ledger to disk (RocksDB/SQLite/Parquet) with periodic snapshots. Historical years remain on disk; only hot windows stay in RAM. With 10 000 symbols and 390 minutes, the trade ledger consumes ~600 MiB/day and the enrichment ledger ~900 MiB/day, both acceptable for resident memory.
+- Keep the active year resident in memory while persisting every mmapped file under a configurable `ledger.state/` directory that cron-backed scripts archive and restore. With 10 000 symbols and 390 minutes, the trade ledger consumes ~600 MiB/day and the enrichment ledger ~900 MiB/day, both acceptable for resident memory.
 
 Note: The 10K cap is more than appropriate given the scope of this project. We'll reevaluate or address migrations/updates more thoroughly when the project's been running for 3 months.
 
@@ -55,6 +57,28 @@ Note: The 10K cap is more than appropriate given the scope of this project. We'l
 - Checksums stored in the slot cover the dereferenced payload bytes, allowing integrity verification without inlining the payload itself.
 - Mapping files can be memory-mapped separately for fast dereferencing and share the same snapshot cadence as the ledgers.
 
+#### Payload Schemas
+
+All payloads embed a `schema_version` so consumers can reject incompatible records. Storage format is a packed binary blob with a short header followed by variant-specific data.
+
+- `rf_rate.map`
+  - `RfRatePayload { schema_version: u8, effective_ts: i64, curve_id: u16, tenor_bps: [i32; 12], next_effective_ts: i64, source_uri: String }`
+  - Tenor array stores the standard 12-point curve, scaled in basis points to avoid floating point in the ledger.
+- `trade.map`
+  - `TradePayload { schema_version: u8, batch_id: u32, first_ts: i64, last_ts: i64, record_count: u32, compression: CompressionKind, artifact_uri: String }`
+  - `CompressionKind` is a `u8` enum (None | Snappy | Zstd) shared with the quote payload.
+- `quote.map`
+  - `QuotePayload { schema_version: u8, batch_id: u32, first_ts: i64, last_ts: i64, nbbo_sample_count: u32, artifact_uri: String }`
+- `aggressor.map`
+  - `AggressorPayload { schema_version: u8, minute_ts: i64, trade_payload_id: u32, quote_payload_id: u32, observation_count: u32, artifact_uri: String }`
+- `greeks.map`
+  - `GreeksPayload { schema_version: u8, minute_ts: i64, rf_rate_payload_id: u32, greeks_version: u32, artifact_uri: String, checksum: u32 }`
+- `aggregate.map`
+  - `AggregatePayload { schema_version: u8, minute_ts: i64, window: AggregateWindow, source_span: (u32, u32), stats_uri: String }`
+  - `AggregateWindow` is a `u8` enum (1m, 5m, 10m, 30m, 1h, 4h). `source_span` stores `(start_symbol_row, end_symbol_row)` indexes so audit tools can rehydrate the contributing rows without recomputing.
+
+Every payload struct ends with a variable-length URI or inline metadata blob, allowing engines to point to Parquet, Arrow, or custom chunk files without expanding the ledger itself.
+
 ### Ledger Variants
 
 - `TradeLedger` is responsible for sourcing data (treasury, trades, quotes) and the derived aggressor view needed by downstream workers. Each ledger instance contains:
@@ -62,6 +86,72 @@ Note: The 10K cap is more than appropriate given the scope of this project. We'l
   - `window_rows: Vec<[TradeWindowRow; 390]>` grouped by symbol so `rows[symbol_id][minute_idx]` yields the struct instantly.
 - `EnrichmentLedger` receives downstream overlays and aggregates that operate on trade ledger payloads. It mirrors the same dense window layout but uses `EnrichmentWindowRow` (seven slots) instead of four.
 - Ledgers expose lightweight iterators for a symbol or minute slice so workers can process contiguous ranges efficiently (cache-friendly scans during repairs/backfills).
+
+### Symbol Map Lifecycle
+
+- `SymbolMap` lives at `ledger.state/symbol-map.bin` (little-endian) and is memory-mapped alongside the ledgers.
+- On bootstrap, the controller loads the map, rebuilds the inverse lookup table, and seeds the next `SymbolId` counter.
+- `resolve_symbol(symbol)` allocates sequential IDs until the 10 000 cap is reached; IDs are stable for the entire active year.
+- No automatic eviction occurs mid-year. When the calendar rolls, operators archive the prior `ledger.state/` directory, create a new one with a fresh map, and optionally replay symbols that should stay hot.
+- Manual overrides (e.g., reclaiming IDs) are accomplished by editing `symbol-map.bin` offline before remapping; future tooling can automate this once usage patterns demand it.
+
+## Crate Layout & Worker Naming
+
+- `m17/`: orchestrator crate and primary binary entrypoint. It boots the ledgers, wires engines together, and owns process lifetime.
+- `ledger/`: shared library crate hosting the trade/enrichment ledgers, mapping-file abstractions, and controller APIs.
+- Worker crates follow the `<domain>-engine` naming convention so their purpose is obvious at a glance:
+  - `treasury-engine`: streams treasury curves into `rf_rate_ref` slots.
+  - `trade-engine`: ingests trades from flatfiles/feeds into `trade_ref` slots.
+  - `quote-engine`: ingests quotes/NBBO inputs into `quote_ref` slots.
+  - `nbbo-engine`: derives aggressor/NBBO payloads from trade+quote refs and fills `aggressor_ref`.
+  - `greeks-engine`: produces greeks overlays into `greeks_ref`.
+  - `aggregation-engine`: writes rolling aggregates into the enrichment slots (`aggs_*`).
+  - Additional specialized workers (e.g., anomaly detection) should follow the same `*-engine` pattern.
+- Each engine crate compiles to its own library with a lightweight runner so the `m17` orchestrator can embed them as modules without external binaries.
+
+## Engine Crate Specifications
+
+Each engine owns a focused scope, exposes a shared `Engine` trait (`start(ctx)`, `stop()`, `health()`, `describe_priority_hooks()`), and consumes ledger handles passed in by `m17`.
+
+### `treasury-engine`
+
+- Inputs: upstream treasury feed client plus `TradeLedger` handle for `rf_rate_ref` writes.
+- Behavior: ingest `RfRatePayload` updates, compute `valid_from/valid_to`, and walk all applicable symbols to write the new payload ID into every minute within the validity range. Carries forward rates until superseded.
+- Outputs: `rf_rate.map` payloads + slot updates; publishes metrics for curve lag and per-symbol update counts.
+
+### `trade-engine`
+
+- Inputs: flatfile/live trade connectors, symbol resolver, `TradeLedger` handle.
+- Behavior: batch trades per minute, append `TradePayload` records, write `trade_ref` slots, and mark `Pending` while processing. Provides hooks for repair/rewind via `clear_slot`.
+- Outputs: trade payload IDs, `trade_ref` slot transitions, ingestion metrics (latency, record count, compression kind).
+
+### `quote-engine`
+
+- Inputs: quote/NBBO feeds, `TradeLedger` handle for `quote_ref` slots.
+- Behavior: batch quotes per minute, persist `QuotePayload`, and write slots once both payload and checksum are ready. Maintains small local cache to align with trade batches for NBBO readiness.
+- Outputs: quote payload IDs, slot updates, metrics for quote lag and NBBO coverage.
+
+### `nbbo-engine`
+
+- Inputs: read-only `TradeLedger` view (trade+quote refs) plus write access to `aggressor_ref` slots.
+- Behavior: scan windows where both trade and quote refs are `Filled`, compute aggressor/NBBO payloads, append `AggressorPayload`, and store references. Retries when dependencies clear.
+- Outputs: aggressor payload IDs, slot updates, dependency lag metrics.
+
+### `greeks-engine`
+
+- Inputs: `TradeLedger` (for rf/trade/quote/aggressor context) and `EnrichmentLedger` write handle.
+- Behavior: recompute greeks whenever treasury version or upstream payloads change, append `GreeksPayload`, and fill `greeks_ref`. Uses CAS to avoid stomping newer writes.
+- Outputs: greeks payload IDs, slot transitions, recompute counters keyed by treasury version.
+
+### `aggregation-engine`
+
+- Inputs: read-only `EnrichmentLedger` + `TradeLedger` (for source data) and write access to enrichment aggregate slots.
+- Behavior: for each minute `T`, compute rolling aggregates per configured window (1m/5m/10m/30m/1h/4h), append `AggregatePayload` entries, and write the results to the slot whose `minute_idx` equals the window start (`T`, `T+5m`, …). Re-entrant runs only touch windows assigned to the current invocation.
+- Outputs: aggregate payload IDs, slot transitions, metrics for window coverage and backlog.
+
+## Legacy Crate Inventory & Retirement Plan
+
+Existing workspace crates (e.g., `orchestrator/`, `treasury-ingestion-service/`, `flatfile-ingestion-service/`, `realtime-ws-ingestion-service/`, `greeks-enrichment-service/`, `nbbo-cache/`, `core-types/`, `metrics/`, `storage/`, `options-universe-ingestion-service/`, `aggregations/`, `classifier/`, `data-client/`) remain useful as design references, but the new implementation must not depend on or extend them. Once the `m17` orchestrator, `ledger`, and all `*-engine` crates satisfy the functionality outlined here, the legacy crates will be deleted from the workspace to avoid split-brain execution paths.
 
 ## Controller Responsibilities
 
@@ -93,7 +183,7 @@ Each setter accepts `payload_meta = { payload_type: PayloadType, payload_id: u32
 - `set_greeks_ref(symbol_id, minute_idx, payload_meta)`
 - `set_aggs_ref_{1m,5m,10m,30m,1h,4h}(symbol_id, minute_idx, payload_meta)`
 
-These setters behave the same as TradeLedger writes but target the enrichment slots. Aggregation windows (5 m, 10 m, etc.) still anchor to the source minute so workers can mark progress once the aggregate covering that minute is complete.
+These setters behave the same as TradeLedger writes but target the enrichment slots. Aggregation windows are rolling: a `5m` aggregate stored at minute `T` covers `[T, T+5m)` and the aggregation engine writes to every `minute_idx` it evaluates. For example, when invoked for minute `T` it fills `T, T+5m, T+10m, …`; when invoked at `T+1m` it writes `T+1m, T+6m, …` without mutating previously written rows. Downstream readers always interpret `minute_idx` as “window start”.
 
 ### Common Helpers
 
@@ -105,7 +195,7 @@ These setters behave the same as TradeLedger writes but target the enrichment sl
 
 ## Worker Coordination
 
-- Each ingestion or materialization loop maintains its own backlog of `(symbol_id, minute_idx)` entries (e.g., “next minute to ingest”, “range needing repair”). Before starting work, the worker marks the slot `Pending` (via a lightweight `mark_pending` helper) so operators can observe intent; once the payload is written it transitions to `Filled`.
+- Each `*-engine` crate maintains its own backlog of `(symbol_id, minute_idx)` entries (e.g., “next minute to ingest”, “range needing repair”). Before starting work, the worker marks the slot `Pending` (via a lightweight `mark_pending` helper) so operators can observe intent; once the payload is written it transitions to `Filled`.
 - Priority regions (described below) override the default queue ordering. Workers must consult the shared priority table before selecting the next unit of work and bias toward the highest-priority outstanding region.
 - Backfills or repairs simply `clear_slot` before writing replacements; no controller-managed retry/trigger queue exists.
 - Because coordination is per-window, workers also own their own concurrency/backpressure limits. The ledger controller only enforces schema + version safety and persists the results.
@@ -132,14 +222,14 @@ These setters behave the same as TradeLedger writes but target the enrichment sl
 
 - **Memory-mapped ledger file**: pre-layout the active year of windows into a fixed-size file; `mmap` it read-write so in-memory updates persist via the OS page cache without a separate WAL. Each slot struct carries a version/checksum so partial writes can be detected and corrected on restart.
 - **In-process view**: wrap the mapped memory as `&mut [SymbolRows]` where each entry contains the 390-minute array. Addressing `(symbol_id, minute_idx)` becomes a simple double index; no hash lookups are needed at runtime.
-- **Snapshots**: use a cron/systemd timer to take hourly reflink/copy-on-write snapshots of both ledger files plus all payload mapping files to a secondary volume, plus a daily off-host backup for DR.
-- **Horizon**: keep six months of completed windows (prior to current date) mapped read-write, and pre-map the next six months for upcoming sessions. Older data lives on disk unmapped unless explicitly loaded for audits.
+- **Snapshots**: bundle `scripts/archive-ledger.sh`, a cron-invoked helper that tars and checksums the entire `ledger.state/` directory (ledgers, mapping files, symbol map). Restores untar the archive into place before remapping.
+- **Horizon**: keep six months of completed windows (prior to current date) mapped read-write, and pre-map the next six months for upcoming sessions. Older data lives on disk inside `ledger.state/` but remains unmapped unless explicitly loaded for audits.
 
 ## Observability & Ops
 
 - Metrics: mutation latency, per-column lag, symbol-cardinality usage, priority-region backlog, mapping-file growth, count of cleared refs, repair throughput, and slot-status ratios (Empty vs Pending vs Filled vs Cleared).
 - Alerts: `trade_ref` lag > N minutes, `quote_ref` staleness, enrichment backlog, treasury revisions causing repeated recomputes, priority region stuck longer than threshold.
-- Introspection tooling: CLI command `ledger window <symbol> <minute>` to print a row; `ledger tail --slot aggressor_ref` (or any slot) to follow changes.
+- Introspection: expose metrics/log hooks first; defer a standalone CLI until operators request one. Future tooling can call controller APIs or reuse the `m17` process once requirements solidify.
 
 ## Security & Access
 
@@ -148,60 +238,78 @@ These setters behave the same as TradeLedger writes but target the enrichment sl
 
 ## Ingestion Engines & Orchestrator Integration
 
-- Single binary: orchestrator and controller live in one process. Orchestrator builds/loads both ledgers and all payload mapping files, replays the latest snapshot, and hands shared handles (e.g., `Arc<TradeLedger>`, `Arc<EnrichmentLedger>`) to each engine.
-- Engines (treasury, flatfile, websocket) run event loops that call the trade-ledger setters. Aggressor workers consume the trade rows once both `trade_ref` and `quote_ref` exist and publish their payload IDs back into the trade ledger.
-- Greeks/aggregate engines take two handles: the trade ledger for source refs and the enrichment ledger for their outputs. They dereference payload IDs via the mapping tables as needed, then publish overlays/aggregates via enrichment setters.
-- Orchestrator supervises engines: if the ledgers detect backpressure, symbol-cap exhaustion, or priority-region starvation, orchestrator can pause/resume loops, initiate repairs via ledger APIs, or clear/replay ranges.
+- Single binary: the `m17` orchestrator crate hosts the ledgers and controller in-process. It builds/loads both ledgers plus all payload mapping files, replays the latest snapshot, and hands shared handles (e.g., `Arc<TradeLedger>`, `Arc<EnrichmentLedger>`) to each engine module.
+- Engines (treasury, trade, quote, nbbo, greeks, aggregation) run event loops that call the ledger setters defined in the `ledger` crate. Aggressor workers consume the trade rows once both `trade_ref` and `quote_ref` exist and publish their payload IDs back into the trade ledger.
+- Greeks/aggregation engines take two handles: the trade ledger for source refs and the enrichment ledger for their outputs. They dereference payload IDs via the mapping tables as needed, then publish overlays/aggregates via enrichment setters.
+- Orchestrator supervises engines: if the ledgers detect backpressure, symbol-cap exhaustion, or priority-region starvation, `m17` can pause/resume loops, initiate repairs via ledger APIs, or clear/replay ranges.
 
-## Migration Checklist
+## Greenfield Build Plan
 
 Use `[ ]` / `[x]` to track progress.
 
 ### Design Finalization
 
-- [ ] Ratify schema, typed setter API, and treasury fill semantics.
-- [ ] Document payload schemas for each mapping file (`rf_rate`, `trade`, `quote`, `aggressor`, `greeks`, `aggregate`).
-- [ ] Define symbol-map lifecycle (allocation, eviction rules, snapshot format).
-- [ ] Define orchestrator responsibilities: bootstrap window space, own ledger lifecycle, and hand references to ingestion engines.
+- [x] Ratify schema, typed setter API, treasury fill semantics, and rolling aggregation behavior (see Row Schema, API Surface, Treasury Cadence, and EnrichmentLedger sections).
+- [x] Document payload schemas for each mapping file (`rf_rate`, `trade`, `quote`, `aggressor`, `greeks`, `aggregate`).
+- [x] Define symbol-map lifecycle (allocation, eviction rules, snapshot format).
+- [x] Finalize crate boundaries (`m17`, `ledger`, each `*-engine`) and shared traits the orchestrator uses to drive engines (see Crate Layout & Worker Naming plus Ingestion Engines & Orchestrator Integration).
 
-### Ledger Service Skeleton
+### Ledger & Controller
 
 - [ ] Build window space generator to materialize the active-year minute map prior to starting any engines.
 - [ ] Implement controller service with in-memory index, memory-mapped persistence, snapshotting, and basic APIs (`set_rf_rate_ref`, `set_trade_ref`, `set_quote_ref`, `set_aggressor_ref`, `set_greeks_ref`, `set_aggs_ref_*`, `get_*_row`).
 - [ ] Implement payload mapping stores with append-only allocation, checksum validation, and snapshot hooks.
-- [ ] Modify orchestrator startup to construct the ledger instance and inject handles into treasury/flatfile/websocket engines before launching loops.
-- [ ] Build CLI/metrics scaffolding.
-- [ ] Add unit/integration tests covering mutation + replay.
+- [ ] Add unit/integration tests covering mutation, replay, and CAS contention semantics.
 
-### Worker Flow Updates
+### Orchestrator (`m17`)
 
-- [ ] Document per-worker contracts (inputs, outputs, failure handling) for trades, quotes, NBBO/aggressor, treasury, and Greeks.
-- [ ] Update worker implementations to poll ledger windows directly and publish via typed setters.
-- [ ] Soak test by simulating synthetic workloads for a trading day with workers self-scheduling minutes.
+- [ ] Construct the `m17` crate that boots ledgers, loads snapshots, and registers engines as modules.
+- [ ] Define engine traits (start/stop, health probes, priority-region hooks) and shared instrumentation wiring.
+- [ ] Implement supervision logic for backpressure, repairs, and graceful shutdown.
+
+### Engine Crates
+
+#### `treasury-engine`
+
+- [ ] Scaffold crate with engine trait implementation, config structs, and ingestion entrypoint.
+- [ ] Implement treasury feed client (or adapters) plus carry-forward logic that writes `rf_rate_ref` slots per symbol/minute.
+- [ ] Emit metrics/logs for curve lag, version churn, and per-symbol update counts.
+
+#### `trade-engine`
+
+- [ ] Scaffold crate with connectors for flatfile/live ingestion and a batching pipeline keyed by `(symbol_id, minute_idx)`.
+- [ ] Append `TradePayload` records, write `trade_ref` slots, and expose repair helpers (`clear_slot`, rewind hooks).
+- [ ] Instrument ingestion latency, record counts, and compression ratios.
+
+#### `quote-engine`
+
+- [ ] Scaffold crate with quote/NBBO feed adapters and per-minute batching.
+- [ ] Persist `QuotePayload` entries, write `quote_ref` slots, and coordinate with NBBO readiness (e.g., notify `nbbo-engine` when prerequisites exist).
+- [ ] Track quote lag, sample counts, and dependency coverage in metrics.
+
+#### `nbbo-engine`
+
+- [ ] Build worker that scans trade+quote slots for `Filled` windows, computes aggressor/NBBO payloads, and appends to `aggressor.map`.
+- [ ] Write `aggressor_ref` slots with CAS semantics and handle retries when dependencies change mid-flight.
+- [ ] Emit metrics for dependency lag and recompute/backfill throughput.
+
+#### `greeks-engine`
+
+- [ ] Implement greeks computation loop that watches treasury versions and upstream slot changes.
+- [ ] Persist `GreeksPayload` outputs, write `greeks_ref`, and guard against stale rewrites with version checks.
+- [ ] Surface recompute counters per treasury version and slot-lag metrics.
+
+#### `aggregation-engine`
+
+- [ ] Build rolling aggregation runners for 1m/5m/10m/30m/1h/4h windows, keyed by minute start.
+- [ ] Append `AggregatePayload` entries per window and write the corresponding enrichment slots without touching previously written minutes.
+- [ ] Track coverage/lateness per window size plus backlog size for operator visibility.
 
 ### Priority Region Integration
 
 - [ ] Implement the shared `PriorityRegionStore` with persistence and snapshot support.
 - [ ] Wire the TUI (and other operator tools) to create/update/delete regions.
-- [ ] Update all engines to consult the priority store before dequeuing default work and to report completion status so regions retire automatically.
-
-### Dual-Write Ingestion
-
-- [ ] Update flatfile trade ingest to write both legacy checkpoints and ledger `trade_ref`.
-- [ ] Update quote ingest similarly; validate NBBO workers observe the required trade+quote refs via ledger reads.
-- [ ] Stand up monitoring dashboards comparing ledger state vs legacy pipeline to ensure parity.
-
-### NBBO & Treasury Adoption
-
-- [ ] Point aggressor/NBBO materializer to trade-ledger getters/setters; ensure artifacts register via `set_aggressor_ref`.
-- [ ] Write treasury slices directly into ledger windows and confirm carry-forward rules behave as expected.
-- [ ] Run shadow-mode Greeks tasks consuming ledger outputs without publishing.
-
-### Greeks Cutover & Legacy Decommission
-
-- [ ] Switch Greeks publication to ledger-driven overlays.
-- [ ] Remove legacy cursor/checkpoint code paths (keep read-only adapters for audit).
-- [ ] Update runbooks, alerting, and documentation.
+- [ ] Ensure all engines consult the priority store before dequeuing default work and report completion so regions retire automatically.
 
 ### Cleanup & Optimization
 

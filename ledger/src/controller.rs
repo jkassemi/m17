@@ -95,7 +95,7 @@ impl LedgerController {
         )?)
     }
 
-    pub fn set_trade_ref(
+    pub fn set_option_trade_ref(
         &self,
         symbol: &str,
         minute_idx: MinuteIndex,
@@ -106,13 +106,13 @@ impl LedgerController {
         Ok(self.trade_ledger.write_slot(
             symbol_id,
             minute_idx,
-            TradeSlotKind::Trade,
+            TradeSlotKind::OptionTrade,
             meta,
             expected_version,
         )?)
     }
 
-    pub fn set_quote_ref(
+    pub fn set_option_quote_ref(
         &self,
         symbol: &str,
         minute_idx: MinuteIndex,
@@ -123,13 +123,13 @@ impl LedgerController {
         Ok(self.trade_ledger.write_slot(
             symbol_id,
             minute_idx,
-            TradeSlotKind::Quote,
+            TradeSlotKind::OptionQuote,
             meta,
             expected_version,
         )?)
     }
 
-    pub fn set_aggressor_ref(
+    pub fn set_underlying_trade_ref(
         &self,
         symbol: &str,
         minute_idx: MinuteIndex,
@@ -140,7 +140,58 @@ impl LedgerController {
         Ok(self.trade_ledger.write_slot(
             symbol_id,
             minute_idx,
-            TradeSlotKind::Aggressor,
+            TradeSlotKind::UnderlyingTrade,
+            meta,
+            expected_version,
+        )?)
+    }
+
+    pub fn set_underlying_quote_ref(
+        &self,
+        symbol: &str,
+        minute_idx: MinuteIndex,
+        meta: PayloadMeta,
+        expected_version: Option<u32>,
+    ) -> Result<Slot> {
+        let symbol_id = self.resolve_symbol(symbol)?;
+        Ok(self.trade_ledger.write_slot(
+            symbol_id,
+            minute_idx,
+            TradeSlotKind::UnderlyingQuote,
+            meta,
+            expected_version,
+        )?)
+    }
+
+    pub fn set_option_aggressor_ref(
+        &self,
+        symbol: &str,
+        minute_idx: MinuteIndex,
+        meta: PayloadMeta,
+        expected_version: Option<u32>,
+    ) -> Result<Slot> {
+        let symbol_id = self.resolve_symbol(symbol)?;
+        Ok(self.trade_ledger.write_slot(
+            symbol_id,
+            minute_idx,
+            TradeSlotKind::OptionAggressor,
+            meta,
+            expected_version,
+        )?)
+    }
+
+    pub fn set_underlying_aggressor_ref(
+        &self,
+        symbol: &str,
+        minute_idx: MinuteIndex,
+        meta: PayloadMeta,
+        expected_version: Option<u32>,
+    ) -> Result<Slot> {
+        let symbol_id = self.resolve_symbol(symbol)?;
+        Ok(self.trade_ledger.write_slot(
+            symbol_id,
+            minute_idx,
+            TradeSlotKind::UnderlyingAggressor,
             meta,
             expected_version,
         )?)
@@ -254,6 +305,24 @@ impl LedgerController {
     pub fn minute_idx_for_timestamp(&self, timestamp: i64) -> Option<MinuteIndex> {
         self.window_space.minute_idx_for_timestamp(timestamp)
     }
+
+    pub fn next_unfilled_window(
+        &self,
+        symbol: &str,
+        start_idx: MinuteIndex,
+        slot: SlotKind,
+    ) -> Result<Option<MinuteIndex>> {
+        let symbol_id = self.resolve_symbol(symbol)?;
+        let next = match slot {
+            SlotKind::Trade(kind) => self
+                .trade_ledger
+                .next_unfilled_window(symbol_id, start_idx, kind)?,
+            SlotKind::Enrichment(kind) => self
+                .enrichment_ledger
+                .next_unfilled_window(symbol_id, start_idx, kind)?,
+        };
+        Ok(next)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -283,14 +352,14 @@ mod tests {
 
         let meta = PayloadMeta::new(PayloadType::Trade, 1, 5, 123);
         controller
-            .set_trade_ref("AAPL", 0, meta, None)
+            .set_option_trade_ref("AAPL", 0, meta, None)
             .expect("write slot");
 
         let row = controller.get_trade_row("AAPL", 0).expect("fetch row");
-        assert_eq!(row.trade_ref.payload_id, 1);
+        assert_eq!(row.option_trade_ref.payload_id, 1);
 
         controller
-            .mark_pending("AAPL", 1, SlotKind::Trade(TradeSlotKind::Quote))
+            .mark_pending("AAPL", 1, SlotKind::Trade(TradeSlotKind::OptionQuote))
             .expect("mark pending");
     }
 }

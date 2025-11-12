@@ -104,27 +104,36 @@ impl PayloadMeta {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TradeSlotKind {
     RfRate,
-    Trade,
-    Quote,
-    Aggressor,
+    OptionTrade,
+    OptionQuote,
+    UnderlyingTrade,
+    UnderlyingQuote,
+    OptionAggressor,
+    UnderlyingAggressor,
 }
 
 impl TradeSlotKind {
     pub fn index(&self) -> usize {
         match self {
             TradeSlotKind::RfRate => 0,
-            TradeSlotKind::Trade => 1,
-            TradeSlotKind::Quote => 2,
-            TradeSlotKind::Aggressor => 3,
+            TradeSlotKind::OptionTrade => 1,
+            TradeSlotKind::OptionQuote => 2,
+            TradeSlotKind::UnderlyingTrade => 3,
+            TradeSlotKind::UnderlyingQuote => 4,
+            TradeSlotKind::OptionAggressor => 5,
+            TradeSlotKind::UnderlyingAggressor => 6,
         }
     }
 
     pub fn payload_type(&self) -> PayloadType {
         match self {
             TradeSlotKind::RfRate => PayloadType::RfRate,
-            TradeSlotKind::Trade => PayloadType::Trade,
-            TradeSlotKind::Quote => PayloadType::Quote,
-            TradeSlotKind::Aggressor => PayloadType::Aggressor,
+            TradeSlotKind::OptionTrade => PayloadType::Trade,
+            TradeSlotKind::OptionQuote => PayloadType::Quote,
+            TradeSlotKind::UnderlyingTrade => PayloadType::Trade,
+            TradeSlotKind::UnderlyingQuote => PayloadType::Quote,
+            TradeSlotKind::OptionAggressor => PayloadType::Aggressor,
+            TradeSlotKind::UnderlyingAggressor => PayloadType::Aggressor,
         }
     }
 }

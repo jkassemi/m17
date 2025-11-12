@@ -37,7 +37,7 @@ Note: The 10K cap is more than appropriate given the scope of this project. We'l
 
   Slot {
       payload_type: u8,   // enum identifying which mapping file owns the payload
-      status: SlotStatus, // u8: Empty | Pending | Filled | Cleared
+      status: SlotStatus, // u8: Empty | Pending | Filled | Cleared | Prune | Pruned
       payload_id: u32,    // index into that mapping file (0 = empty)
       version: u32,
       checksum: u32,
@@ -45,10 +45,13 @@ Note: The 10K cap is more than appropriate given the scope of this project. We'l
   }
 ```
 
-- Trade ledger rows carry four slots: `rf_rate_ref`, `trade_ref`, `quote_ref`, `aggressor_ref`.
+- Trade ledger rows carry seven slots: `rf_rate_ref`, `option_trade_ref`, `option_quote_ref`, `underlying_trade_ref`, `underlying_quote_ref`, `option_aggressor_ref`, `underlying_aggressor_ref`.
+- Option and underlying trade payloads only persist raw Massive columns (contract/symbol, timestamps, price/size, exchange, etc.); aggressor tags and Greeks remain isolated in their dedicated mapping files and enrichment slots.
 - Enrichment ledger rows carry seven slots: `greeks_ref`, `aggs_1m`, `aggs_5m`, `aggs_10m`, `aggs_30m`, `aggs_1h`, `aggs_4h`.
 - Empty slot means `status == Empty` and `payload_id == 0`; clearing a ref resets the struct to zeroed bytes and bumps `last_updated_ns`.
 - Slots contain only lightweight metadata (type/id/version/checksum). Payload content lives in type-specific mapping files explained below.
+- `Prune` slot means artifact can be safely removed.
+- `Pruned` slot means artifact was safely removed by GC service.
 
 ### Payload Indirection & Mapping Tables
 
@@ -101,10 +104,10 @@ Every payload struct ends with a variable-length URI or inline metadata blob, al
 - `ledger/`: shared library crate hosting the trade/enrichment ledgers, mapping-file abstractions, and controller APIs.
 - Worker crates follow the `<domain>-engine` naming convention so their purpose is obvious at a glance:
   - `treasury-engine`: streams treasury curves into `rf_rate_ref` slots.
-  - `trade-flatfile-engine`: ingests historical/flatfile trades into `trade_ref` slots.
-  - `trade-ws-engine`: ingests realtime websocket trades into `trade_ref` slots.
-  - `quote-engine`: ingests quotes/NBBO inputs into `quote_ref` slots.
-  - `nbbo-engine`: derives aggressor/NBBO payloads from trade+quote refs and fills `aggressor_ref`.
+  - `trade-flatfile-engine`: ingests historical/flatfile trades into `option_trade_ref` slots.
+  - `trade-ws-engine`: ingests realtime websocket trades into `option_trade_ref` slots.
+  - `quote-engine`: ingests quotes/NBBO inputs into `option_quote_ref` slots.
+  - `nbbo-engine`: derives aggressor/NBBO payloads from trade+quote refs and fills `option_aggressor_ref`.
   - `greeks-engine`: produces greeks overlays into `greeks_ref`.
   - `aggregation-engine`: writes rolling aggregates into the enrichment slots (`aggs_*`).
   - Additional specialized workers (e.g., anomaly detection) should follow the same `*-engine` pattern.
@@ -123,25 +126,25 @@ Each engine owns a focused scope, exposes a shared `Engine` trait (`start(ctx)`,
 ### `trade-flatfile-engine`
 
 - Inputs: batch/flatfile trade connectors, symbol resolver, `TradeLedger` handle.
-- Behavior: walk historical files, batch trades per minute, append `TradeBatchPayload` records, write `trade_ref` slots, and mark `Pending` while processing. Provides hooks for repair/rewind via `clear_slot`.
-- Outputs: trade payload IDs, `trade_ref` slot transitions, ingestion metrics (latency, record count, file offsets).
+- Behavior: walk historical files, batch trades per minute, append `TradeBatchPayload` records, write `option_trade_ref` slots, and mark `Pending` while processing. Provides hooks for repair/rewind via `clear_slot`.
+- Outputs: trade payload IDs, `option_trade_ref` slot transitions, ingestion metrics (latency, record count, file offsets).
 
 ### `trade-ws-engine`
 
 - Inputs: realtime websocket feeds, incremental checkpoint state, `TradeLedger` handle.
-- Behavior: stream trades minute-by-minute, emit `TradeBatchPayload` artifacts (or inline buffers) once the minute closes, write `trade_ref` slots immediately so downstream consumers see near-real-time updates.
+- Behavior: stream trades minute-by-minute, emit `TradeBatchPayload` artifacts (or inline buffers) once the minute closes, write `option_trade_ref` slots immediately so downstream consumers see near-real-time updates.
 - Outputs: trade payload IDs, real-time ingestion metrics (lag, dropped messages, reconnect counters).
 
 ### `quote-engine`
 
-- Inputs: quote/NBBO feeds, `TradeLedger` handle for `quote_ref` slots.
-- Behavior: batch quotes per minute, persist `QuotePayload`, and write slots once both payload and checksum are ready. Maintains small local cache to align with trade batches for NBBO readiness.
+- Inputs: quote/NBBO feeds, `TradeLedger` handle for `option_quote_ref` slots.
+- Behavior: batch quotes per minute, persist `QuotePayload`, and write slots once both payload and checksum are ready.
 - Outputs: quote payload IDs, slot updates, metrics for quote lag and NBBO coverage.
 
 ### `nbbo-engine`
 
-- Inputs: read-only `TradeLedger` view (trade+quote refs) plus write access to `aggressor_ref` slots.
-- Behavior: scan windows where both trade and quote refs are `Filled`, compute aggressor/NBBO payloads, append `AggressorPayload`, and store references. Retries when dependencies clear.
+- Inputs: `TradeLedger` view (trade+quote refs) plus write access to `option_aggressor_ref` slots.
+- Behavior: scan windows where both trade and quote refs are `Filled`, compute aggressor/NBBO payloads, append `AggressorPayload`, and store references. Retries when dependencies clear. After writing quotes, set quote refs to `Prune`.
 - Outputs: aggressor payload IDs, slot updates, dependency lag metrics.
 
 ### `greeks-engine`
@@ -162,7 +165,7 @@ Existing workspace crates (e.g., `orchestrator/`, `treasury-ingestion-service/`,
 
 ## Controller Responsibilities
 
-1. **Ledger-specialized APIs**: ingestion/materialization services call explicit setters on the trade or enrichment ledger (`set_rf_rate_ref`, `set_trade_ref`, `set_quote_ref`, `set_aggressor_ref`, `set_greeks_ref`, `set_aggs_ref_*`). Each setter accepts `(symbol_id, minute_idx, payload_type, payload_id, checksum, version)` plus optional expected version for CAS semantics and automatically manages the slot status (`Pending` → `Filled`).
+1. **Ledger-specialized APIs**: ingestion/materialization services call explicit setters on the trade or enrichment ledger (`set_rf_rate_ref`, `set_option_trade_ref`, `set_option_quote_ref`, `set_underlying_trade_ref`, `set_underlying_quote_ref`, `set_option_aggressor_ref`, `set_underlying_aggressor_ref`, `set_greeks_ref`, `set_aggs_ref_*`). Each setter accepts `(symbol_id, minute_idx, payload_type, payload_id, checksum, version)` plus optional expected version for CAS semantics and automatically manages the slot status (`Pending` → `Filled`).
 2. **Window-scoped coordination**: workers already know which symbol+minute windows they own while ingesting, backfilling, or repairing. They fetch that row, verify prerequisites locally, and update only the column they own—no central dependency graph, mutation queue, or fan-out triggers.
 3. **Durability & restart**: mutations land in the mmap-backed file immediately; the OS flush policy is sufficient durability for the first iteration. Restarts remap the file and rebuild lightweight indexes—there is no WAL or changestream to replay.
 4. **Concurrency control**: per-row compare-and-swap guards ensure two writers cannot race on the same slot; the controller returns a conflict error if a caller’s expected version regresses.
@@ -176,12 +179,16 @@ All APIs address windows via `(symbol_id, minute_idx)`. Helpers exist to transla
 
 - `set_rf_rate_ref(symbol_id, minute_idx, payload_meta)`  
   Stores a risk-free-rate/treasury slice reference for that symbol+minute (used primarily for index/ETF symbols).
-- `set_trade_ref(symbol_id, minute_idx, payload_meta)`  
-  Writes the trade batch reference (usually an immutable partition ID).
-- `set_quote_ref(symbol_id, minute_idx, payload_meta)`  
-  Writes the quote/NBBO inputs captured for the minute.
-- `set_aggressor_ref(symbol_id, minute_idx, payload_meta)`  
-  Stores the aggressor/NBBO output derived from the trade+quote payloads.
+- `set_option_trade_ref(symbol_id, minute_idx, payload_meta)`  
+  Writes the option trade batch reference (usually an immutable partition ID).
+- `set_option_quote_ref(symbol_id, minute_idx, payload_meta)`  
+  Writes the option quote/NBBO inputs captured for the minute.
+- `set_underlying_trade_ref(symbol_id, minute_idx, payload_meta)`  
+  Writes the underlying (equity) trade payload reference.
+- `set_underlying_quote_ref(symbol_id, minute_idx, payload_meta)`  
+  Writes the underlying (equity) quote/NBBO payload reference.
+- `set_option_aggressor_ref(symbol_id, minute_idx, payload_meta)` and `set_underlying_aggressor_ref(...)`  
+  Store the aggressor/NBBO outputs derived from the respective trade+quote payloads.
 
 Each setter accepts `payload_meta = { payload_type: PayloadType, payload_id: u32, version: u32, checksum: u32, last_updated_ns }`. The controller enforces that the provided `payload_type` matches the slot’s allowed enum.
 
@@ -235,7 +242,7 @@ These setters behave the same as TradeLedger writes but target the enrichment sl
 ## Observability & Ops
 
 - Metrics: mutation latency, per-column lag, symbol-cardinality usage, priority-region backlog, mapping-file growth, count of cleared refs, repair throughput, and slot-status ratios (Empty vs Pending vs Filled vs Cleared).
-- Alerts: `trade_ref` lag > N minutes, `quote_ref` staleness, enrichment backlog, treasury revisions causing repeated recomputes, priority region stuck longer than threshold.
+- Alerts: `option_trade_ref` lag > N minutes, `option_quote_ref` staleness, enrichment backlog, treasury revisions causing repeated recomputes, priority region stuck longer than threshold.
 - Introspection: expose metrics/log hooks first; defer a standalone CLI until operators request one. Future tooling can call controller APIs or reuse the `m17` process once requirements solidify.
 
 ## Security & Access
@@ -246,7 +253,7 @@ These setters behave the same as TradeLedger writes but target the enrichment sl
 ## Ingestion Engines & Orchestrator Integration
 
 - Single binary: the `m17` orchestrator crate hosts the ledgers and controller in-process. It builds/loads both ledgers plus all payload mapping files, replays the latest snapshot, and hands shared handles (e.g., `Arc<TradeLedger>`, `Arc<EnrichmentLedger>`) to each engine module.
-- Engines (treasury, trade-flatfile, trade-ws, quote, nbbo, greeks, aggregation) run event loops that call the ledger setters defined in the `ledger` crate. Aggressor workers consume the trade rows once both `trade_ref` and `quote_ref` exist and publish their payload IDs back into the trade ledger.
+- Engines (treasury, trade-flatfile, trade-ws, quote, nbbo, greeks, aggregation) run event loops that call the ledger setters defined in the `ledger` crate. Aggressor workers consume the trade rows once both `option_trade_ref` and `option_quote_ref` exist and publish their payload IDs back into the trade ledger.
 - Greeks/aggregation engines take two handles: the trade ledger for source refs and the enrichment ledger for their outputs. They dereference payload IDs via the mapping tables as needed, then publish overlays/aggregates via enrichment setters.
 - Orchestrator supervises engines: if the ledgers detect backpressure, symbol-cap exhaustion, or priority-region starvation, `m17` can pause/resume loops, initiate repairs via ledger APIs, or clear/replay ranges.
 
@@ -264,7 +271,7 @@ Use `[ ]` / `[x]` to track progress.
 ### Ledger & Controller
 
 - [x] Build window space generator to materialize the active-year minute map prior to starting any engines.
-- [x] Implement controller service with in-memory index, memory-mapped persistence, snapshotting, and basic APIs (`set_rf_rate_ref`, `set_trade_ref`, `set_quote_ref`, `set_aggressor_ref`, `set_greeks_ref`, `set_aggs_ref_*`, `get_*_row`).
+- [x] Implement controller service with in-memory index, memory-mapped persistence, snapshotting, and basic APIs (`set_rf_rate_ref`, `set_option_trade_ref`, `set_option_quote_ref`, `set_option_aggressor_ref`, `set_greeks_ref`, `set_aggs_ref_*`, `get_*_row`).
 - [x] Implement payload mapping stores with append-only allocation, checksum validation, and snapshot hooks.
 - [x] Add unit/integration tests covering mutation, replay, and CAS contention semantics.
 
@@ -279,7 +286,7 @@ Use `[ ]` / `[x]` to track progress.
     with well-defined payload schemas (TradeBatchPayload, QuoteBatchPayload, etc.) and
     automatic payload-id generation.
 - Implemented LedgerController to bootstrap state, resolve symbols, expose all
-    setter APIs (set_trade_ref, set_quote_ref, set_greeks_ref, etc.), handle pending/
+    setter APIs (set_option_trade_ref, set_option_quote_ref, set_greeks_ref, etc.), handle pending/
     clear operations, provide minute_idx_for_timestamp, and gate access to the payload
     stores via mutexes.
 - Added unit tests covering slot type enforcement, version conflicts, window lookup
@@ -296,9 +303,9 @@ Use `[ ]` / `[x]` to track progress.
 
 #### `trade-flatfile-engine`
 
-- [ ] Scaffold crate focused on historical/flatfile inputs and a batching pipeline keyed by `(symbol_id, minute_idx)`.
-- [ ] Append `TradeBatchPayload` records, write `trade_ref` slots, and expose repair helpers (`clear_slot`, rewind hooks) for backfills.
-- [ ] Instrument ingestion latency, record counts, file offsets, and retry counters.
+- [ ] `OptionTradeFlatfileEngine`: walk OPRA trade dumps, emit Parquet artifacts containing raw trade columns only (no aggressor/greeks), append `TradeBatchPayload`s, and write the `option_trade_ref` slots.
+- [ ] `UnderlyingFlatfileEngine`: walk SIP equity trades _and_ quotes. Trade payloads write the new `underlying_trade_ref` slot, quote payloads write `underlying_quote_ref`, and both reuse the same ledger-driven restart semantics.
+- [ ] Share the S3 client, batching, checksum, and ledger CAS helpers across both engines; expose repair helpers (`clear_slot`, rewind hooks) for backfills plus ingestion metrics (latency, rows, bytes).
 
 #### `treasury-engine`
 
@@ -306,29 +313,23 @@ Use `[ ]` / `[x]` to track progress.
 - [ ] Implement treasury feed client (or adapters) plus carry-forward logic that writes `rf_rate_ref` slots per symbol/minute.
 - [ ] Emit metrics/logs for curve lag, version churn, and per-symbol update counts.
 
-#### `trade-flatfile-engine`
-
-- [ ] Scaffold crate focused on historical/flatfile inputs and a batching pipeline keyed by `(symbol_id, minute_idx)`.
-- [ ] Append `TradeBatchPayload` records, write `trade_ref` slots, and expose repair helpers (`clear_slot`, rewind hooks) for backfills.
-- [ ] Instrument ingestion latency, record counts, file offsets, and retry counters.
-
 #### `trade-ws-engine`
 
 - [ ] Scaffold crate for realtime websocket ingestion with reconnect/backpressure handling.
-- [ ] Buffer minute windows, append `TradeBatchPayload` artifacts (or inline buffers) as minutes close, then write `trade_ref` slots promptly.
+- [ ] Buffer minute windows, append `TradeBatchPayload` artifacts (or inline buffers) as minutes close, then write `option_trade_ref` slots promptly.
 - [ ] Instrument stream lag, reconnects, dropped messages, and per-minute publish latency.
 
 #### `quote-engine`
 
 - [ ] Scaffold crate with quote/NBBO feed adapters and per-minute batching.
-- [ ] Persist `QuotePayload` entries, write `quote_ref` slots, and coordinate with NBBO readiness (e.g., notify `nbbo-engine` when prerequisites exist).
+- [ ] Persist `QuotePayload` entries, write `option_quote_ref` slots, and coordinate with NBBO readiness (e.g., notify `nbbo-engine` when prerequisites exist).
 - [ ] Track quote lag, sample counts, and dependency coverage in metrics.
 
 #### `nbbo-engine`
 
-- [ ] Build worker that scans trade+quote slots for `Filled` windows, computes aggressor/NBBO payloads, and appends to `aggressor.map`.
-- [ ] Write `aggressor_ref` slots with CAS semantics and handle retries when dependencies change mid-flight.
-- [ ] Emit metrics for dependency lag and recompute/backfill throughput.
+- [ ] `OptionsNbboEngine`: scan option `option_trade_ref`/`option_quote_ref` slots, compute aggressor payloads, append to `aggressor.map`, and write the `option_aggressor_ref` column.
+- [ ] `UnderlyingNbboEngine`: scan the new `underlying_trade_ref`/`underlying_quote_ref` slots to maintain equities-focused NBBO payloads or diagnostics.
+- [ ] Emit metrics for dependency lag and recompute/backfill throughput, keeping the option/underlying streams independent so they can be paused or repaired without impacting each other.
 
 #### `greeks-engine`
 
@@ -342,6 +343,10 @@ Use `[ ]` / `[x]` to track progress.
 - [ ] Append `AggregatePayload` entries per window and write the corresponding enrichment slots without touching previously written minutes.
 - [ ] Track coverage/lateness per window size plus backlog size for operator visibility.
 
+#### gc-engine
+
+- [ ] Build worker that scans all slots for `Prune` windows, and executes a routine in `nbbo-engine` to remove the underlying artifact. Updates `Prune` windows to `Pruned` when complete.
+
 ### Priority Region Integration
 
 - [ ] Implement the shared `PriorityRegionStore` with persistence and snapshot support.
@@ -350,6 +355,7 @@ Use `[ ]` / `[x]` to track progress.
 
 ### Cleanup & Optimization
 
+- [ ] Build GC - remove refs in Prune, update to Pruned.
 - [ ] Tune snapshot cadence, consider sharding, implement head eviction when stable.
 - [ ] Build repair tooling (bulk `clear_*` plus range refill helpers) for ops ergonomics.
 
@@ -362,7 +368,7 @@ Use `[ ]` / `[x]` to track progress.
 
 ## Notes
 
-How a trade engine writes a trade_ref - early concept:
+How a trade engine writes a option_trade_ref - early concept:
 
   Trade engine pseudocode
 
@@ -387,4 +393,4 @@ How a trade engine writes a trade_ref - early concept:
   };
 
   let meta = PayloadMeta::new(PayloadType::Trade, payload_id, version, checksum);
-  controller.set_trade_ref(symbol, minute_idx, meta, None)?;
+  controller.set_option_trade_ref(symbol, minute_idx, meta, None)?;

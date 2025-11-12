@@ -1,0 +1,8 @@
+[package]
+name = "engine-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ledger = { path = "../ledger" }
+thiserror = "1"

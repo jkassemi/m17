@@ -9,15 +9,11 @@ In numerology, 17 symbolizes success, spiritual insight, and business acumen.
 This system captures trades with NBBO snapshots, classifies aggressors, calculates greeks, stores data in Parquet, and provides a dashboard for realtime application of trading algorithms and strategies.
 
 ```bash
-cargo build
-cargo run  # Starts orchestrator with WS stub and metrics at http://localhost:8080/metrics
-cargo fmt --check
-cargo clippy -- -D warnings
-cargo test
+
+export M17_MASSIVE_API_KEY=
+export M17_FLATFILE_ACCESS_KEY_ID=
+export M17_FLATFILE_SECRET_ACCESS_KEY=
+
+./m17 prod # For production server
+./m17 dev # For development server
 ```
-
-## Architecture
-
-- `core-types`: Shared schemas and config.
-- `ws-source`: WebSocket ingestion.
-- `orchestrator`: Main runtime.

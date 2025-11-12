@@ -42,6 +42,31 @@ pub fn option_trade_schema() -> Schema {
     ])
 }
 
+/// Simplified option trade schema used by ledger payload artifacts.
+pub fn option_trade_record_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("contract", DataType::Utf8, false),
+        Field::new("trade_uid", DataType::FixedSizeBinary(16), false),
+        Field::new("contract_direction", DataType::Utf8, false),
+        Field::new("strike_price", DataType::Float64, false),
+        Field::new("underlying", DataType::Utf8, false),
+        Field::new("trade_ts_ns", DataType::Int64, false),
+        Field::new("participant_ts_ns", DataType::Int64, true),
+        Field::new("price", DataType::Float64, false),
+        Field::new("size", DataType::UInt32, false),
+        Field::new(
+            "conditions",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        ),
+        Field::new("exchange", DataType::Int32, false),
+        Field::new("expiry_ts_ns", DataType::Int64, false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("quality", DataType::Utf8, false),
+        Field::new("watermark_ts_ns", DataType::Int64, false),
+    ])
+}
+
 /// Placeholder for EquityTrade schema.
 pub fn equity_trade_schema() -> Schema {
     Schema::new(vec![
@@ -79,6 +104,33 @@ pub fn equity_trade_schema() -> Schema {
         Field::new("correction", DataType::Int32, true),
         Field::new("trf_id", DataType::Utf8, true),
         Field::new("trf_ts_ns", DataType::Int64, true),
+    ])
+}
+
+/// Simplified underlying trade schema used by ledger payload artifacts.
+pub fn underlying_trade_record_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new("trade_uid", DataType::FixedSizeBinary(16), false),
+        Field::new("trade_ts_ns", DataType::Int64, false),
+        Field::new("participant_ts_ns", DataType::Int64, true),
+        Field::new("price", DataType::Float64, false),
+        Field::new("size", DataType::UInt32, false),
+        Field::new(
+            "conditions",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        ),
+        Field::new("exchange", DataType::Int32, false),
+        Field::new("trade_id", DataType::Utf8, true),
+        Field::new("seq", DataType::UInt64, true),
+        Field::new("tape", DataType::Utf8, true),
+        Field::new("correction", DataType::Int32, true),
+        Field::new("trf_id", DataType::Utf8, true),
+        Field::new("trf_ts_ns", DataType::Int64, true),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("quality", DataType::Utf8, false),
+        Field::new("watermark_ts_ns", DataType::Int64, false),
     ])
 }
 

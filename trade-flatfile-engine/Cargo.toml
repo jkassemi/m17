@@ -1,0 +1,27 @@
+[package]
+name = "trade-flatfile-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+engine-api = { path = "../engine-api" }
+ledger = { path = "../ledger" }
+parking_lot = "0.12"
+thiserror = "1"
+async-compression = { version = "0.4", features = ["gzip", "tokio"] }
+aws-sdk-s3 = { version = "1.112.0", features = ["rt-tokio", "rustls"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+core-types = { path = "../core-types" }
+crc32fast = "1"
+csv-async = { version = "1", features = ["tokio"] }
+futures = "0.3"
+trading-calendar = "0.2"
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio-stream = "0.1"
+arrow = "57.0.0"
+parquet = { version = "57.0", features = ["arrow"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+log = "0.4"

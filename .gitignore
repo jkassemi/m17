@@ -1,3 +1,6 @@
 .aider*
+Cargo.lock
 target
 config.toml
+data
+orchestrator.log

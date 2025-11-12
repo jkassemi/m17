@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod opra;
+pub mod raw;
 pub mod retry;
 pub mod schema;
 pub mod status;

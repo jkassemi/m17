@@ -4,7 +4,9 @@ use parking_lot::RwLock;
 
 use crate::{
     error::SlotWriteError,
-    payload::{EnrichmentSlotKind, PayloadMeta, PayloadType, Slot, SlotKind, TradeSlotKind},
+    payload::{
+        EnrichmentSlotKind, PayloadMeta, PayloadType, Slot, SlotKind, SlotStatus, TradeSlotKind,
+    },
     symbol_map::SymbolId,
     window::{MinuteIndex, WindowMeta, WindowSpace},
 };
@@ -42,9 +44,12 @@ pub trait LedgerRow: Clone + Send + Sync + 'static {
 pub struct TradeWindowRow {
     pub header: WindowRowHeader,
     pub rf_rate: Slot,
-    pub trade_ref: Slot,
-    pub quote_ref: Slot,
-    pub aggressor_ref: Slot,
+    pub option_trade_ref: Slot,
+    pub option_quote_ref: Slot,
+    pub underlying_trade_ref: Slot,
+    pub underlying_quote_ref: Slot,
+    pub option_aggressor_ref: Slot,
+    pub underlying_aggressor_ref: Slot,
 }
 
 impl Default for TradeWindowRow {
@@ -52,9 +57,12 @@ impl Default for TradeWindowRow {
         Self {
             header: WindowRowHeader::default(),
             rf_rate: Slot::default(),
-            trade_ref: Slot::default(),
-            quote_ref: Slot::default(),
-            aggressor_ref: Slot::default(),
+            option_trade_ref: Slot::default(),
+            option_quote_ref: Slot::default(),
+            underlying_trade_ref: Slot::default(),
+            underlying_quote_ref: Slot::default(),
+            option_aggressor_ref: Slot::default(),
+            underlying_aggressor_ref: Slot::default(),
         }
     }
 }
@@ -70,9 +78,12 @@ impl LedgerRow for TradeWindowRow {
     fn slot(&self, index: usize) -> &Slot {
         match index {
             0 => &self.rf_rate,
-            1 => &self.trade_ref,
-            2 => &self.quote_ref,
-            3 => &self.aggressor_ref,
+            1 => &self.option_trade_ref,
+            2 => &self.option_quote_ref,
+            3 => &self.underlying_trade_ref,
+            4 => &self.underlying_quote_ref,
+            5 => &self.option_aggressor_ref,
+            6 => &self.underlying_aggressor_ref,
             _ => panic!("invalid trade slot index {index}"),
         }
     }
@@ -80,9 +91,12 @@ impl LedgerRow for TradeWindowRow {
     fn slot_mut(&mut self, index: usize) -> &mut Slot {
         match index {
             0 => &mut self.rf_rate,
-            1 => &mut self.trade_ref,
-            2 => &mut self.quote_ref,
-            3 => &mut self.aggressor_ref,
+            1 => &mut self.option_trade_ref,
+            2 => &mut self.option_quote_ref,
+            3 => &mut self.underlying_trade_ref,
+            4 => &mut self.underlying_quote_ref,
+            5 => &mut self.option_aggressor_ref,
+            6 => &mut self.underlying_aggressor_ref,
             _ => panic!("invalid trade slot index {index}"),
         }
     }
@@ -257,6 +271,29 @@ impl<Row: LedgerRow> LedgerCore<Row> {
             .ok_or(SlotWriteError::MissingSymbol { symbol_id })?;
         Ok(rows.clone())
     }
+
+    fn next_unfilled(
+        &self,
+        symbol_id: SymbolId,
+        start_idx: MinuteIndex,
+        slot_index: usize,
+    ) -> Result<Option<MinuteIndex>, SlotWriteError> {
+        if start_idx as usize >= self.window_space.len() {
+            return Ok(None);
+        }
+        let guard = self.rows.read();
+        let rows = guard
+            .get(symbol_id as usize)
+            .and_then(|opt| opt.as_ref())
+            .ok_or(SlotWriteError::MissingSymbol { symbol_id })?;
+        for (idx, row) in rows.iter().enumerate().skip(start_idx as usize) {
+            let slot = row.slot(slot_index);
+            if slot.status != SlotStatus::Filled {
+                return Ok(Some(idx as MinuteIndex));
+            }
+        }
+        Ok(None)
+    }
 }
 
 pub struct TradeLedger {
@@ -335,6 +372,15 @@ impl TradeLedger {
 
     pub fn iter_symbol(&self, symbol_id: SymbolId) -> Result<Vec<TradeWindowRow>, SlotWriteError> {
         self.core.iter_symbol(symbol_id)
+    }
+
+    pub fn next_unfilled_window(
+        &self,
+        symbol_id: SymbolId,
+        start_idx: MinuteIndex,
+        kind: TradeSlotKind,
+    ) -> Result<Option<MinuteIndex>, SlotWriteError> {
+        self.core.next_unfilled(symbol_id, start_idx, kind.index())
     }
 }
 
@@ -418,6 +464,15 @@ impl EnrichmentLedger {
     ) -> Result<Vec<EnrichmentWindowRow>, SlotWriteError> {
         self.core.iter_symbol(symbol_id)
     }
+
+    pub fn next_unfilled_window(
+        &self,
+        symbol_id: SymbolId,
+        start_idx: MinuteIndex,
+        kind: EnrichmentSlotKind,
+    ) -> Result<Option<MinuteIndex>, SlotWriteError> {
+        self.core.next_unfilled(symbol_id, start_idx, kind.index())
+    }
 }
 
 fn validate_payload(
@@ -451,13 +506,13 @@ mod tests {
 
         let meta = PayloadMeta::new(PayloadType::Trade, 42, 1, 777);
         let slot = ledger
-            .write_slot(0, 0, TradeSlotKind::Trade, meta, None)
+            .write_slot(0, 0, TradeSlotKind::OptionTrade, meta, None)
             .unwrap();
         assert_eq!(slot.payload_id, 42);
         assert_eq!(slot.version, 1);
 
         let err = ledger
-            .write_slot(0, 0, TradeSlotKind::Trade, meta, Some(0))
+            .write_slot(0, 0, TradeSlotKind::OptionTrade, meta, Some(0))
             .unwrap_err();
         assert!(matches!(err, SlotWriteError::VersionConflict { .. }));
     }
@@ -471,5 +526,22 @@ mod tests {
             .write_slot(0, 0, EnrichmentSlotKind::Greeks, meta, None)
             .unwrap_err();
         assert!(matches!(err, SlotWriteError::PayloadTypeMismatch { .. }));
+    }
+
+    #[test]
+    fn next_unfilled_skips_filled_minutes() {
+        let ledger = TradeLedger::new(4, window());
+        ledger.ensure_symbol(0).unwrap();
+        let filled = PayloadMeta::new(PayloadType::Trade, 7, 1, 1);
+        ledger
+            .write_slot(0, 0, TradeSlotKind::OptionTrade, filled, None)
+            .unwrap();
+        ledger
+            .write_slot(0, 1, TradeSlotKind::OptionTrade, filled, None)
+            .unwrap();
+        let next = ledger
+            .next_unfilled_window(0, 0, TradeSlotKind::OptionTrade)
+            .unwrap();
+        assert_eq!(next, Some(2));
     }
 }

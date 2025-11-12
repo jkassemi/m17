@@ -1,0 +1,12 @@
+[package]
+name = "m17"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+engine-api = { path = "../engine-api" }
+ledger = { path = "../ledger" }
+trade-flatfile-engine = { path = "../trade-flatfile-engine" }
+thiserror = "1"
+time = { version = "0.3", default-features = false, features = ["alloc", "formatting", "parsing"] }
+core-types = { path = "../core-types" }

@@ -19,6 +19,8 @@ pub struct AppConfig {
     pub flatfile: FlatfileConfig,
     #[serde(default)]
     pub ingest: IngestConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -219,8 +221,11 @@ pub struct SchedulerConfig {
 pub struct IngestConfig {
     #[serde(default = "default_ingest_batch_size")]
     pub batch_size: usize,
-    #[serde(default = "default_ingest_concurrent_days")]
-    pub concurrent_days: usize,
+    #[serde(
+        default = "default_ingest_concurrent_permits",
+        alias = "concurrent_days"
+    )]
+    pub concurrent_permits: usize,
     #[serde(default = "default_progress_update_ms")]
     pub progress_update_ms: u64,
 }
@@ -229,7 +234,7 @@ impl Default for IngestConfig {
     fn default() -> Self {
         Self {
             batch_size: default_ingest_batch_size(),
-            concurrent_days: default_ingest_concurrent_days(),
+            concurrent_permits: default_ingest_concurrent_permits(),
             progress_update_ms: default_progress_update_ms(),
         }
     }
@@ -239,7 +244,7 @@ fn default_ingest_batch_size() -> usize {
     20_000
 }
 
-fn default_ingest_concurrent_days() -> usize {
+fn default_ingest_concurrent_permits() -> usize {
     4
 }
 
@@ -307,4 +312,21 @@ impl AppConfig {
         let config: Self = settings.try_deserialize()?;
         Ok(config)
     }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    #[serde(default = "default_metrics_port")]
+    pub port: u16,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            port: default_metrics_port(),
+        }
+    }
+}
+
+fn default_metrics_port() -> u16 {
+    8080
 }

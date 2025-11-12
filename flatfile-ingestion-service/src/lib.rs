@@ -11,6 +11,7 @@ use metrics::Metrics;
 use nbbo_cache::NbboStore;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use storage::Storage;
 use tokio::sync::{OwnedSemaphorePermit, RwLock as TokioRwLock, Semaphore};
 use treasury_ingestion_service::TreasuryServiceHandle;
@@ -29,7 +30,7 @@ pub struct FlatfileIngestionService {
     nbbo_store: Arc<TokioRwLock<NbboStore>>,
     greeks_cfg: GreeksConfig,
     flatfile_staleness_us: u32,
-    concurrent_days: usize,
+    concurrent_permits: usize,
     treasury: TreasuryServiceHandle,
     status: ServiceStatusHandle,
     checkpoints: Arc<CheckpointManager>,
@@ -45,7 +46,7 @@ impl FlatfileIngestionService {
         nbbo_store: Arc<TokioRwLock<NbboStore>>,
         greeks_cfg: GreeksConfig,
         flatfile_staleness_us: u32,
-        concurrent_days: usize,
+        concurrent_permits: usize,
         treasury: TreasuryServiceHandle,
     ) -> Self {
         let source = FlatfileSource::new(
@@ -66,7 +67,7 @@ impl FlatfileIngestionService {
             nbbo_store,
             greeks_cfg,
             flatfile_staleness_us,
-            concurrent_days: concurrent_days.max(1),
+            concurrent_permits: concurrent_permits.max(1),
             treasury,
             status,
             checkpoints,
@@ -89,7 +90,7 @@ impl FlatfileIngestionService {
     }
 
     async fn process_ranges(&self, date_ranges: Vec<DateRange>) {
-        let semaphore = Arc::new(Semaphore::new(self.concurrent_days));
+        let semaphore = Arc::new(Semaphore::new(self.concurrent_permits));
         let planned_days = self.count_planned_days(&date_ranges);
         self.metrics.add_planned_days(planned_days);
         self.status.clear_warnings_matching(|_| true);
@@ -376,7 +377,9 @@ impl FlatfileIngestionService {
             row_count += batch.rows.len() as u64;
             metrics.inc_batches(1);
             metrics.inc_rows(batch.rows.len() as u64);
+            let start = Instant::now();
             greeks_engine.enrich_batch(&mut batch.rows).await;
+            metrics.observe_enrichment(batch.rows.len(), start.elapsed());
             if let Err(e) = storage.lock().unwrap().write_option_trades(&batch) {
                 error!("Failed to write option trades batch: {}", e);
             }

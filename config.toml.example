@@ -80,9 +80,9 @@ diptest_bootstrap_draws = 2000
 # FlatfileSource page size per request. Larger batches reduce HTTP overhead but also increase peak
 # memory because we stage the batch until Greeks + storage have finished with it.
 batch_size = 20000
-# Maximum number of calendar days processed concurrently while backfilling. Enforced via a semaphore
-# shared by equity + option workers, so each day consumes two permits (one per asset class).
-concurrent_days = 4
+# Total worker permits for the flatfile semaphore. Each calendar day consumes two permits
+# (one for equities, one for options), so 4 permits ≈ two days running in parallel.
+concurrent_permits = 4
 # Frequency (milliseconds) at which FlatfileIngestionService updates metrics/TUI progress bars. If
 # you lengthen this, the UI will look stagnant but you’ll cut down on chatter.
 progress_update_ms = 250
@@ -108,10 +108,14 @@ massive_flatfiles_region = "custom"
 massive_flatfiles_bucket = "massive-flatfiles"
 
 # Each range instructs FlatfileIngestionService which UTC window to hydrate. Ranges are inclusive,
-# and the service walks them day-by-day honoring ingest.concurrent_days. Omit end_ts to stream all
+# and the service walks them day-by-day honoring ingest.concurrent_permits. Omit end_ts to stream all
 # future data after start_ts (useful for “follow-the-tail” backfills).
 [[flatfile.date_ranges]]
 start_ts = "2025-10-01T00:00:00Z"
+
+[metrics]
+# Port exposed for Prometheus scraping and the TUI status banner.
+port = 8080
 
 [classifier]
 # Enable the tick-rule fallback for live data when NBBO is missing. Keep this false unless you are

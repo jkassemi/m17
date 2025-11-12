@@ -8,7 +8,7 @@ This system captures trades with NBBO snapshots, classifies aggressors, calculat
 
 ```bash
 cargo build
-cargo run  # Starts orchestrator with WS stub and metrics at http://localhost:9090/metrics
+cargo run  # Starts orchestrator with WS stub and metrics at http://localhost:8080/metrics
 cargo fmt --check
 cargo clippy -- -D warnings
 cargo test

@@ -22,12 +22,18 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, ReadBuf};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::{ReaderStream, StreamReader};
 use trading_calendar::{Market, TradingCalendar};
+
+const FLATFILE_QUEUE_CAPACITY: usize = 100;
+const QUEUE_EQUITY_TRADES: &str = "flatfile_equity_trades";
+const QUEUE_OPTION_TRADES: &str = "flatfile_option_trades";
+const QUEUE_EQUITY_NBBO: &str = "flatfile_equity_nbbo";
+const QUEUE_OPTION_NBBO: &str = "flatfile_option_nbbo";
 
 /// Combined source trait merging ObjectStore, UpdateLoop, and Queryable.
 #[async_trait]
@@ -119,8 +125,9 @@ impl FlatfileSource {
         scope: QueryScope,
         dataset: &'static str,
         label: &'static str,
+        queue_name: &'static str,
     ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>> {
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(FLATFILE_QUEUE_CAPACITY);
         let self_clone = self.clone();
         let scope_clone = scope.clone();
         tokio::spawn(async move {
@@ -146,6 +153,7 @@ impl FlatfileSource {
                         &path,
                         &scope_clone,
                         tx.clone(),
+                        queue_name,
                         self_clone.ingest_batch_size,
                         self_clone.progress_update_ms,
                         self_clone.metrics.clone(),
@@ -164,7 +172,9 @@ impl FlatfileSource {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let local_dir = std::path::PathBuf::from("data");
         let local_path = local_dir.join(path);
-        fs::create_dir_all(local_path.parent().unwrap()).await?;
+        if let Some(parent) = local_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
         let resp = self
             .retry
             .retry_async(|_| async {
@@ -176,9 +186,68 @@ impl FlatfileSource {
                     .await
             })
             .await?;
-        let data = resp.body.collect().await?;
-        fs::write(&local_path, data.into_bytes()).await?;
+        let metrics = self.metrics.clone();
+        let tmp_name = format!(
+            "{}.__partial",
+            local_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("download")
+        );
+        let tmp_path = local_path.with_file_name(tmp_name);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .await?;
+        let mut reader = resp.body.into_async_read();
+        let mut buffer = vec![0u8; 64 * 1024];
+        let download_result: Result<(), std::io::Error> = async {
+            loop {
+                let n = reader.read(&mut buffer).await?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buffer[..n]).await?;
+                if let Some(metrics) = metrics.as_ref() {
+                    metrics.add_downloaded_bytes(n as u64);
+                }
+            }
+            file.flush().await?;
+            Ok(())
+        }
+        .await;
+        if let Err(err) = download_result {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(err.into());
+        }
+        if fs::try_exists(&local_path).await.unwrap_or(false) {
+            let _ = fs::remove_file(&local_path).await;
+        }
+        fs::rename(&tmp_path, &local_path).await?;
         Ok(())
+    }
+
+    async fn local_file_len(&self, path: &str) -> Option<u64> {
+        let local_dir = std::path::PathBuf::from("data");
+        let local_path = local_dir.join(path);
+        if fs::try_exists(&local_path).await.ok()? {
+            if let Ok(meta) = fs::metadata(&local_path).await {
+                return Some(meta.len());
+            }
+        }
+        None
+    }
+
+    async fn local_file_complete(&self, path: &str, expected_len: u64) -> bool {
+        if expected_len == 0 {
+            return false;
+        }
+        match self.local_file_len(path).await {
+            Some(len) => len == expected_len,
+            None => false,
+        }
     }
 
     async fn load_processed(
@@ -314,23 +383,34 @@ impl SourceTrait for FlatfileSource {
                             "us_stocks_sip/trades_v1/{}/{:02}/{}-{:02}-{:02}.csv.gz",
                             year, month, year, month, day
                         );
-                        let exists = self
+                        match self
                             .client
                             .head_object()
                             .bucket(self.config.massive_flatfiles_bucket.clone())
                             .key(&path)
                             .send()
                             .await
-                            .is_ok();
-                        if exists {
-                            if !processed.contains(&path) {
-                                if let Ok(_) = self.download_file(&path).await {
+                        {
+                            Ok(resp) => {
+                                let remote_len = resp.content_length().unwrap_or(0) as u64;
+                                let complete = self.local_file_complete(&path, remote_len).await;
+                                if !complete {
+                                    if let Ok(_) = self.download_file(&path).await {
+                                        if !processed.contains(&path) {
+                                            processed.insert(path.clone());
+                                            let _ = self.append_processed(&path).await;
+                                        }
+                                    }
+                                } else if !processed.contains(&path) {
                                     processed.insert(path.clone());
                                     let _ = self.append_processed(&path).await;
                                 }
                             }
-                        } else if current_date < now_date {
-                            status_parts.push(format!("Missing: {}", current_date));
+                            Err(_) => {
+                                if current_date < now_date {
+                                    status_parts.push(format!("Missing: {}", current_date));
+                                }
+                            }
                         }
                     }
                     current_date += TimeDelta::try_days(1).unwrap();
@@ -355,7 +435,7 @@ impl SourceTrait for FlatfileSource {
         &self,
         scope: QueryScope,
     ) -> Pin<Box<dyn Stream<Item = DataBatch<OptionTrade>> + Send>> {
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(FLATFILE_QUEUE_CAPACITY);
         let self_clone = self.clone();
         let scope_clone = scope.clone();
         tokio::spawn(async move {
@@ -404,7 +484,7 @@ impl SourceTrait for FlatfileSource {
         &self,
         scope: QueryScope,
     ) -> Pin<Box<dyn Stream<Item = DataBatch<EquityTrade>> + Send>> {
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(FLATFILE_QUEUE_CAPACITY);
         let self_clone = self.clone();
         let scope_clone = scope.clone();
         tokio::spawn(async move {
@@ -452,14 +532,42 @@ impl SourceTrait for FlatfileSource {
         &self,
         scope: QueryScope,
     ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>> {
-        self.nbbo_stream_for_dataset(scope, "us_stocks_sip/quotes_v1", "equity")
+        self.nbbo_stream_for_dataset(
+            scope,
+            "us_stocks_sip/quotes_v1",
+            "equity",
+            QUEUE_EQUITY_NBBO,
+        )
     }
 
     async fn get_option_nbbo(
         &self,
         scope: QueryScope,
     ) -> Pin<Box<dyn Stream<Item = DataBatch<Nbbo>> + Send>> {
-        self.nbbo_stream_for_dataset(scope, "us_options_opra/quotes_v1", "options")
+        self.nbbo_stream_for_dataset(
+            scope,
+            "us_options_opra/quotes_v1",
+            "options",
+            QUEUE_OPTION_NBBO,
+        )
+    }
+}
+
+fn record_queue_depth<T>(
+    metrics: &Option<Arc<Metrics>>,
+    queue: &'static str,
+    sender: &mpsc::Sender<DataBatch<T>>,
+    capacity: usize,
+) {
+    if let Some(metrics) = metrics {
+        let depth = capacity.saturating_sub(sender.capacity());
+        metrics.set_queue_depth(queue, depth);
+    }
+}
+
+fn reset_queue_depth(metrics: &Option<Arc<Metrics>>, queue: &'static str) {
+    if let Some(metrics) = metrics {
+        metrics.set_queue_depth(queue, 0);
     }
 }
 
@@ -588,6 +696,18 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                             rows: std::mem::take(&mut batch),
                             meta,
                         });
+                        record_queue_depth(
+                            &metrics,
+                            QUEUE_OPTION_TRADES,
+                            &tx,
+                            FLATFILE_QUEUE_CAPACITY,
+                        );
+                        record_queue_depth(
+                            &metrics,
+                            QUEUE_EQUITY_TRADES,
+                            &tx,
+                            FLATFILE_QUEUE_CAPACITY,
+                        );
                     }
                 }
                 if let Some(progress) = progress.as_ref() {
@@ -611,6 +731,7 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                     schema_version: 1,
                 };
                 let _ = tx.try_send(DataBatch { rows: batch, meta });
+                record_queue_depth(&metrics, QUEUE_EQUITY_TRADES, &tx, FLATFILE_QUEUE_CAPACITY);
             }
 
             if let Some(progress) = progress.as_ref() {
@@ -631,6 +752,7 @@ async fn process_equity_trades_stream<S: SourceTrait>(
             info!("Failed to get stream for path: {}: {:?}", path, e);
         }
     }
+    reset_queue_depth(&metrics, QUEUE_EQUITY_TRADES);
 }
 
 async fn process_nbbo_stream<S: SourceTrait>(
@@ -638,6 +760,7 @@ async fn process_nbbo_stream<S: SourceTrait>(
     path: &str,
     scope: &QueryScope,
     tx: mpsc::Sender<DataBatch<Nbbo>>,
+    queue: &'static str,
     batch_size: usize,
     progress_update_ms: u64,
     metrics: Option<Arc<Metrics>>,
@@ -728,6 +851,7 @@ async fn process_nbbo_stream<S: SourceTrait>(
                             rows: std::mem::take(&mut batch),
                             meta,
                         });
+                        record_queue_depth(&metrics, queue, &tx, FLATFILE_QUEUE_CAPACITY);
                     }
                 }
                 if let Some(progress) = progress.as_ref() {
@@ -750,6 +874,7 @@ async fn process_nbbo_stream<S: SourceTrait>(
                     schema_version: 1,
                 };
                 let _ = tx.try_send(DataBatch { rows: batch, meta });
+                record_queue_depth(&metrics, queue, &tx, FLATFILE_QUEUE_CAPACITY);
             }
 
             if let Some(progress) = progress.as_ref() {
@@ -765,6 +890,7 @@ async fn process_nbbo_stream<S: SourceTrait>(
             eprintln!("Failed to get stream for {}: {}", path, e);
         }
     }
+    reset_queue_depth(&metrics, queue);
 }
 
 fn build_quote_path(dataset: &str, date: NaiveDate) -> String {
@@ -897,6 +1023,7 @@ async fn process_option_trades_stream<S: SourceTrait>(
                     schema_version: 1,
                 };
                 let _ = tx.try_send(DataBatch { rows: batch, meta });
+                record_queue_depth(&metrics, QUEUE_OPTION_TRADES, &tx, FLATFILE_QUEUE_CAPACITY);
             }
 
             if let Some(progress) = progress.as_ref() {
@@ -912,6 +1039,7 @@ async fn process_option_trades_stream<S: SourceTrait>(
             eprintln!("Failed to get stream for {}: {}", path, e);
         }
     }
+    reset_queue_depth(&metrics, QUEUE_OPTION_TRADES);
 }
 
 #[cfg(test)]

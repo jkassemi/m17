@@ -19,7 +19,7 @@ use ratatui::{
 use std::io;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::time::{sleep, Duration};
 
 use metrics::Metrics;
@@ -27,14 +27,20 @@ use metrics::Metrics;
 pub struct Tui {
     metrics: Arc<Metrics>,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    shutdown_rx: watch::Receiver<bool>,
     shutting_down: bool,
 }
 
 impl Tui {
-    pub fn new(metrics: Arc<Metrics>, shutdown_tx: oneshot::Sender<()>) -> Self {
+    pub fn new(
+        metrics: Arc<Metrics>,
+        shutdown_tx: oneshot::Sender<()>,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> Self {
         Self {
             metrics,
             shutdown_tx: Some(shutdown_tx),
+            shutdown_rx,
             shutting_down: false,
         }
     }
@@ -48,6 +54,10 @@ impl Tui {
         let mut terminal = Terminal::new(backend)?;
 
         loop {
+            if *self.shutdown_rx.borrow() {
+                self.shutting_down = true;
+            }
+
             terminal.draw(|f| self.ui(f))?;
 
             if event::poll(Duration::from_millis(50))? {
@@ -65,6 +75,10 @@ impl Tui {
                         break;
                     }
                 }
+            }
+
+            if self.shutting_down {
+                break;
             }
 
             sleep(Duration::from_millis(50)).await;
@@ -142,6 +156,7 @@ impl Tui {
                 .constraints(cf_constraints)
                 .split(chunks[1]);
             for (idx, file) in current_files.iter().enumerate() {
+                let chunk = cf_chunks[idx];
                 let elapsed_ns = (now_ns - file.started_ns).max(1);
                 let read_mb = (file.read as f64) / (1024.0 * 1024.0);
                 let total_mb = (file.total as f64) / (1024.0 * 1024.0);
@@ -156,14 +171,14 @@ impl Tui {
                     0.0
                 }
                 .clamp(0.0, 1.0);
-                let label = if file.total > 0 {
-                    format!(
-                        "{}  {:.1}/{:.1} MB  {:.1} MB/s",
-                        file.name, read_mb, total_mb, throughput_mb_s
-                    )
-                } else {
-                    format!("{}  {:.1} MB read  (unknown total)", file.name, read_mb)
-                };
+                let max_label_len = chunk.width.saturating_sub(4) as usize;
+                let label = Self::format_file_label(
+                    &file.name,
+                    read_mb,
+                    if file.total > 0 { Some(total_mb) } else { None },
+                    throughput_mb_s,
+                    max_label_len,
+                );
                 let title = if current_files.len() == 1 {
                     "Current file".to_string()
                 } else {
@@ -202,6 +217,7 @@ impl Tui {
 
         let batches = self.metrics.ingested_batches();
         let rows = self.metrics.ingested_rows();
+        let metrics_port = self.metrics.metrics_port();
 
         let mut lines = Vec::new();
         lines.push(Line::from(Span::styled(
@@ -210,7 +226,7 @@ impl Tui {
         )));
         lines.push(Line::from("")); // blank line
         lines.push(Line::from(Span::styled(
-            "Metrics Server: Running on 127.0.0.1:9090",
+            format!("Metrics Server: Running on 127.0.0.1:{}", metrics_port),
             Style::default().fg(Color::Green),
         )));
         lines.push(Line::from(Span::styled(
@@ -319,5 +335,42 @@ impl Tui {
             OverallStatus::Warn => Color::Yellow,
             OverallStatus::Crit => Color::Red,
         }
+    }
+
+    fn format_file_label(
+        name: &str,
+        read_mb: f64,
+        total_mb: Option<f64>,
+        throughput_mb_s: f64,
+        max_len: usize,
+    ) -> String {
+        let safe_len = max_len.max(10);
+        let shortened_name = Self::shorten_tail(name, safe_len.saturating_sub(25));
+        let mut label = if let Some(total) = total_mb {
+            format!(
+                "{}  {:.1}/{:.1} MB  {:.1} MB/s",
+                shortened_name, read_mb, total, throughput_mb_s
+            )
+        } else {
+            format!(
+                "{}  {:.1} MB read  (unknown total)",
+                shortened_name, read_mb
+            )
+        };
+        if label.len() > safe_len {
+            label.truncate(safe_len);
+        }
+        label
+    }
+
+    fn shorten_tail(text: &str, max_len: usize) -> String {
+        if text.len() <= max_len {
+            return text.to_string();
+        }
+        if max_len <= 1 {
+            return "…".to_string();
+        }
+        let tail = &text[text.len() - (max_len - 1)..];
+        format!("…{}", tail)
     }
 }

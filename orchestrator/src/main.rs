@@ -19,6 +19,7 @@ use aggregations::AggregationsEngine;
 use chrono::{DateTime, NaiveDate, Utc};
 use classifier::Classifier;
 use core_types::config::AppConfig;
+use core_types::status::{OverallStatus, ServiceStatusHandle, StatusGauge};
 use core_types::types::{Completeness, DataBatch, DataBatchMeta, Quality, Source, Watermark};
 use flatfile_ingestion_service::FlatfileIngestionService;
 use log::info;
@@ -35,6 +36,7 @@ use storage::Storage;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::time::sleep;
 use treasury_ingestion_service::TreasuryIngestionService;
@@ -85,6 +87,8 @@ async fn main() {
         }
     }
     let metrics = Arc::new(Metrics::new());
+    let shutdown_progress = ShutdownProgress::new(metrics.clone());
+    metrics.set_metrics_port(config.metrics.port);
     metrics.spawn_service_metric_task(Duration::from_secs(5));
     let api_key = config
         .ws
@@ -185,7 +189,7 @@ async fn main() {
         nbbo_flatfile.clone(),
         config.greeks.clone(),
         config.greeks.flatfile_underlying_staleness_us,
-        config.ingest.concurrent_days,
+        config.ingest.concurrent_permits,
         treasury_handle.clone(),
     )
     .await;
@@ -201,7 +205,9 @@ async fn main() {
     metrics.set_last_config_reload_ts_ns(now);
 
     // Stub metrics server
-    let listener = TcpListener::bind("127.0.0.1:9090").await.unwrap();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", config.metrics.port))
+        .await
+        .unwrap();
     let metrics_clone = metrics.clone(); // Clone the Arc for the spawned task
     tokio::spawn(async move {
         if let Err(e) = metrics_clone.serve(listener).await {
@@ -254,8 +260,9 @@ async fn main() {
 
     // Launch TUI dashboard
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let mut tui = Tui::new(metrics.clone(), shutdown_tx);
-    tokio::spawn(async move {
+    let (tui_shutdown_tx, tui_shutdown_rx) = watch::channel(false);
+    let mut tui = Tui::new(metrics.clone(), shutdown_tx, tui_shutdown_rx);
+    let tui_handle = tokio::spawn(async move {
         if let Err(e) = tui.run().await {
             eprintln!("TUI error: {}", e);
         }
@@ -277,8 +284,123 @@ async fn main() {
     realtime_service.start();
 
     // Wait for shutdown signal or ctrl_c
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {},
-        _ = shutdown_rx => {},
+    let shutdown_reason = tokio::select! {
+        _ = tokio::signal::ctrl_c() => ShutdownReason::CtrlC,
+        _ = shutdown_rx => ShutdownReason::TuiRequested,
+    };
+    shutdown_progress.set_phase(
+        ShutdownPhase::SignalReceived,
+        Some(shutdown_reason.description().to_string()),
+    );
+
+    shutdown_progress.set_phase(ShutdownPhase::NotifyingTui, None);
+    let _ = tui_shutdown_tx.send(true);
+
+    shutdown_progress.set_phase(ShutdownPhase::WaitingForTuiExit, None);
+    match tui_handle.await {
+        Ok(()) => {
+            shutdown_progress.set_phase(
+                ShutdownPhase::Complete,
+                Some(format!(
+                    "Shutdown complete after {}",
+                    shutdown_reason.description()
+                )),
+            );
+        }
+        Err(e) => {
+            eprintln!("TUI join error: {}", e);
+            shutdown_progress.set_phase(
+                ShutdownPhase::Complete,
+                Some(format!("Shutdown complete with TUI join error: {}", e)),
+            );
+        }
+    }
+}
+
+struct ShutdownProgress {
+    status: ServiceStatusHandle,
+}
+
+impl ShutdownProgress {
+    fn new(metrics: Arc<Metrics>) -> Self {
+        let status = ServiceStatusHandle::new("orchestrator_shutdown");
+        metrics.register_service_status(status.clone());
+        let tracker = Self { status };
+        tracker.set_phase(ShutdownPhase::Running, None);
+        tracker
+    }
+
+    fn set_phase(&self, phase: ShutdownPhase, detail: Option<String>) {
+        let max = (SHUTDOWN_PHASES.len().saturating_sub(1)).max(1);
+        let idx = phase.index();
+        let detail = detail.unwrap_or_else(|| phase.description().to_string());
+        info!("shutdown phase {:?}: {}", phase, detail);
+        let gauge = StatusGauge {
+            label: "shutdown_progress".to_string(),
+            value: idx as f64,
+            max: Some(max as f64),
+            unit: None,
+            details: Some(detail.clone()),
+        };
+        self.status.update(|status| {
+            status.gauges = vec![gauge];
+            status.warnings.retain(|w| !w.starts_with("phase:"));
+            status.warnings.push(format!("phase: {}", detail));
+            status.overall = if matches!(phase, ShutdownPhase::Complete) {
+                OverallStatus::Ok
+            } else {
+                OverallStatus::Warn
+            };
+        });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownPhase {
+    Running,
+    SignalReceived,
+    NotifyingTui,
+    WaitingForTuiExit,
+    Complete,
+}
+
+impl ShutdownPhase {
+    fn description(&self) -> &'static str {
+        match self {
+            ShutdownPhase::Running => "orchestrator running",
+            ShutdownPhase::SignalReceived => "shutdown signal received",
+            ShutdownPhase::NotifyingTui => "notifying TUI to exit",
+            ShutdownPhase::WaitingForTuiExit => "waiting for TUI task to finish",
+            ShutdownPhase::Complete => "shutdown finished",
+        }
+    }
+
+    fn index(&self) -> usize {
+        SHUTDOWN_PHASES
+            .iter()
+            .position(|phase| phase == self)
+            .unwrap_or(0)
+    }
+}
+
+const SHUTDOWN_PHASES: [ShutdownPhase; 5] = [
+    ShutdownPhase::Running,
+    ShutdownPhase::SignalReceived,
+    ShutdownPhase::NotifyingTui,
+    ShutdownPhase::WaitingForTuiExit,
+    ShutdownPhase::Complete,
+];
+
+enum ShutdownReason {
+    CtrlC,
+    TuiRequested,
+}
+
+impl ShutdownReason {
+    fn description(&self) -> &'static str {
+        match self {
+            ShutdownReason::CtrlC => "Ctrl+C",
+            ShutdownReason::TuiRequested => "TUI request",
+        }
     }
 }

@@ -7,7 +7,8 @@ use engine_api::{Engine, EngineError};
 use ledger::{LedgerController, LedgerError};
 use thiserror::Error;
 use trade_flatfile_engine::{
-    FlatfileRuntimeConfig, OptionTradeFlatfileEngine, UnderlyingFlatfileEngine,
+    FlatfileRuntimeConfig, OptionQuoteFlatfileEngine, OptionTradeFlatfileEngine,
+    UnderlyingQuoteFlatfileEngine, UnderlyingTradeFlatfileEngine,
 };
 
 fn main() {
@@ -37,8 +38,14 @@ fn run() -> Result<(), AppError> {
         batch_size: config.flatfile.batch_size,
         progress_update_ms: config.flatfile.progress_update_ms,
     };
-    let option_engine = OptionTradeFlatfileEngine::new(flatfile_cfg.clone(), controller.clone());
-    let underlying_engine = UnderlyingFlatfileEngine::new(flatfile_cfg, controller.clone());
+    let option_trade_engine =
+        OptionTradeFlatfileEngine::new(flatfile_cfg.clone(), controller.clone());
+    let option_quote_engine =
+        OptionQuoteFlatfileEngine::new(flatfile_cfg.clone(), controller.clone());
+    let underlying_trade_engine =
+        UnderlyingTradeFlatfileEngine::new(flatfile_cfg.clone(), controller.clone());
+    let underlying_quote_engine =
+        UnderlyingQuoteFlatfileEngine::new(flatfile_cfg, controller.clone());
 
     println!(
         "m17 orchestrator booted in {:?} mode; ledger state at {:?}",
@@ -60,20 +67,34 @@ fn run() -> Result<(), AppError> {
         config.ledger.max_symbols
     );
 
-    option_engine.start()?;
-    underlying_engine.start()?;
-    let option_health = option_engine.health();
+    option_trade_engine.start()?;
+    option_quote_engine.start()?;
+    underlying_trade_engine.start()?;
+    underlying_quote_engine.start()?;
+    let option_trade_health = option_trade_engine.health();
     println!(
         "option-trade-flatfile status: {:?} ({:?})",
-        option_health.status, option_health.detail
+        option_trade_health.status, option_trade_health.detail
     );
-    let underlying_health = underlying_engine.health();
+    let option_quote_health = option_quote_engine.health();
     println!(
-        "underlying-flatfile status: {:?} ({:?})",
-        underlying_health.status, underlying_health.detail
+        "option-quote-flatfile status: {:?} ({:?})",
+        option_quote_health.status, option_quote_health.detail
     );
-    underlying_engine.stop()?;
-    option_engine.stop()?;
+    let underlying_trade_health = underlying_trade_engine.health();
+    println!(
+        "underlying-trade-flatfile status: {:?} ({:?})",
+        underlying_trade_health.status, underlying_trade_health.detail
+    );
+    let underlying_quote_health = underlying_quote_engine.health();
+    println!(
+        "underlying-quote-flatfile status: {:?} ({:?})",
+        underlying_quote_health.status, underlying_quote_health.detail
+    );
+    underlying_quote_engine.stop()?;
+    underlying_trade_engine.stop()?;
+    option_quote_engine.stop()?;
+    option_trade_engine.stop()?;
 
     // Keep controller alive for the lifetime of engines.
     drop(controller);

@@ -717,7 +717,8 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                                 completeness: Completeness::Complete,
                                 hints: None,
                             },
-                            schema_version: 1,
+                            schema_version: 2,
+                            run_id: None,
                         };
                         let _ = tx.try_send(DataBatch {
                             rows: std::mem::take(&mut batch),
@@ -755,7 +756,8 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                         completeness: Completeness::Complete,
                         hints: None,
                     },
-                    schema_version: 1,
+                    schema_version: 2,
+                    run_id: None,
                 };
                 let _ = tx.try_send(DataBatch { rows: batch, meta });
                 record_queue_depth(&metrics, QUEUE_EQUITY_TRADES, &tx, FLATFILE_QUEUE_CAPACITY);
@@ -885,7 +887,8 @@ async fn process_nbbo_stream<S: SourceTrait>(
                                 completeness: Completeness::Complete,
                                 hints: None,
                             },
-                            schema_version: 1,
+                            schema_version: 2,
+                            run_id: None,
                         };
                         let _ = tx.try_send(DataBatch {
                             rows: std::mem::take(&mut batch),
@@ -911,7 +914,8 @@ async fn process_nbbo_stream<S: SourceTrait>(
                         completeness: Completeness::Complete,
                         hints: None,
                     },
-                    schema_version: 1,
+                    schema_version: 2,
+                    run_id: None,
                 };
                 let _ = tx.try_send(DataBatch { rows: batch, meta });
                 record_queue_depth(&metrics, queue, &tx, FLATFILE_QUEUE_CAPACITY);
@@ -1051,7 +1055,8 @@ async fn process_option_trades_stream<S: SourceTrait>(
                                 completeness: Completeness::Complete,
                                 hints: None,
                             },
-                            schema_version: 1,
+                            schema_version: 2,
+                            run_id: None,
                         };
                         let _ = tx.try_send(DataBatch {
                             rows: std::mem::take(&mut batch),
@@ -1076,7 +1081,8 @@ async fn process_option_trades_stream<S: SourceTrait>(
                         completeness: Completeness::Complete,
                         hints: None,
                     },
-                    schema_version: 1,
+                    schema_version: 2,
+                    run_id: None,
                 };
                 let _ = tx.try_send(DataBatch { rows: batch, meta });
                 record_queue_depth(&metrics, QUEUE_OPTION_TRADES, &tx, FLATFILE_QUEUE_CAPACITY);
@@ -1136,7 +1142,8 @@ mod tests {
                     completeness: Completeness::Complete,
                     hints: None,
                 },
-                schema_version: 1,
+                schema_version: 2,
+                run_id: None,
             },
         }
     }

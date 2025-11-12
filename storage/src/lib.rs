@@ -8,7 +8,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{Int32Type, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use chrono::{DateTime, NaiveDate};
+use chrono::{DateTime, Datelike, NaiveDate};
 use core_types::schema::{
     aggregation_schema, equity_trade_schema, nbbo_schema, option_trade_schema,
 };
@@ -22,8 +22,9 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -39,6 +40,8 @@ pub enum StorageError {
     SchemaVersionMismatch,
     #[error("Corrupt WAL entry: {0}")]
     WalCorrupt(String),
+    #[error("Manifest error: {0}")]
+    Manifest(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +61,7 @@ struct WalMeta {
     watermark_completeness: Completeness,
     watermark_hints: Option<String>,
     schema_version: u16,
+    run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +119,7 @@ impl From<&DataBatchMeta> for WalMeta {
             watermark_completeness: meta.watermark.completeness.clone(),
             watermark_hints: meta.watermark.hints.clone(),
             schema_version: meta.schema_version,
+            run_id: meta.run_id.clone(),
         }
     }
 }
@@ -130,25 +135,24 @@ impl From<WalMeta> for DataBatchMeta {
                 hints: meta.watermark_hints,
             },
             schema_version: meta.schema_version,
+            run_id: meta.run_id,
         }
     }
 }
 
 /// Storage handles Parquet I/O with partitioning and deduplication.
 pub struct Storage {
-    config: core_types::config::StorageConfig,
     base_path: PathBuf,
     dedup_cache: HashMap<String, LruCache<String, ()>>,
-    writers: Mutex<HashMap<String, PartitionWriter>>,
+    manifest_wip: Mutex<HashMap<String, ManifestAccumulator>>,
 }
 
 impl Storage {
     pub fn new(config: core_types::config::StorageConfig) -> Self {
         let mut storage = Self {
             base_path: PathBuf::from(&config.paths.get("base").unwrap_or(&"data".to_string())),
-            config,
             dedup_cache: HashMap::new(),
-            writers: Mutex::new(HashMap::new()),
+            manifest_wip: Mutex::new(HashMap::new()),
         };
         if let Err(err) = storage.replay_wal() {
             panic!("failed to replay WAL: {}", err);
@@ -157,10 +161,6 @@ impl Storage {
     }
 
     pub fn flush_all(&self) -> Result<(), StorageError> {
-        let mut writers = self.writers.lock().unwrap();
-        for writer in writers.values_mut() {
-            writer.close()?;
-        }
         Ok(())
     }
 
@@ -231,10 +231,24 @@ impl Storage {
         let meta: DataBatchMeta = entry.meta.into();
         match entry.payload {
             WalPayload::OptionTrades { trades } => {
-                self.write_option_partition_from_rows(&entry.partition, trades, &meta, false)?;
+                let manifest_date = extract_date_from_partition(&entry.partition);
+                self.write_option_partition_from_rows(
+                    &entry.partition,
+                    trades,
+                    &meta,
+                    false,
+                    manifest_date,
+                )?;
             }
             WalPayload::EquityTrades { trades } => {
-                self.write_equity_partition_from_rows(&entry.partition, trades, &meta, false)?;
+                let manifest_date = extract_date_from_partition(&entry.partition);
+                self.write_equity_partition_from_rows(
+                    &entry.partition,
+                    trades,
+                    &meta,
+                    false,
+                    manifest_date,
+                )?;
             }
             WalPayload::Nbbo { quotes } => {
                 self.write_nbbo_from_rows(&entry.partition, quotes, &meta, false)?;
@@ -246,32 +260,12 @@ impl Storage {
         Ok(())
     }
 
-    fn partition_dir(&self, rel_partition: &str) -> String {
+    fn partition_dir(&self, rel_partition: &str) -> PathBuf {
         if rel_partition.is_empty() {
-            self.base_path.display().to_string()
+            self.base_path.clone()
         } else {
-            format!("{}/{}", self.base_path.display(), rel_partition)
+            self.base_path.join(rel_partition)
         }
-    }
-
-    fn write_with_pooled_writer(
-        &self,
-        rel_partition: &str,
-        record_batch: &RecordBatch,
-        target_bytes: u64,
-    ) -> Result<(), StorageError> {
-        let partition_dir = self.partition_dir(rel_partition);
-        std::fs::create_dir_all(&partition_dir)?;
-        {
-            let mut writers = self.writers.lock().unwrap();
-            let pw = writers.entry(partition_dir.clone()).or_insert_with(|| {
-                PartitionWriter::new(&partition_dir, record_batch.schema())
-                    .expect("failed to create partition writer")
-            });
-            pw.write(record_batch)?;
-            rotate_if_needed(pw, target_bytes)?;
-        }
-        Ok(())
     }
 
     fn write_option_partition_from_rows(
@@ -280,6 +274,7 @@ impl Storage {
         trades: Vec<OptionTrade>,
         meta: &DataBatchMeta,
         log_to_wal: bool,
+        manifest_date: Option<NaiveDate>,
     ) -> Result<(), StorageError> {
         if trades.is_empty() {
             return Ok(());
@@ -293,8 +288,12 @@ impl Storage {
         } else {
             None
         };
-        let target_bytes = self.config.file_size_mb_target.saturating_mul(1024 * 1024);
-        self.write_with_pooled_writer(rel_partition, &record_batch, target_bytes)?;
+        let file_path = self.write_partitioned(rel_partition, &record_batch)?;
+        if let (Some(run_id), Some(date)) = (meta.run_id.as_deref(), manifest_date) {
+            let file =
+                ManifestFile::from_option_trades(self.relative_data_path(&file_path), &trades);
+            self.record_manifest_file("options_trades", date, run_id, meta.schema_version, file);
+        }
         if let Some(path) = wal_path {
             self.commit_wal_entry(path)?;
         }
@@ -307,6 +306,7 @@ impl Storage {
         trades: Vec<EquityTrade>,
         meta: &DataBatchMeta,
         log_to_wal: bool,
+        manifest_date: Option<NaiveDate>,
     ) -> Result<(), StorageError> {
         if trades.is_empty() {
             return Ok(());
@@ -320,8 +320,12 @@ impl Storage {
         } else {
             None
         };
-        let target_bytes = self.config.file_size_mb_target.saturating_mul(1024 * 1024);
-        self.write_with_pooled_writer(rel_partition, &record_batch, target_bytes)?;
+        let file_path = self.write_partitioned(rel_partition, &record_batch)?;
+        if let (Some(run_id), Some(date)) = (meta.run_id.as_deref(), manifest_date) {
+            let file =
+                ManifestFile::from_equity_trades(self.relative_data_path(&file_path), &trades);
+            self.record_manifest_file("equity_trades", date, run_id, meta.schema_version, file);
+        }
         if let Some(path) = wal_path {
             self.commit_wal_entry(path)?;
         }
@@ -345,8 +349,7 @@ impl Storage {
         } else {
             None
         };
-        let target_bytes = self.config.file_size_mb_target.saturating_mul(1024 * 1024);
-        self.write_with_pooled_writer(rel_partition, &record_batch, target_bytes)?;
+        let _ = self.write_partitioned(rel_partition, &record_batch)?;
         if let Some(path) = wal_path {
             self.commit_wal_entry(path)?;
         }
@@ -372,7 +375,7 @@ impl Storage {
         } else {
             None
         };
-        self.write_partitioned(rel_partition, &record_batch)?;
+        let _ = self.write_partitioned(rel_partition, &record_batch)?;
         if let Some(path) = wal_path {
             self.commit_wal_entry(path)?;
         }
@@ -431,7 +434,13 @@ impl Storage {
             }
             for (prefix, trades) in per_prefix {
                 let rel_partition = format!("options_trades/dt={}/root={}/", dt_str, prefix);
-                self.write_option_partition_from_rows(&rel_partition, trades, &batch.meta, true)?;
+                self.write_option_partition_from_rows(
+                    &rel_partition,
+                    trades,
+                    &batch.meta,
+                    true,
+                    Some(date),
+                )?;
             }
         }
         Ok(())
@@ -495,7 +504,13 @@ impl Storage {
             for (prefix, trades) in per_prefix {
                 let rel_partition =
                     format!("equity_trades/dt={}/symbol_prefix={}/", dt_str, prefix);
-                self.write_equity_partition_from_rows(&rel_partition, trades, &batch.meta, true)?;
+                self.write_equity_partition_from_rows(
+                    &rel_partition,
+                    trades,
+                    &batch.meta,
+                    true,
+                    Some(date),
+                )?;
             }
         }
         Ok(())
@@ -589,10 +604,10 @@ impl Storage {
         &self,
         rel_partition: &str,
         record_batch: &RecordBatch,
-    ) -> Result<(), StorageError> {
+    ) -> Result<PathBuf, StorageError> {
         let partition_dir = self.partition_dir(rel_partition);
         std::fs::create_dir_all(&partition_dir)?;
-        let file_path = format!("{}data_{}.parquet", partition_dir, Uuid::new_v4());
+        let file_path = partition_dir.join(format!("data_{}.parquet", Uuid::new_v4()));
         let file = std::fs::File::create(&file_path)?;
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(Default::default()))
@@ -600,6 +615,72 @@ impl Storage {
         let mut writer = ArrowWriter::try_new(file, record_batch.schema(), Some(props))?;
         writer.write(record_batch)?;
         writer.close()?;
+        Ok(file_path)
+    }
+
+    fn record_manifest_file(
+        &self,
+        dataset: &str,
+        date: NaiveDate,
+        run_id: &str,
+        schema_version: u16,
+        file: ManifestFile,
+    ) {
+        let key = manifest_key(dataset, date, run_id);
+        let mut guard = self.manifest_wip.lock().unwrap();
+        let entry = guard
+            .entry(key)
+            .or_insert_with(|| ManifestAccumulator::new(dataset, date, run_id, schema_version));
+        entry.files.push(file);
+    }
+
+    fn persist_manifest(&self, acc: ManifestAccumulator) -> Result<(), StorageError> {
+        let manifest_dir = self
+            .base_path
+            .join("manifests")
+            .join(&acc.dataset)
+            .join(format!("{:04}", acc.date.year()))
+            .join(format!("{:02}", acc.date.month()))
+            .join(format!("{:02}", acc.date.day()));
+        std::fs::create_dir_all(&manifest_dir)?;
+        let manifest_path = manifest_dir.join(format!("manifest-{}.json", acc.run_id));
+        let manifest_doc = DatasetManifest {
+            dataset: acc.dataset,
+            date: acc.date.format("%Y-%m-%d").to_string(),
+            run_id: acc.run_id,
+            schema_version: acc.schema_version,
+            generated_ns: current_time_ns(),
+            files: acc.files,
+        };
+        let file = std::fs::File::create(&manifest_path)?;
+        serde_json::to_writer_pretty(file, &manifest_doc)
+            .map_err(|err| StorageError::Manifest(err.to_string()))
+    }
+
+    fn relative_data_path(&self, path: &Path) -> String {
+        path.strip_prefix(&self.base_path)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    pub fn finalize_manifest(
+        &self,
+        dataset: &str,
+        date: NaiveDate,
+        run_id: &str,
+    ) -> Result<(), StorageError> {
+        let key = manifest_key(dataset, date, run_id);
+        let accumulator = {
+            let mut guard = self.manifest_wip.lock().unwrap();
+            guard.remove(&key)
+        };
+        if let Some(acc) = accumulator {
+            if acc.files.is_empty() {
+                return Ok(());
+            }
+            self.persist_manifest(acc)?;
+        }
         Ok(())
     }
 
@@ -632,12 +713,6 @@ impl Storage {
         let mut nbbo_age_us: Vec<Option<u32>> = Vec::new();
         let mut nbbo_state = Vec::new();
         let mut tick_size_used = Vec::new();
-        let mut delta = Vec::new();
-        let mut gamma = Vec::new();
-        let mut vega = Vec::new();
-        let mut theta = Vec::new();
-        let mut iv = Vec::new();
-        let mut greeks_flags = Vec::new();
         let mut source = Vec::new();
         let mut quality = Vec::new();
         let mut watermark_ts_ns = Vec::new();
@@ -667,12 +742,6 @@ impl Storage {
             nbbo_age_us.push(trade.nbbo_age_us);
             nbbo_state.push(format!("{:?}", trade.nbbo_state));
             tick_size_used.push(trade.tick_size_used);
-            delta.push(trade.delta);
-            gamma.push(trade.gamma);
-            vega.push(trade.vega);
-            theta.push(trade.theta);
-            iv.push(trade.iv);
-            greeks_flags.push(trade.greeks_flags);
             source.push(format!("{:?}", meta.source));
             quality.push(format!("{:?}", meta.quality));
             watermark_ts_ns.push(meta.watermark.watermark_ts_ns);
@@ -711,12 +780,6 @@ impl Storage {
             Arc::new(UInt32Array::from(nbbo_age_us)),
             Arc::new(StringArray::from(nbbo_state)),
             Arc::new(Float64Array::from(tick_size_used)),
-            Arc::new(Float64Array::from(delta)),
-            Arc::new(Float64Array::from(gamma)),
-            Arc::new(Float64Array::from(vega)),
-            Arc::new(Float64Array::from(theta)),
-            Arc::new(Float64Array::from(iv)),
-            Arc::new(UInt32Array::from(greeks_flags)),
             Arc::new(StringArray::from(source)),
             Arc::new(StringArray::from(quality)),
             Arc::new(Int64Array::from(watermark_ts_ns)),
@@ -1381,81 +1444,168 @@ impl Storage {
     }
 }
 
-fn rotate_if_needed(pw: &mut PartitionWriter, target_bytes: u64) -> Result<(), StorageError> {
-    if target_bytes > 0 && pw.current_size_bytes()? >= target_bytes as u64 {
-        pw.rotate()?;
-    }
-    Ok(())
+#[derive(Clone, Serialize)]
+struct ManifestFile {
+    relative_path: String,
+    rows: usize,
+    min_ts_ns: i64,
+    max_ts_ns: i64,
+    min_trade_uid: Option<String>,
+    max_trade_uid: Option<String>,
 }
 
-struct PartitionWriter {
-    partition_dir: String,
-    file_path: PathBuf,
-    writer: Option<ArrowWriter<std::fs::File>>,
-    schema: SchemaRef,
+impl ManifestFile {
+    fn new(
+        relative_path: String,
+        rows: usize,
+        min_ts_ns: i64,
+        max_ts_ns: i64,
+        min_uid: Option<[u8; 16]>,
+        max_uid: Option<[u8; 16]>,
+    ) -> Self {
+        Self {
+            relative_path,
+            rows,
+            min_ts_ns,
+            max_ts_ns,
+            min_trade_uid: min_uid.as_ref().map(encode_uid),
+            max_trade_uid: max_uid.as_ref().map(encode_uid),
+        }
+    }
+
+    fn from_option_trades(relative_path: String, trades: &[OptionTrade]) -> Self {
+        let (min_ts, max_ts) = ts_bounds(trades.iter().map(|t| t.trade_ts_ns));
+        let (min_uid, max_uid) = uid_bounds(trades.iter().map(|t| t.trade_uid));
+        Self::new(
+            relative_path,
+            trades.len(),
+            min_ts,
+            max_ts,
+            min_uid,
+            max_uid,
+        )
+    }
+
+    fn from_equity_trades(relative_path: String, trades: &[EquityTrade]) -> Self {
+        let (min_ts, max_ts) = ts_bounds(trades.iter().map(|t| t.trade_ts_ns));
+        let (min_uid, max_uid) = uid_bounds(trades.iter().map(|t| t.trade_uid));
+        Self::new(
+            relative_path,
+            trades.len(),
+            min_ts,
+            max_ts,
+            min_uid,
+            max_uid,
+        )
+    }
 }
 
-impl PartitionWriter {
-    fn new(partition_dir: &str, schema: SchemaRef) -> Result<Self, StorageError> {
-        let dir = partition_dir.to_string();
-        let file_path = PathBuf::from(format!("{}data_{}.parquet", partition_dir, Uuid::new_v4()));
-        let file = std::fs::File::create(&file_path)?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(Default::default()))
-            .build();
-        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
-        Ok(Self {
-            partition_dir: dir,
-            file_path,
-            writer: Some(writer),
-            schema,
-        })
-    }
+#[derive(Serialize)]
+struct DatasetManifest {
+    dataset: String,
+    date: String,
+    run_id: String,
+    schema_version: u16,
+    generated_ns: i64,
+    files: Vec<ManifestFile>,
+}
 
-    fn ensure_open(&mut self) -> Result<(), StorageError> {
-        if self.writer.is_none() {
-            let new_path = PathBuf::from(format!(
-                "{}data_{}.parquet",
-                self.partition_dir,
-                Uuid::new_v4()
-            ));
-            let file = std::fs::File::create(&new_path)?;
-            let props = WriterProperties::builder()
-                .set_compression(Compression::ZSTD(Default::default()))
-                .build();
-            let writer = ArrowWriter::try_new(file, self.schema.clone(), Some(props))?;
-            self.file_path = new_path;
-            self.writer = Some(writer);
+struct ManifestAccumulator {
+    dataset: String,
+    date: NaiveDate,
+    run_id: String,
+    schema_version: u16,
+    files: Vec<ManifestFile>,
+}
+
+impl ManifestAccumulator {
+    fn new(dataset: &str, date: NaiveDate, run_id: &str, schema_version: u16) -> Self {
+        Self {
+            dataset: dataset.to_string(),
+            date,
+            run_id: run_id.to_string(),
+            schema_version,
+            files: Vec::new(),
         }
-        Ok(())
     }
+}
 
-    fn write(&mut self, batch: &RecordBatch) -> Result<(), StorageError> {
-        self.ensure_open()?;
-        if let Some(writer) = &mut self.writer {
-            writer.write(batch)?;
+fn manifest_key(dataset: &str, date: NaiveDate, run_id: &str) -> String {
+    format!("{}:{}:{}", dataset, date.format("%Y-%m-%d"), run_id)
+}
+
+fn encode_uid(uid: &[u8; 16]) -> String {
+    use std::fmt::Write as _;
+    let mut buf = String::with_capacity(32);
+    for byte in uid {
+        let _ = write!(&mut buf, "{:02x}", byte);
+    }
+    buf
+}
+
+fn current_time_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64
+}
+
+fn extract_date_from_partition(partition: &str) -> Option<NaiveDate> {
+    for segment in partition.split('/') {
+        if let Some(rest) = segment.strip_prefix("dt=") {
+            if let Ok(date) = NaiveDate::parse_from_str(rest, "%Y-%m-%d") {
+                return Some(date);
+            }
         }
-        Ok(())
     }
+    None
+}
 
-    fn current_size_bytes(&self) -> Result<u64, StorageError> {
-        let meta = std::fs::metadata(&self.file_path)?;
-        Ok(meta.len())
-    }
-
-    fn rotate(&mut self) -> Result<(), StorageError> {
-        self.close()?;
-        // Open a new file for continued writes
-        self.ensure_open()?;
-        Ok(())
-    }
-
-    fn close(&mut self) -> Result<(), StorageError> {
-        if let Some(writer) = self.writer.take() {
-            writer.close()?; // ensures footer is written
+fn ts_bounds<I>(iter: I) -> (i64, i64)
+where
+    I: Iterator<Item = i64>,
+{
+    let mut min = i64::MAX;
+    let mut max = i64::MIN;
+    for ts in iter {
+        if ts < min {
+            min = ts;
         }
-        Ok(())
+        if ts > max {
+            max = ts;
+        }
     }
+    if min == i64::MAX {
+        (0, 0)
+    } else {
+        (min, max)
+    }
+}
+
+fn uid_bounds<I>(iter: I) -> (Option<[u8; 16]>, Option<[u8; 16]>)
+where
+    I: Iterator<Item = [u8; 16]>,
+{
+    let mut min_val: Option<(u128, [u8; 16])> = None;
+    let mut max_val: Option<(u128, [u8; 16])> = None;
+    for uid in iter {
+        let val = u128::from_le_bytes(uid);
+        if min_val
+            .as_ref()
+            .map(|(existing, _)| val < *existing)
+            .unwrap_or(true)
+        {
+            min_val = Some((val, uid));
+        }
+        if max_val
+            .as_ref()
+            .map(|(existing, _)| val > *existing)
+            .unwrap_or(true)
+        {
+            max_val = Some((val, uid));
+        }
+    }
+    (min_val.map(|(_, uid)| uid), max_val.map(|(_, uid)| uid))
 }
 
 #[cfg(test)]
@@ -1525,6 +1675,7 @@ mod tests {
                 hints: None,
             },
             schema_version: 2,
+            run_id: None,
         };
         let batch = DataBatch {
             rows: vec![trade],
@@ -1603,6 +1754,7 @@ mod tests {
                 hints: None,
             },
             schema_version: 2,
+            run_id: None,
         };
 
         // First batch

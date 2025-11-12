@@ -182,6 +182,7 @@ pub struct DataBatchMeta {
     pub quality: Quality,
     pub watermark: Watermark,
     pub schema_version: u16,
+    pub run_id: Option<String>,
 }
 
 /// Aggregated feature row per window.

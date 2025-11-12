@@ -17,3 +17,4 @@ chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
 arrow = "57.0"
 parquet = { version = "57.0", features = ["arrow"] }
+uuid = { version = "1.18", features = ["v4"] }

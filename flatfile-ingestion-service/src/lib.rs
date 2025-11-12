@@ -15,6 +15,7 @@ use std::time::Instant;
 use storage::Storage;
 use tokio::sync::{OwnedSemaphorePermit, RwLock as TokioRwLock, Semaphore};
 use treasury_ingestion_service::TreasuryServiceHandle;
+use uuid::Uuid;
 
 mod checkpoint;
 use checkpoint::CheckpointManager;
@@ -239,11 +240,13 @@ impl FlatfileIngestionService {
         checkpoint: Arc<CheckpointManager>,
     ) {
         info!("Processing equity day: {}", date.format("%Y-%m-%d"));
+        let run_id = format!("raw-equities-{}-{}", date.format("%Y%m%d"), Uuid::new_v4());
         let mut stream = source.get_equity_trades(scope).await;
         let mut batch_count = 0u64;
         let mut row_count = 0u64;
         let mut progress = build_progress_map(checkpoint.load(EQUITY_DATASET, date));
         while let Some(mut batch) = stream.next().await {
+            batch.meta.run_id = Some(run_id.clone());
             let mut persist_needed = false;
             batch.rows.retain(|trade| {
                 let hour = hour_from_ts_ns(trade.trade_ts_ns);
@@ -280,6 +283,17 @@ impl FlatfileIngestionService {
             batch_count,
             row_count
         ));
+        if let Err(err) = storage
+            .lock()
+            .unwrap()
+            .finalize_manifest(EQUITY_DATASET, date, &run_id)
+        {
+            error!(
+                "Failed to finalize equity manifest for {}: {}",
+                date.format("%Y-%m-%d"),
+                err
+            );
+        }
     }
 
     async fn process_options_day(
@@ -297,6 +311,7 @@ impl FlatfileIngestionService {
         checkpoint: Arc<CheckpointManager>,
     ) {
         info!("Seeding NBBO for options day: {}", date.format("%Y-%m-%d"));
+        let run_id = format!("raw-options-{}-{}", date.format("%Y%m%d"), Uuid::new_v4());
         let mut nbbo_stream = source.get_nbbo(scope.clone()).await;
         let mut last_ts = None;
         while let Some(batch) = nbbo_stream.next().await {
@@ -376,6 +391,7 @@ impl FlatfileIngestionService {
         let mut row_count = 0u64;
         let mut progress = build_progress_map(checkpoint.load(OPTIONS_DATASET, date));
         while let Some(mut batch) = stream.next().await {
+            batch.meta.run_id = Some(run_id.clone());
             let mut persist_needed = false;
             batch.rows.retain(|trade| {
                 let symbol = if trade.underlying.is_empty() {
@@ -420,6 +436,17 @@ impl FlatfileIngestionService {
             batch_count,
             row_count
         ));
+        if let Err(err) = storage
+            .lock()
+            .unwrap()
+            .finalize_manifest(OPTIONS_DATASET, date, &run_id)
+        {
+            error!(
+                "Failed to finalize options manifest for {}: {}",
+                date.format("%Y-%m-%d"),
+                err
+            );
+        }
     }
 }
 

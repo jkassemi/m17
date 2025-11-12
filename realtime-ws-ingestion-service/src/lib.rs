@@ -336,7 +336,8 @@ async fn persist_realtime_options(
             completeness: Completeness::Unknown,
             hints: None,
         },
-        schema_version: 1,
+        schema_version: 2,
+        run_id: None,
     };
     let batch = DataBatch {
         rows: std::mem::take(rows),

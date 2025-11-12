@@ -163,6 +163,7 @@ async fn main() {
                                     hints: None,
                                 },
                                 schema_version: 1,
+                                run_id: None,
                             },
                         };
                         if let Err(e) = storage_clone.lock().unwrap().write_aggregations(&batch) {

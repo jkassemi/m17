@@ -10,8 +10,8 @@ Living task list that captures the outstanding work needed to fully separate Gre
 
 ## Derived Enrichment Pipeline (Top Priority)
 
-- [ ] **Greeks-only derivation worker:** create a dedicated service that consumes raw-day tasks, streams parquet rows, runs GreeksEngine, and writes slim derived parquet keyed by `trade_uid`. (NBBO overlays stay inline with trade ingestion.)
-- [ ] **Enrichment state machine:** persist `checkpoints/enrichment/<dataset>/<date>.json` with `{Pending, InFlight, Blocked(dep_missing), Published}` plus the active `run_id`.
+- [x] **Greeks-only derivation worker:** create a dedicated service (`greeks-enrichment-service`) that consumes raw-day tasks, streams parquet rows, runs GreeksEngine, and writes slim derived parquet keyed by `trade_uid`. (NBBO overlays stay inline with trade ingestion.)
+- [x] **Enrichment state machine:** persist `checkpoints/enrichment/<dataset>/<date>.json` with `{Pending, InFlight, Blocked(dep_missing), Published}` plus the active `run_id`.
 - [ ] **Manual rerun workflow:** codify the operator-triggered treasury rerun (no automatic NBBO refresh) so flagged days can be rebuilt on demand without editing config by hand.
 
 ## Operator Visibility & Alerts (Next After Worker/State Machine)

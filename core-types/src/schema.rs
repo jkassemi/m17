@@ -267,3 +267,31 @@ pub fn aggregation_schema() -> Schema {
     }
     Schema::new(fields)
 }
+
+/// Slim overlay schema for derived Greeks outputs.
+pub fn greeks_overlay_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("trade_uid", DataType::FixedSizeBinary(16), false),
+        Field::new("trade_ts_ns", DataType::Int64, false),
+        Field::new("contract", DataType::Utf8, false),
+        Field::new("underlying", DataType::Utf8, false),
+        Field::new("delta", DataType::Float64, true),
+        Field::new("gamma", DataType::Float64, true),
+        Field::new("vega", DataType::Float64, true),
+        Field::new("theta", DataType::Float64, true),
+        Field::new("iv", DataType::Float64, true),
+        Field::new("greeks_flags", DataType::UInt32, false),
+        Field::new("nbbo_bid", DataType::Float64, true),
+        Field::new("nbbo_ask", DataType::Float64, true),
+        Field::new("nbbo_bid_sz", DataType::UInt32, true),
+        Field::new("nbbo_ask_sz", DataType::UInt32, true),
+        Field::new("nbbo_ts_ns", DataType::Int64, true),
+        Field::new("nbbo_age_us", DataType::UInt32, true),
+        Field::new("nbbo_state", DataType::Utf8, true),
+        Field::new("engine_version", DataType::Utf8, false),
+        Field::new("treasury_curve_date", DataType::Utf8, true),
+        Field::new("treasury_curve_source_date", DataType::Utf8, true),
+        Field::new("enriched_at_ns", DataType::Int64, false),
+        Field::new("run_id", DataType::Utf8, false),
+    ])
+}

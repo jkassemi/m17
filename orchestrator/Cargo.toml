@@ -27,3 +27,4 @@ serde = { version = "1.0", features = ["derive"] }
 treasury-ingestion-service = { path = "../treasury-ingestion-service" }
 options-universe-ingestion-service = { path = "../options-universe-ingestion-service" }
 realtime-ws-ingestion-service = { path = "../realtime-ws-ingestion-service" }
+greeks-enrichment-service = { path = "../greeks-enrichment-service" }

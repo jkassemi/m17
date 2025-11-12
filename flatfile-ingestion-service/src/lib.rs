@@ -2,10 +2,11 @@
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use core_types::config::{DateRange, FlatfileConfig, GreeksConfig, IngestConfig};
 use core_types::status::{OverallStatus, ServiceStatusHandle, StatusGauge};
-use core_types::types::QueryScope;
+use core_types::types::{EnrichmentDataset, QueryScope};
 use flatfile_source::{FlatfileSource, SourceTrait};
 use futures::StreamExt;
 use greeks_engine::GreeksEngine;
+use greeks_enrichment_service::{GreeksEnrichmentHandle, GreeksEnrichmentTask};
 use log::{error, info};
 use metrics::Metrics;
 use nbbo_cache::NbboStore;
@@ -35,6 +36,7 @@ pub struct FlatfileIngestionService {
     treasury: TreasuryServiceHandle,
     status: ServiceStatusHandle,
     checkpoints: Arc<CheckpointManager>,
+    greeks_handle: Option<GreeksEnrichmentHandle>,
 }
 
 impl FlatfileIngestionService {
@@ -49,6 +51,7 @@ impl FlatfileIngestionService {
         flatfile_staleness_us: u32,
         concurrent_permits: usize,
         treasury: TreasuryServiceHandle,
+        greeks_handle: Option<GreeksEnrichmentHandle>,
     ) -> Self {
         let source = FlatfileSource::new(
             flatfile_cfg,
@@ -72,6 +75,7 @@ impl FlatfileIngestionService {
             treasury,
             status,
             checkpoints,
+            greeks_handle,
         }
     }
 
@@ -153,6 +157,7 @@ impl FlatfileIngestionService {
             let treasury = self.treasury.clone();
             let status_opt = status.clone();
             let checkpoint_opt = checkpoint_manager.clone();
+            let greeks_handle = self.greeks_handle.clone();
             tokio::spawn(async move {
                 Self::process_options_day(
                     current_date,
@@ -167,6 +172,7 @@ impl FlatfileIngestionService {
                     treasury,
                     status_opt,
                     checkpoint_opt,
+                    greeks_handle,
                 )
                 .await;
             });
@@ -309,6 +315,7 @@ impl FlatfileIngestionService {
         treasury: TreasuryServiceHandle,
         status: ServiceStatusHandle,
         checkpoint: Arc<CheckpointManager>,
+        greeks_handle: Option<GreeksEnrichmentHandle>,
     ) {
         info!("Seeding NBBO for options day: {}", date.format("%Y-%m-%d"));
         let run_id = format!("raw-options-{}-{}", date.format("%Y%m%d"), Uuid::new_v4());
@@ -446,6 +453,23 @@ impl FlatfileIngestionService {
                 date.format("%Y-%m-%d"),
                 err
             );
+        }
+        if let Some(handle) = greeks_handle {
+            if let Err(err) = handle
+                .enqueue(GreeksEnrichmentTask::new(
+                    EnrichmentDataset::Options,
+                    date,
+                    run_id.clone(),
+                ))
+                .await
+            {
+                error!(
+                    "Failed to enqueue Greeks enrichment for {} run {}: {}",
+                    date.format("%Y-%m-%d"),
+                    run_id,
+                    err
+                );
+            }
         }
     }
 }

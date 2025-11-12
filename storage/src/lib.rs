@@ -10,11 +10,12 @@ use arrow::datatypes::{Int32Type, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Datelike, NaiveDate};
 use core_types::schema::{
-    aggregation_schema, equity_trade_schema, nbbo_schema, option_trade_schema,
+    aggregation_schema, equity_trade_schema, greeks_overlay_schema, nbbo_schema,
+    option_trade_schema,
 };
 use core_types::types::{
-    AggregationRow, Completeness, DataBatch, DataBatchMeta, EquityTrade, Nbbo, OptionTrade,
-    Quality, Source, Watermark,
+    AggregationRow, Completeness, DataBatch, DataBatchMeta, EnrichmentDataset, EquityTrade,
+    GreeksOverlayRow, Nbbo, OptionTrade, Quality, Source, Watermark,
 };
 use lru::LruCache;
 use parquet::arrow::ArrowWriter;
@@ -27,6 +28,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
+
+const GREEKS_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Error, Debug)]
 pub enum StorageError {
@@ -108,6 +111,17 @@ fn instrument_partition_prefix(instrument: &str) -> String {
     } else {
         normalize_prefix(instrument, 2)
     }
+}
+
+fn greeks_partition_path(dataset: EnrichmentDataset, date: NaiveDate, run_id: &str) -> String {
+    format!(
+        "{}/dt={:04}/{:02}/{:02}/run_id={}/",
+        dataset.partition_root(),
+        date.year(),
+        date.month(),
+        date.day(),
+        run_id
+    )
 }
 
 impl From<&DataBatchMeta> for WalMeta {
@@ -380,6 +394,45 @@ impl Storage {
             self.commit_wal_entry(path)?;
         }
         Ok(())
+    }
+
+    fn write_greeks_partition(
+        &mut self,
+        rel_partition: &str,
+        rows: &[GreeksOverlayRow],
+        dataset: EnrichmentDataset,
+        date: NaiveDate,
+        run_id: &str,
+    ) -> Result<(), StorageError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let record_batch = self.greeks_overlays_to_record_batch(rows)?;
+        let file_path = self.write_partitioned(rel_partition, &record_batch)?;
+        let file = ManifestFile::from_greeks_overlays(self.relative_data_path(&file_path), rows);
+        self.record_manifest_file(
+            dataset.dataset_name(),
+            date,
+            run_id,
+            GREEKS_SCHEMA_VERSION,
+            file,
+        );
+        Ok(())
+    }
+
+    /// Write derived Greeks overlays for a given dataset/day/run.
+    pub fn write_greeks_overlays(
+        &mut self,
+        dataset: EnrichmentDataset,
+        date: NaiveDate,
+        run_id: &str,
+        rows: &[GreeksOverlayRow],
+    ) -> Result<(), StorageError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let rel_partition = greeks_partition_path(dataset, date, run_id);
+        self.write_greeks_partition(&rel_partition, rows, dataset, date, run_id)
     }
 
     /// Write a batch of option trades to Parquet, with basic dedup and pooled writers.
@@ -783,6 +836,90 @@ impl Storage {
             Arc::new(StringArray::from(source)),
             Arc::new(StringArray::from(quality)),
             Arc::new(Int64Array::from(watermark_ts_ns)),
+        ];
+
+        Ok(RecordBatch::try_new(schema, arrays)?)
+    }
+
+    fn greeks_overlays_to_record_batch(
+        &self,
+        rows: &[GreeksOverlayRow],
+    ) -> Result<RecordBatch, StorageError> {
+        let len = rows.len();
+        let mut trade_uids = Vec::with_capacity(len);
+        let mut trade_ts_ns = Vec::with_capacity(len);
+        let mut contract = Vec::with_capacity(len);
+        let mut underlying = Vec::with_capacity(len);
+        let mut delta = Vec::with_capacity(len);
+        let mut gamma = Vec::with_capacity(len);
+        let mut vega = Vec::with_capacity(len);
+        let mut theta = Vec::with_capacity(len);
+        let mut iv = Vec::with_capacity(len);
+        let mut greeks_flags = Vec::with_capacity(len);
+        let mut nbbo_bid = Vec::with_capacity(len);
+        let mut nbbo_ask = Vec::with_capacity(len);
+        let mut nbbo_bid_sz = Vec::with_capacity(len);
+        let mut nbbo_ask_sz = Vec::with_capacity(len);
+        let mut nbbo_ts_ns = Vec::with_capacity(len);
+        let mut nbbo_age_us = Vec::with_capacity(len);
+        let mut nbbo_state = Vec::with_capacity(len);
+        let mut engine_version = Vec::with_capacity(len);
+        let mut curve_date = Vec::with_capacity(len);
+        let mut curve_source_date = Vec::with_capacity(len);
+        let mut enriched_at_ns = Vec::with_capacity(len);
+        let mut run_ids = Vec::with_capacity(len);
+
+        for row in rows {
+            trade_uids.push(row.trade_uid);
+            trade_ts_ns.push(row.trade_ts_ns);
+            contract.push(row.contract.clone());
+            underlying.push(row.underlying.clone());
+            delta.push(row.delta);
+            gamma.push(row.gamma);
+            vega.push(row.vega);
+            theta.push(row.theta);
+            iv.push(row.iv);
+            greeks_flags.push(row.greeks_flags);
+            nbbo_bid.push(row.nbbo_bid);
+            nbbo_ask.push(row.nbbo_ask);
+            nbbo_bid_sz.push(row.nbbo_bid_sz);
+            nbbo_ask_sz.push(row.nbbo_ask_sz);
+            nbbo_ts_ns.push(row.nbbo_ts_ns);
+            nbbo_age_us.push(row.nbbo_age_us);
+            nbbo_state.push(row.nbbo_state.as_ref().map(|state| format!("{:?}", state)));
+            engine_version.push(row.engine_version.clone());
+            curve_date.push(row.treasury_curve_date.clone());
+            curve_source_date.push(row.treasury_curve_source_date.clone());
+            enriched_at_ns.push(row.enriched_at_ns);
+            run_ids.push(row.run_id.clone());
+        }
+
+        let schema: SchemaRef = Arc::new(greeks_overlay_schema());
+        let trade_uid_array =
+            FixedSizeBinaryArray::try_from_iter(trade_uids.iter().map(|uid| uid.as_ref()))?;
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(trade_uid_array),
+            Arc::new(Int64Array::from(trade_ts_ns)),
+            Arc::new(StringArray::from(contract)),
+            Arc::new(StringArray::from(underlying)),
+            Arc::new(Float64Array::from(delta)),
+            Arc::new(Float64Array::from(gamma)),
+            Arc::new(Float64Array::from(vega)),
+            Arc::new(Float64Array::from(theta)),
+            Arc::new(Float64Array::from(iv)),
+            Arc::new(UInt32Array::from(greeks_flags)),
+            Arc::new(Float64Array::from(nbbo_bid)),
+            Arc::new(Float64Array::from(nbbo_ask)),
+            Arc::new(UInt32Array::from(nbbo_bid_sz)),
+            Arc::new(UInt32Array::from(nbbo_ask_sz)),
+            Arc::new(Int64Array::from(nbbo_ts_ns)),
+            Arc::new(UInt32Array::from(nbbo_age_us)),
+            Arc::new(StringArray::from(nbbo_state)),
+            Arc::new(StringArray::from(engine_version)),
+            Arc::new(StringArray::from(curve_date)),
+            Arc::new(StringArray::from(curve_source_date)),
+            Arc::new(Int64Array::from(enriched_at_ns)),
+            Arc::new(StringArray::from(run_ids)),
         ];
 
         Ok(RecordBatch::try_new(schema, arrays)?)
@@ -1497,6 +1634,12 @@ impl ManifestFile {
             min_uid,
             max_uid,
         )
+    }
+
+    fn from_greeks_overlays(relative_path: String, rows: &[GreeksOverlayRow]) -> Self {
+        let (min_ts, max_ts) = ts_bounds(rows.iter().map(|row| row.trade_ts_ns));
+        let (min_uid, max_uid) = uid_bounds(rows.iter().map(|row| row.trade_uid));
+        Self::new(relative_path, rows.len(), min_ts, max_ts, min_uid, max_uid)
     }
 }
 

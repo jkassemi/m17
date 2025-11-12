@@ -20,4 +20,5 @@ members = [
   "tui",
   "ws-source",
   "greeks-engine",
+  "greeks-enrichment-service",
 ]

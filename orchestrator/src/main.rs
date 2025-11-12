@@ -22,6 +22,9 @@ use core_types::config::AppConfig;
 use core_types::status::{OverallStatus, ServiceStatusHandle, StatusGauge};
 use core_types::types::{Completeness, DataBatch, DataBatchMeta, Quality, Source, Watermark};
 use flatfile_ingestion_service::FlatfileIngestionService;
+use greeks_enrichment_service::{
+    CurveStateProvider, GreeksEnrichmentService, ManifestParquetSource, StorageGreeksWriter,
+};
 use log::info;
 use metrics::Metrics;
 use nbbo_cache::NbboStore;
@@ -29,6 +32,7 @@ use realtime_ws_ingestion_service::RealtimeWsIngestionService;
 use reqwest::Client;
 use simplelog::*;
 use std::fs::File;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -138,7 +142,29 @@ async fn main() {
     let nbbo_flatfile = Arc::new(TokioRwLock::new(NbboStore::new()));
     let nbbo_realtime = Arc::new(TokioRwLock::new(NbboStore::new()));
     let _classifier = Classifier::new();
+    let storage_base_path = config
+        .storage
+        .paths
+        .get("base")
+        .cloned()
+        .unwrap_or_else(|| "data".to_string());
     let storage = Arc::new(Mutex::new(Storage::new(config.storage)));
+
+    let greeks_source = Arc::new(ManifestParquetSource::new(storage_base_path.clone()));
+    let greeks_writer = Arc::new(StorageGreeksWriter::new(storage.clone()));
+    let greeks_curve_provider: Arc<dyn CurveStateProvider> = Arc::new(treasury_service.handle());
+    let greeks_enrichment_service = GreeksEnrichmentService::start(
+        config.greeks.clone(),
+        config.greeks.flatfile_underlying_staleness_us,
+        greeks_curve_provider,
+        greeks_source,
+        greeks_writer,
+        PathBuf::from("checkpoints/enrichment"),
+        config.ingest.concurrent_permits,
+    );
+    let greeks_status = greeks_enrichment_service.status_handle();
+    metrics.register_service_status(greeks_status);
+    let greeks_handle = greeks_enrichment_service.handle();
 
     let aggregator_sender = if !config.aggregations.symbol.trim().is_empty() {
         match AggregationsEngine::new(config.aggregations.clone()) {
@@ -192,6 +218,7 @@ async fn main() {
         config.greeks.flatfile_underlying_staleness_us,
         config.ingest.concurrent_permits,
         treasury_handle.clone(),
+        Some(greeks_handle.clone()),
     )
     .await;
     let flatfile_status = flatfile_service.status_handle();

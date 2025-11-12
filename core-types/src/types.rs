@@ -31,6 +31,45 @@ pub enum InstrumentType {
     Option,
 }
 
+/// Datasets that run through the enrichment worker.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum EnrichmentDataset {
+    Options,
+    Equities,
+}
+
+impl EnrichmentDataset {
+    pub fn dataset_name(&self) -> &'static str {
+        match self {
+            EnrichmentDataset::Options => "greeks_options",
+            EnrichmentDataset::Equities => "greeks_equities",
+        }
+    }
+
+    pub fn raw_dataset_name(&self) -> &'static str {
+        match self {
+            EnrichmentDataset::Options => "options_trades",
+            EnrichmentDataset::Equities => "equity_trades",
+        }
+    }
+
+    pub fn partition_root(&self) -> &'static str {
+        match self {
+            EnrichmentDataset::Options => "greeks/options",
+            EnrichmentDataset::Equities => "greeks/equities",
+        }
+    }
+}
+
+impl std::fmt::Display for EnrichmentDataset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnrichmentDataset::Options => write!(f, "options"),
+            EnrichmentDataset::Equities => write!(f, "equities"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AggressorSide {
     Buyer,
@@ -104,6 +143,33 @@ pub struct OptionTrade {
     pub source: Source,
     pub quality: Quality,
     pub watermark_ts_ns: i64,
+}
+
+/// Derived Greeks output linked back to the immutable raw trade via `trade_uid`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GreeksOverlayRow {
+    pub trade_uid: TradeUid,
+    pub trade_ts_ns: i64,
+    pub contract: String,
+    pub underlying: String,
+    pub delta: Option<f64>,
+    pub gamma: Option<f64>,
+    pub vega: Option<f64>,
+    pub theta: Option<f64>,
+    pub iv: Option<f64>,
+    pub greeks_flags: u32,
+    pub nbbo_bid: Option<f64>,
+    pub nbbo_ask: Option<f64>,
+    pub nbbo_bid_sz: Option<u32>,
+    pub nbbo_ask_sz: Option<u32>,
+    pub nbbo_ts_ns: Option<i64>,
+    pub nbbo_age_us: Option<u32>,
+    pub nbbo_state: Option<NbboState>,
+    pub engine_version: String,
+    pub treasury_curve_date: Option<String>,
+    pub treasury_curve_source_date: Option<String>,
+    pub enriched_at_ns: i64,
+    pub run_id: String,
 }
 
 /// Equity trade row (stub).

@@ -101,7 +101,7 @@ impl PayloadMeta {
 }
 
 /// Slot kinds for the trade ledger.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TradeSlotKind {
     RfRate,
     OptionTrade,
@@ -113,6 +113,16 @@ pub enum TradeSlotKind {
 }
 
 impl TradeSlotKind {
+    pub const ALL: [Self; 7] = [
+        TradeSlotKind::RfRate,
+        TradeSlotKind::OptionTrade,
+        TradeSlotKind::OptionQuote,
+        TradeSlotKind::UnderlyingTrade,
+        TradeSlotKind::UnderlyingQuote,
+        TradeSlotKind::OptionAggressor,
+        TradeSlotKind::UnderlyingAggressor,
+    ];
+
     pub fn index(&self) -> usize {
         match self {
             TradeSlotKind::RfRate => 0,
@@ -136,11 +146,23 @@ impl TradeSlotKind {
             TradeSlotKind::UnderlyingAggressor => PayloadType::Aggressor,
         }
     }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            TradeSlotKind::RfRate => "rf_rate",
+            TradeSlotKind::OptionTrade => "option_trade",
+            TradeSlotKind::OptionQuote => "option_quote",
+            TradeSlotKind::UnderlyingTrade => "underlying_trade",
+            TradeSlotKind::UnderlyingQuote => "underlying_quote",
+            TradeSlotKind::OptionAggressor => "option_aggressor",
+            TradeSlotKind::UnderlyingAggressor => "underlying_aggressor",
+        }
+    }
 }
 
 /// Aggregation window kinds for enrichment slots.
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum AggregateWindowKind {
     W1m,
     W5m,
@@ -164,13 +186,23 @@ impl AggregateWindowKind {
 }
 
 /// Slot kinds for the enrichment ledger.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EnrichmentSlotKind {
     Greeks,
     Aggregate(AggregateWindowKind),
 }
 
 impl EnrichmentSlotKind {
+    pub const ALL: [Self; 7] = [
+        EnrichmentSlotKind::Greeks,
+        EnrichmentSlotKind::Aggregate(AggregateWindowKind::W1m),
+        EnrichmentSlotKind::Aggregate(AggregateWindowKind::W5m),
+        EnrichmentSlotKind::Aggregate(AggregateWindowKind::W10m),
+        EnrichmentSlotKind::Aggregate(AggregateWindowKind::W30m),
+        EnrichmentSlotKind::Aggregate(AggregateWindowKind::W1h),
+        EnrichmentSlotKind::Aggregate(AggregateWindowKind::W4h),
+    ];
+
     pub fn index(&self) -> usize {
         match self {
             EnrichmentSlotKind::Greeks => 0,
@@ -182,6 +214,18 @@ impl EnrichmentSlotKind {
         match self {
             EnrichmentSlotKind::Greeks => PayloadType::Greeks,
             EnrichmentSlotKind::Aggregate(_) => PayloadType::Aggregate,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            EnrichmentSlotKind::Greeks => "greeks",
+            EnrichmentSlotKind::Aggregate(AggregateWindowKind::W1m) => "agg_1m",
+            EnrichmentSlotKind::Aggregate(AggregateWindowKind::W5m) => "agg_5m",
+            EnrichmentSlotKind::Aggregate(AggregateWindowKind::W10m) => "agg_10m",
+            EnrichmentSlotKind::Aggregate(AggregateWindowKind::W30m) => "agg_30m",
+            EnrichmentSlotKind::Aggregate(AggregateWindowKind::W1h) => "agg_1h",
+            EnrichmentSlotKind::Aggregate(AggregateWindowKind::W4h) => "agg_4h",
         }
     }
 }

@@ -272,6 +272,18 @@ impl<Row: LedgerRow> LedgerCore<Row> {
         Ok(rows.clone())
     }
 
+    fn with_symbol_rows<F, R>(&self, symbol_id: SymbolId, f: F) -> Result<R, SlotWriteError>
+    where
+        F: FnOnce(&[Row]) -> R,
+    {
+        let guard = self.rows.read();
+        let rows = guard
+            .get(symbol_id as usize)
+            .and_then(|opt| opt.as_ref())
+            .ok_or(SlotWriteError::MissingSymbol { symbol_id })?;
+        Ok(f(rows))
+    }
+
     fn next_unfilled(
         &self,
         symbol_id: SymbolId,
@@ -374,6 +386,13 @@ impl TradeLedger {
         self.core.iter_symbol(symbol_id)
     }
 
+    pub fn with_symbol_rows<F, R>(&self, symbol_id: SymbolId, f: F) -> Result<R, SlotWriteError>
+    where
+        F: FnOnce(&[TradeWindowRow]) -> R,
+    {
+        self.core.with_symbol_rows(symbol_id, f)
+    }
+
     pub fn next_unfilled_window(
         &self,
         symbol_id: SymbolId,
@@ -463,6 +482,13 @@ impl EnrichmentLedger {
         symbol_id: SymbolId,
     ) -> Result<Vec<EnrichmentWindowRow>, SlotWriteError> {
         self.core.iter_symbol(symbol_id)
+    }
+
+    pub fn with_symbol_rows<F, R>(&self, symbol_id: SymbolId, f: F) -> Result<R, SlotWriteError>
+    where
+        F: FnOnce(&[EnrichmentWindowRow]) -> R,
+    {
+        self.core.with_symbol_rows(symbol_id, f)
     }
 
     pub fn next_unfilled_window(

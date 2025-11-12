@@ -1,11 +1,23 @@
 mod config;
 
-use std::{env, process, str::FromStr, sync::Arc};
+use std::{
+    env, process,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
 
 use config::{AppConfig, ConfigError, Environment};
+use core_types::config::DateRange;
 use engine_api::{Engine, EngineError};
-use ledger::{LedgerController, LedgerError};
+use ledger::{LedgerController, LedgerError, LedgerSlotStatusSnapshot, WindowSpace};
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use trade_flatfile_engine::{
     FlatfileRuntimeConfig, OptionQuoteFlatfileEngine, OptionTradeFlatfileEngine,
     UnderlyingQuoteFlatfileEngine, UnderlyingTradeFlatfileEngine,
@@ -17,6 +29,8 @@ fn main() {
         process::exit(1);
     }
 }
+
+const STATUS_LOG_INTERVAL_SECS: u64 = 30;
 
 fn run() -> Result<(), AppError> {
     let config = {
@@ -52,45 +66,49 @@ fn run() -> Result<(), AppError> {
         config.env,
         config.ledger.state_dir()
     );
+    match ledger_window_summary(&config.ledger.window_space) {
+        Some(summary) => println!(
+            "Ledger capacity: up to {} symbols across {} minutes ({} -> {})",
+            config.ledger.max_symbols, summary.minutes, summary.start_label, summary.end_label
+        ),
+        None => println!(
+            "Ledger capacity: up to {} symbols with no configured window range",
+            config.ledger.max_symbols
+        ),
+    }
     println!(
         "Massive REST base: {}; stocks WS: {}; options WS: {}",
         config.rest_base_url, config.stocks_ws_url, config.options_ws_url
     );
     println!(
-        "Loaded Massive API key (len={}), flatfile access key (len={}), secret (len={})",
-        config.secrets.massive_api_key.len(),
-        config.secrets.flatfile_access_key_id.len(),
-        config.secrets.flatfile_secret_access_key.len()
+        "Flatfile ingestion: bucket={}, endpoint={}, region={}, batch_size={}, progress_update={}ms",
+        config.flatfile.bucket,
+        config.flatfile.endpoint,
+        config.flatfile.region,
+        config.flatfile.batch_size,
+        config.flatfile.progress_update_ms
     );
     println!(
-        "Ledger currently tracks up to {} symbols",
-        config.ledger.max_symbols
+        "Flatfile date ranges: {}",
+        describe_flatfile_ranges(&config.flatfile.date_ranges)
     );
 
     option_trade_engine.start()?;
     option_quote_engine.start()?;
     underlying_trade_engine.start()?;
     underlying_quote_engine.start()?;
-    let option_trade_health = option_trade_engine.health();
-    println!(
-        "option-trade-flatfile status: {:?} ({:?})",
-        option_trade_health.status, option_trade_health.detail
+    log_engine_health("option-trade-flatfile", &option_trade_engine);
+    log_engine_health("option-quote-flatfile", &option_quote_engine);
+    log_engine_health("underlying-trade-flatfile", &underlying_trade_engine);
+    log_engine_health("underlying-quote-flatfile", &underlying_quote_engine);
+    println!("Flatfile engines are running; press Ctrl+C to shut down.");
+    let status_logger = LedgerStatusLogger::spawn(
+        controller.clone(),
+        Duration::from_secs(STATUS_LOG_INTERVAL_SECS),
     );
-    let option_quote_health = option_quote_engine.health();
-    println!(
-        "option-quote-flatfile status: {:?} ({:?})",
-        option_quote_health.status, option_quote_health.detail
-    );
-    let underlying_trade_health = underlying_trade_engine.health();
-    println!(
-        "underlying-trade-flatfile status: {:?} ({:?})",
-        underlying_trade_health.status, underlying_trade_health.detail
-    );
-    let underlying_quote_health = underlying_quote_engine.health();
-    println!(
-        "underlying-quote-flatfile status: {:?} ({:?})",
-        underlying_quote_health.status, underlying_quote_health.detail
-    );
+    wait_for_shutdown_signal()?;
+    println!("Shutdown signal received; stopping flatfile engines...");
+    status_logger.shutdown();
     underlying_quote_engine.stop()?;
     underlying_trade_engine.stop()?;
     option_quote_engine.stop()?;
@@ -116,4 +134,130 @@ enum AppError {
     Ledger(#[from] LedgerError),
     #[error(transparent)]
     Engine(#[from] EngineError),
+    #[error("failed to install signal handler: {0}")]
+    Signal(#[from] ctrlc::Error),
+    #[error("failed while waiting for shutdown signal: {0}")]
+    ShutdownWait(#[from] mpsc::RecvError),
+}
+
+struct WindowSummary {
+    minutes: usize,
+    start_label: String,
+    end_label: String,
+}
+
+fn ledger_window_summary(window_space: &WindowSpace) -> Option<WindowSummary> {
+    let mut iter = window_space.iter();
+    let first = iter.next()?;
+    let mut last = first;
+    for meta in iter {
+        last = meta;
+    }
+    let minutes = window_space.len();
+    let start_label = format_timestamp(first.start_ts);
+    let end_label = format_timestamp(last.start_ts + 60);
+    Some(WindowSummary {
+        minutes,
+        start_label,
+        end_label,
+    })
+}
+
+fn format_timestamp(ts: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(ts)
+        .ok()
+        .and_then(|dt| dt.format(&Rfc3339).ok())
+        .unwrap_or_else(|| format!("{ts}"))
+}
+
+fn describe_flatfile_ranges(ranges: &[DateRange]) -> String {
+    if ranges.is_empty() {
+        return "none configured".to_string();
+    }
+
+    ranges
+        .iter()
+        .enumerate()
+        .map(|(idx, range)| match &range.end_ts {
+            Some(end) => format!("#{}: {} -> {}", idx + 1, range.start_ts, end),
+            None => format!("#{}: {} -> open-ended", idx + 1, range.start_ts),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn wait_for_shutdown_signal() -> Result<(), AppError> {
+    let (tx, rx) = mpsc::channel();
+    ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    })?;
+    rx.recv()?;
+    Ok(())
+}
+
+fn log_engine_health(label: &str, engine: &dyn Engine) {
+    let health = engine.health();
+    println!("{label} status: {:?} ({:?})", health.status, health.detail);
+}
+
+struct LedgerStatusLogger {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl LedgerStatusLogger {
+    fn spawn(controller: Arc<LedgerController>, interval: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                match controller.slot_status_snapshot() {
+                    Ok(snapshot) => log_snapshot(&snapshot),
+                    Err(err) => eprintln!("failed to snapshot ledger slots: {err}"),
+                }
+                if stop_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                sleep_with_stop(&stop_clone, interval);
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn shutdown(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for LedgerStatusLogger {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn log_snapshot(snapshot: &LedgerSlotStatusSnapshot) {
+    println!();
+    println!("{snapshot}");
+}
+
+fn sleep_with_stop(stop: &AtomicBool, interval: Duration) {
+    let mut remaining = interval;
+    const STEP: Duration = Duration::from_millis(500);
+    while remaining > Duration::ZERO {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let sleep_for = if remaining > STEP { STEP } else { remaining };
+        thread::sleep(sleep_for);
+        remaining = remaining.saturating_sub(sleep_for);
+    }
 }

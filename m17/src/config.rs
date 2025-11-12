@@ -79,7 +79,7 @@ impl FlatfileSettings {
             endpoint: "https://files.massive.com",
             region: "custom",
             date_ranges: vec![DateRange {
-                start_ts: "2025-01-02T14:30:00Z".to_string(),
+                start_ts: "2025-11-03T00:00:00Z".to_string(),
                 end_ts: None,
             }],
             batch_size: 2000,
@@ -89,16 +89,17 @@ impl FlatfileSettings {
 }
 
 fn ledger_config_for(env: Environment) -> LedgerConfig {
-    let mut cfg = LedgerConfig::new(state_dir(), session_windows());
+    let ledger_state_dir = match env {
+        Environment::Dev => PathBuf::from("/home/james/m17/ledger.state"),
+        Environment::Prod => PathBuf::from("/home/james/ledger.state"),
+    };
+
+    let mut cfg = LedgerConfig::new(ledger_state_dir, session_windows());
     cfg.max_symbols = match env {
         Environment::Dev => DEFAULT_MAX_SYMBOLS,
         Environment::Prod => DEFAULT_MAX_SYMBOLS,
     };
     cfg
-}
-
-fn state_dir() -> PathBuf {
-    PathBuf::from("/home/james/ledger.state")
 }
 
 fn session_windows() -> WindowSpace {
@@ -116,9 +117,9 @@ pub struct Secrets {
 impl Secrets {
     fn from_env() -> Result<Self, ConfigError> {
         Ok(Self {
-            massive_api_key: require_env("M17_MASSIVE_API_KEY")?,
-            flatfile_access_key_id: require_env("M17_FLATFILE_ACCESS_KEY_ID")?,
-            flatfile_secret_access_key: require_env("M17_FLATFILE_SECRET_ACCESS_KEY")?,
+            massive_api_key: require_env("POLYGONIO_KEY")?,
+            flatfile_access_key_id: require_env("POLYGONIO_ACCESS_KEY_ID")?,
+            flatfile_secret_access_key: require_env("POLYGONIO_SECRET_ACCESS_KEY")?,
         })
     }
 }

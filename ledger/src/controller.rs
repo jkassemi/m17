@@ -1,14 +1,15 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::{
     config::LedgerConfig,
     error::{LedgerError, Result},
-    ledger::{EnrichmentLedger, TradeLedger},
+    ledger::{EnrichmentLedger, LedgerRow, TradeLedger},
     mapping::PayloadStores,
     payload::{
-        AggregateWindowKind, EnrichmentSlotKind, PayloadMeta, Slot, SlotKind, TradeSlotKind,
+        AggregateWindowKind, EnrichmentSlotKind, PayloadMeta, Slot, SlotKind, SlotStatus,
+        TradeSlotKind,
     },
     symbol_map::{SymbolId, SymbolMap},
     window::{MinuteIndex, WindowSpace},
@@ -298,6 +299,37 @@ impl LedgerController {
         self.payload_stores.lock()
     }
 
+    pub fn slot_status_snapshot(&self) -> Result<LedgerSlotStatusSnapshot> {
+        let symbol_ids: Vec<SymbolId> = {
+            let map = self.symbol_map.read();
+            map.iter().map(|(id, _)| id).collect()
+        };
+        let mut snapshot = LedgerSlotStatusSnapshot::default();
+        for symbol_id in symbol_ids {
+            self.trade_ledger
+                .with_symbol_rows(symbol_id, |rows| {
+                    for row in rows {
+                        for kind in TradeSlotKind::ALL {
+                            let slot = row.slot(kind.index());
+                            snapshot.record_trade(kind, slot.status);
+                        }
+                    }
+                })
+                .map_err(LedgerError::from)?;
+            self.enrichment_ledger
+                .with_symbol_rows(symbol_id, |rows| {
+                    for row in rows {
+                        for kind in EnrichmentSlotKind::ALL {
+                            let slot = row.slot(kind.index());
+                            snapshot.record_enrichment(kind, slot.status);
+                        }
+                    }
+                })
+                .map_err(LedgerError::from)?;
+        }
+        Ok(snapshot)
+    }
+
     pub fn config(&self) -> &LedgerConfig {
         &self.config
     }
@@ -322,6 +354,98 @@ impl LedgerController {
                 .next_unfilled_window(symbol_id, start_idx, kind)?,
         };
         Ok(next)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SlotStatusCounts {
+    pub empty: usize,
+    pub pending: usize,
+    pub filled: usize,
+    pub cleared: usize,
+}
+
+impl SlotStatusCounts {
+    fn increment(&mut self, status: SlotStatus) {
+        match status {
+            SlotStatus::Empty => self.empty += 1,
+            SlotStatus::Pending => self.pending += 1,
+            SlotStatus::Filled => self.filled += 1,
+            SlotStatus::Cleared => self.cleared += 1,
+        }
+    }
+
+    pub fn total(&self) -> usize {
+        self.empty + self.pending + self.filled + self.cleared
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.total() == 0
+    }
+}
+
+impl fmt::Display for SlotStatusCounts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "empty={}, pending={}, filled={}, cleared={}",
+            self.empty, self.pending, self.filled, self.cleared
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LedgerSlotStatusSnapshot {
+    pub trade: BTreeMap<TradeSlotKind, SlotStatusCounts>,
+    pub enrichment: BTreeMap<EnrichmentSlotKind, SlotStatusCounts>,
+}
+
+impl LedgerSlotStatusSnapshot {
+    fn record_trade(&mut self, kind: TradeSlotKind, status: SlotStatus) {
+        self.trade.entry(kind).or_default().increment(status);
+    }
+
+    fn record_enrichment(&mut self, kind: EnrichmentSlotKind, status: SlotStatus) {
+        self.enrichment.entry(kind).or_default().increment(status);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.trade.values().all(SlotStatusCounts::is_zero)
+            && self.enrichment.values().all(SlotStatusCounts::is_zero)
+    }
+
+    pub fn total_slots(&self) -> usize {
+        self.trade
+            .values()
+            .map(SlotStatusCounts::total)
+            .sum::<usize>()
+            + self
+                .enrichment
+                .values()
+                .map(SlotStatusCounts::total)
+                .sum::<usize>()
+    }
+}
+
+impl fmt::Display for LedgerSlotStatusSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_empty() {
+            return write!(f, "ledger slot statuses: no symbols loaded");
+        }
+        writeln!(f, "ledger slot statuses:")?;
+        if !self.trade.is_empty() {
+            writeln!(f, "  trade refs:")?;
+            for (kind, counts) in &self.trade {
+                writeln!(f, "    {:>18}: {}", kind.label(), counts)?;
+            }
+        }
+        if !self.enrichment.is_empty() {
+            writeln!(f, "  enrichment refs:")?;
+            for (kind, counts) in &self.enrichment {
+                writeln!(f, "    {:>18}: {}", kind.label(), counts)?;
+            }
+        }
+        Ok(())
     }
 }
 

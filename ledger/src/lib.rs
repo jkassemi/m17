@@ -15,7 +15,7 @@ pub mod symbol_map;
 pub mod window;
 
 pub use config::LedgerConfig;
-pub use controller::{LedgerController, PendingHandle};
+pub use controller::{LedgerController, LedgerSlotStatusSnapshot, PendingHandle, SlotStatusCounts};
 pub use error::{ControllerError, LedgerError, SlotWriteError};
 pub use ledger::{EnrichmentLedger, TradeLedger};
 pub use payload::{PayloadMeta, PayloadType, SlotKind, SlotStatus};

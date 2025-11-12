@@ -1047,6 +1047,43 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+    use core_types::types::{Completeness, DataBatch, DataBatchMeta, Quality, Source, Watermark};
+
+    static TEST_METRICS: OnceLock<Arc<Metrics>> = OnceLock::new();
+    static TEST_METRICS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn test_metrics() -> (Arc<Metrics>, MutexGuard<'static, ()>) {
+        let guard = TEST_METRICS_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let metrics = TEST_METRICS
+            .get_or_init(|| Arc::new(Metrics::new()))
+            .clone();
+        metrics.set_queue_depth(QUEUE_EQUITY_TRADES, 0);
+        metrics.set_queue_depth(QUEUE_OPTION_TRADES, 0);
+        metrics.set_queue_depth(QUEUE_EQUITY_NBBO, 0);
+        metrics.set_queue_depth(QUEUE_OPTION_NBBO, 0);
+        (metrics, guard)
+    }
+
+    fn empty_batch() -> DataBatch<()> {
+        DataBatch {
+            rows: Vec::new(),
+            meta: DataBatchMeta {
+                source: Source::Flatfile,
+                quality: Quality::Prelim,
+                watermark: Watermark {
+                    watermark_ts_ns: 0,
+                    completeness: Completeness::Complete,
+                    hints: None,
+                },
+                schema_version: 1,
+            },
+        }
+    }
 
     #[derive(Clone)]
     pub struct LocalFileSource {
@@ -1279,5 +1316,31 @@ mod tests {
             all_trades[1].exchange, 8,
             "Second trade exchange should be 8"
         );
+    }
+
+    #[test]
+    fn record_queue_depth_tracks_usage() {
+        let (metrics, _guard) = test_metrics();
+        let (tx, _rx) = mpsc::channel(FLATFILE_QUEUE_CAPACITY);
+        tx.try_send(empty_batch()).unwrap();
+
+        record_queue_depth(
+            &Some(metrics.clone()),
+            QUEUE_EQUITY_TRADES,
+            &tx,
+            FLATFILE_QUEUE_CAPACITY,
+        );
+
+        assert_eq!(metrics.queue_depth(QUEUE_EQUITY_TRADES), 1);
+    }
+
+    #[test]
+    fn reset_queue_depth_zeroes_metric() {
+        let (metrics, _guard) = test_metrics();
+        metrics.set_queue_depth(QUEUE_EQUITY_TRADES, 5);
+
+        reset_queue_depth(&Some(metrics.clone()), QUEUE_EQUITY_TRADES);
+
+        assert_eq!(metrics.queue_depth(QUEUE_EQUITY_TRADES), 0);
     }
 }

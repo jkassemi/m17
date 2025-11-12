@@ -268,6 +268,10 @@ impl Metrics {
             .set(depth as i64);
     }
 
+    pub fn queue_depth(&self, queue: &str) -> i64 {
+        self.queue_depth_gauges.with_label_values(&[queue]).get()
+    }
+
     pub fn observe_enrichment(&self, rows: usize, duration: std::time::Duration) {
         if rows > 0 {
             self.enrichment_row_counter.inc_by(rows as u64);

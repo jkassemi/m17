@@ -101,7 +101,8 @@ Every payload struct ends with a variable-length URI or inline metadata blob, al
 - `ledger/`: shared library crate hosting the trade/enrichment ledgers, mapping-file abstractions, and controller APIs.
 - Worker crates follow the `<domain>-engine` naming convention so their purpose is obvious at a glance:
   - `treasury-engine`: streams treasury curves into `rf_rate_ref` slots.
-  - `trade-engine`: ingests trades from flatfiles/feeds into `trade_ref` slots.
+  - `trade-flatfile-engine`: ingests historical/flatfile trades into `trade_ref` slots.
+  - `trade-ws-engine`: ingests realtime websocket trades into `trade_ref` slots.
   - `quote-engine`: ingests quotes/NBBO inputs into `quote_ref` slots.
   - `nbbo-engine`: derives aggressor/NBBO payloads from trade+quote refs and fills `aggressor_ref`.
   - `greeks-engine`: produces greeks overlays into `greeks_ref`.
@@ -119,11 +120,17 @@ Each engine owns a focused scope, exposes a shared `Engine` trait (`start(ctx)`,
 - Behavior: ingest `RfRatePayload` updates, compute `valid_from/valid_to`, and walk all applicable symbols to write the new payload ID into every minute within the validity range. Carries forward rates until superseded.
 - Outputs: `rf_rate.map` payloads + slot updates; publishes metrics for curve lag and per-symbol update counts.
 
-### `trade-engine`
+### `trade-flatfile-engine`
 
-- Inputs: flatfile/live trade connectors, symbol resolver, `TradeLedger` handle.
-- Behavior: batch trades per minute, append `TradePayload` records, write `trade_ref` slots, and mark `Pending` while processing. Provides hooks for repair/rewind via `clear_slot`.
-- Outputs: trade payload IDs, `trade_ref` slot transitions, ingestion metrics (latency, record count, compression kind).
+- Inputs: batch/flatfile trade connectors, symbol resolver, `TradeLedger` handle.
+- Behavior: walk historical files, batch trades per minute, append `TradeBatchPayload` records, write `trade_ref` slots, and mark `Pending` while processing. Provides hooks for repair/rewind via `clear_slot`.
+- Outputs: trade payload IDs, `trade_ref` slot transitions, ingestion metrics (latency, record count, file offsets).
+
+### `trade-ws-engine`
+
+- Inputs: realtime websocket feeds, incremental checkpoint state, `TradeLedger` handle.
+- Behavior: stream trades minute-by-minute, emit `TradeBatchPayload` artifacts (or inline buffers) once the minute closes, write `trade_ref` slots immediately so downstream consumers see near-real-time updates.
+- Outputs: trade payload IDs, real-time ingestion metrics (lag, dropped messages, reconnect counters).
 
 ### `quote-engine`
 
@@ -239,7 +246,7 @@ These setters behave the same as TradeLedger writes but target the enrichment sl
 ## Ingestion Engines & Orchestrator Integration
 
 - Single binary: the `m17` orchestrator crate hosts the ledgers and controller in-process. It builds/loads both ledgers plus all payload mapping files, replays the latest snapshot, and hands shared handles (e.g., `Arc<TradeLedger>`, `Arc<EnrichmentLedger>`) to each engine module.
-- Engines (treasury, trade, quote, nbbo, greeks, aggregation) run event loops that call the ledger setters defined in the `ledger` crate. Aggressor workers consume the trade rows once both `trade_ref` and `quote_ref` exist and publish their payload IDs back into the trade ledger.
+- Engines (treasury, trade-flatfile, trade-ws, quote, nbbo, greeks, aggregation) run event loops that call the ledger setters defined in the `ledger` crate. Aggressor workers consume the trade rows once both `trade_ref` and `quote_ref` exist and publish their payload IDs back into the trade ledger.
 - Greeks/aggregation engines take two handles: the trade ledger for source refs and the enrichment ledger for their outputs. They dereference payload IDs via the mapping tables as needed, then publish overlays/aggregates via enrichment setters.
 - Orchestrator supervises engines: if the ledgers detect backpressure, symbol-cap exhaustion, or priority-region starvation, `m17` can pause/resume loops, initiate repairs via ledger APIs, or clear/replay ranges.
 
@@ -256,10 +263,18 @@ Use `[ ]` / `[x]` to track progress.
 
 ### Ledger & Controller
 
-- [ ] Build window space generator to materialize the active-year minute map prior to starting any engines.
-- [ ] Implement controller service with in-memory index, memory-mapped persistence, snapshotting, and basic APIs (`set_rf_rate_ref`, `set_trade_ref`, `set_quote_ref`, `set_aggressor_ref`, `set_greeks_ref`, `set_aggs_ref_*`, `get_*_row`).
-- [ ] Implement payload mapping stores with append-only allocation, checksum validation, and snapshot hooks.
-- [ ] Add unit/integration tests covering mutation, replay, and CAS contention semantics.
+- [x] Build window space generator to materialize the active-year minute map prior to starting any engines.
+- [x] Implement controller service with in-memory index, memory-mapped persistence, snapshotting, and basic APIs (`set_rf_rate_ref`, `set_trade_ref`, `set_quote_ref`, `set_aggressor_ref`, `set_greeks_ref`, `set_aggs_ref_*`, `get_*_row`).
+- [x] Implement payload mapping stores with append-only allocation, checksum validation, and snapshot hooks.
+- [x] Add unit/integration tests covering mutation, replay, and CAS contention semantics.
+
+### First Engine Crate
+
+#### `trade-flatfile-engine`
+
+- [ ] Scaffold crate focused on historical/flatfile inputs and a batching pipeline keyed by `(symbol_id, minute_idx)`.
+- [ ] Append `TradeBatchPayload` records, write `trade_ref` slots, and expose repair helpers (`clear_slot`, rewind hooks) for backfills.
+- [ ] Instrument ingestion latency, record counts, file offsets, and retry counters.
 
 ### Orchestrator (`m17`)
 
@@ -267,7 +282,7 @@ Use `[ ]` / `[x]` to track progress.
 - [ ] Define engine traits (start/stop, health probes, priority-region hooks) and shared instrumentation wiring.
 - [ ] Implement supervision logic for backpressure, repairs, and graceful shutdown.
 
-### Engine Crates
+### Remaining Engine Crates
 
 #### `treasury-engine`
 
@@ -275,11 +290,23 @@ Use `[ ]` / `[x]` to track progress.
 - [ ] Implement treasury feed client (or adapters) plus carry-forward logic that writes `rf_rate_ref` slots per symbol/minute.
 - [ ] Emit metrics/logs for curve lag, version churn, and per-symbol update counts.
 
-#### `trade-engine`
+#### `treasury-engine`
 
-- [ ] Scaffold crate with connectors for flatfile/live ingestion and a batching pipeline keyed by `(symbol_id, minute_idx)`.
-- [ ] Append `TradePayload` records, write `trade_ref` slots, and expose repair helpers (`clear_slot`, rewind hooks).
-- [ ] Instrument ingestion latency, record counts, and compression ratios.
+- [ ] Scaffold crate with engine trait implementation, config structs, and ingestion entrypoint.
+- [ ] Implement treasury feed client (or adapters) plus carry-forward logic that writes `rf_rate_ref` slots per symbol/minute.
+- [ ] Emit metrics/logs for curve lag, version churn, and per-symbol update counts.
+
+#### `trade-flatfile-engine`
+
+- [ ] Scaffold crate focused on historical/flatfile inputs and a batching pipeline keyed by `(symbol_id, minute_idx)`.
+- [ ] Append `TradeBatchPayload` records, write `trade_ref` slots, and expose repair helpers (`clear_slot`, rewind hooks) for backfills.
+- [ ] Instrument ingestion latency, record counts, file offsets, and retry counters.
+
+#### `trade-ws-engine`
+
+- [ ] Scaffold crate for realtime websocket ingestion with reconnect/backpressure handling.
+- [ ] Buffer minute windows, append `TradeBatchPayload` artifacts (or inline buffers) as minutes close, then write `trade_ref` slots promptly.
+- [ ] Instrument stream lag, reconnects, dropped messages, and per-minute publish latency.
 
 #### `quote-engine`
 
@@ -322,3 +349,32 @@ Use `[ ]` / `[x]` to track progress.
   - `Filled`: payload is durable and ready for downstream consumption.
   - `Cleared`: slot intentionally blank pending a refill (operators can distinguish this from never-touched rows).
   Engines transition `Empty → Pending → Filled` for normal ingestion and use `Cleared` when forcing a rewind before re-filling.
+
+## Notes
+
+How a trade engine writes a trade_ref - early concept:
+
+  Trade engine pseudocode
+
+  let minute_idx = controller
+      .minute_idx_for_timestamp(window_start_ts)
+      .expect("window in range");
+
+  let trade_batch = TradeBatchPayload {
+      schema_version: 1,
+      minute_ts: window_start_ts,
+      batch_id: next_batch_id(),
+      first_trade_ts,
+      last_trade_ts,
+      record_count,
+      artifact_uri: trade_artifact_uri.clone(),
+      checksum,
+  };
+
+  let payload_id = {
+      let mut stores = controller.payload_stores();
+      stores.trades.append(trade_batch)?
+  };
+
+  let meta = PayloadMeta::new(PayloadType::Trade, payload_id, version, checksum);
+  controller.set_trade_ref(symbol, minute_idx, meta, None)?;

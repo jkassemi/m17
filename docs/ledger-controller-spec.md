@@ -268,7 +268,7 @@ Use `[ ]` / `[x]` to track progress.
 - [x] Implement payload mapping stores with append-only allocation, checksum validation, and snapshot hooks.
 - [x] Add unit/integration tests covering mutation, replay, and CAS contention semantics.
 
-• Ledger & Controller Implementation Summary
+• Ledger & Controller Implementation Summary (ebb259a and 568415b)
 
 - Built a reusable ledger crate with dense TradeLedger/EnrichmentLedger row
     structures, slot semantics (PayloadType, SlotStatus, CAS checks), and a

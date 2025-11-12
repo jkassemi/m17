@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, watch};
 use tokio::time::{sleep, Duration};
 
-use metrics::Metrics;
+use metrics::{Metrics, OutdatedDataSnapshot};
 
 pub struct Tui {
     metrics: Arc<Metrics>,
@@ -98,10 +98,16 @@ impl Tui {
         let size = f.size();
         let service_statuses = self.metrics.service_status_snapshots();
         let current_files = self.metrics.current_files();
+        let outdated_entries = self.metrics.outdated_data();
         let status_block_height =
             std::cmp::max(4, (service_statuses.len() as u16).saturating_mul(3));
         let current_file_block_height =
             std::cmp::max(3, (current_files.len() as u16).saturating_mul(3));
+        let outdated_block_height = if outdated_entries.is_empty() {
+            3
+        } else {
+            std::cmp::max(3, (outdated_entries.len() as u16).saturating_mul(2))
+        };
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -110,6 +116,7 @@ impl Tui {
                     Constraint::Length(3),                         // ingestion progress
                     Constraint::Length(current_file_block_height), // current file progress
                     Constraint::Length(status_block_height),
+                    Constraint::Length(outdated_block_height),
                     Constraint::Percentage(100), // details
                 ]
                 .as_ref(),
@@ -201,6 +208,13 @@ impl Tui {
         );
         f.render_widget(status_block, chunks[2]);
 
+        // Outdated datasets
+        let outdated_lines = Self::format_outdated_lines(&outdated_entries);
+        let outdated_title = "Outdated data (see docs/runbooks/treasury-rebuild.md)";
+        let outdated_block = Paragraph::new(Text::from(outdated_lines))
+            .block(Block::default().borders(Borders::ALL).title(outdated_title));
+        f.render_widget(outdated_block, chunks[3]);
+
         // Metrics
         let last_request = self.metrics.last_request_ts_ns();
         let last_request_str = match last_request {
@@ -263,7 +277,7 @@ impl Tui {
         let paragraph = Paragraph::new(status_text)
             .block(Block::default().borders(Borders::ALL).title("Dashboard"))
             .alignment(Alignment::Left);
-        f.render_widget(paragraph, chunks[3]);
+        f.render_widget(paragraph, chunks[4]);
     }
 
     fn format_status_lines(statuses: &[ServiceStatusSnapshot]) -> Vec<Line<'static>> {
@@ -314,6 +328,43 @@ impl Tui {
                 lines.push(Line::from(vec![
                     Span::styled("  gauge: ", Style::default().fg(Color::Cyan)),
                     Span::raw(detail),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
+        lines
+    }
+
+    fn format_outdated_lines(entries: &[OutdatedDataSnapshot]) -> Vec<Line<'static>> {
+        if entries.is_empty() {
+            return vec![Line::from(Span::raw(
+                "No known outdated datasets; all runs match current dependencies.",
+            ))];
+        }
+        let mut lines = Vec::new();
+        for entry in entries {
+            let dependency_label = entry
+                .dependency_day
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let lag_label = entry
+                .lag_days
+                .map(|lag| format!("{} day lag", lag))
+                .unwrap_or_else(|| "lag unknown".to_string());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<12}", entry.dataset),
+                    Style::default().fg(Color::Yellow).bold(),
+                ),
+                Span::raw(format!(
+                    "{} → {} ({}, {})",
+                    entry.target_day, entry.dependency, dependency_label, lag_label
+                )),
+            ]));
+            if let Some(note) = &entry.note {
+                lines.push(Line::from(vec![
+                    Span::styled("  note: ", Style::default().fg(Color::Cyan)),
+                    Span::raw(note.clone()),
                 ]));
             }
             lines.push(Line::from(""));

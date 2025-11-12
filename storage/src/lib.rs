@@ -3,8 +3,8 @@
 //! Parquet writer/reader with partitioning, compaction, and deduplication.
 
 use arrow::array::{
-    ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StringArray, UInt32Array,
-    UInt64Array,
+    ArrayRef, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
+    UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{Int32Type, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -609,6 +609,7 @@ impl Storage {
         meta: &DataBatchMeta,
     ) -> Result<RecordBatch, StorageError> {
         let mut contract = Vec::new();
+        let mut trade_uid_bytes: Vec<[u8; 16]> = Vec::new();
         let mut contract_direction = Vec::new();
         let mut strike_price = Vec::new();
         let mut underlying = Vec::new();
@@ -643,6 +644,7 @@ impl Storage {
 
         for trade in trades {
             contract.push(trade.contract.clone());
+            trade_uid_bytes.push(trade.trade_uid);
             contract_direction.push(trade.contract_direction.to_string());
             strike_price.push(trade.strike_price);
             underlying.push(trade.underlying.clone());
@@ -677,6 +679,8 @@ impl Storage {
         }
 
         let schema: SchemaRef = Arc::new(option_trade_schema());
+        let trade_uid_array =
+            FixedSizeBinaryArray::try_from_iter(trade_uid_bytes.iter().map(|uid| uid.as_ref()))?;
         let conditions_array = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
             conditions
                 .into_iter()
@@ -684,6 +688,7 @@ impl Storage {
         ));
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(contract)),
+            Arc::new(trade_uid_array),
             Arc::new(StringArray::from(contract_direction)),
             Arc::new(Float64Array::from(strike_price)),
             Arc::new(StringArray::from(underlying)),
@@ -726,6 +731,7 @@ impl Storage {
         meta: &DataBatchMeta,
     ) -> Result<RecordBatch, StorageError> {
         let mut symbol = Vec::new();
+        let mut trade_uid_bytes: Vec<[u8; 16]> = Vec::new();
         let mut trade_ts_ns = Vec::new();
         let mut price = Vec::new();
         let mut size = Vec::new();
@@ -757,6 +763,7 @@ impl Storage {
 
         for trade in trades {
             symbol.push(trade.symbol.clone());
+            trade_uid_bytes.push(trade.trade_uid);
             trade_ts_ns.push(trade.trade_ts_ns);
             price.push(trade.price);
             size.push(trade.size);
@@ -788,6 +795,8 @@ impl Storage {
         }
 
         let schema: SchemaRef = Arc::new(equity_trade_schema());
+        let trade_uid_array =
+            FixedSizeBinaryArray::try_from_iter(trade_uid_bytes.iter().map(|uid| uid.as_ref()))?;
         let conditions_array = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
             conditions
                 .into_iter()
@@ -795,6 +804,7 @@ impl Storage {
         ));
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(symbol)),
+            Arc::new(trade_uid_array),
             Arc::new(Int64Array::from(trade_ts_ns)),
             Arc::new(Float64Array::from(price)),
             Arc::new(UInt32Array::from(size)),
@@ -835,6 +845,7 @@ impl Storage {
     ) -> Result<RecordBatch, StorageError> {
         let len = nbbos.len();
         let mut instrument_id = Vec::with_capacity(len);
+        let mut quote_uids: Vec<[u8; 16]> = Vec::with_capacity(len);
         let mut quote_ts_ns = Vec::with_capacity(len);
         let mut bid = Vec::with_capacity(len);
         let mut ask = Vec::with_capacity(len);
@@ -850,6 +861,7 @@ impl Storage {
 
         for quote in nbbos {
             instrument_id.push(quote.instrument_id.clone());
+            quote_uids.push(quote.quote_uid);
             quote_ts_ns.push(quote.quote_ts_ns);
             bid.push(quote.bid);
             ask.push(quote.ask);
@@ -865,8 +877,11 @@ impl Storage {
         }
 
         let schema: SchemaRef = Arc::new(nbbo_schema());
+        let quote_uid_array =
+            FixedSizeBinaryArray::try_from_iter(quote_uids.iter().map(|uid| uid.as_ref()))?;
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(instrument_id)),
+            Arc::new(quote_uid_array),
             Arc::new(Int64Array::from(quote_ts_ns)),
             Arc::new(Float64Array::from(bid)),
             Arc::new(Float64Array::from(ask)),
@@ -1450,14 +1465,28 @@ mod tests {
         AggressorSide, ClassMethod, Completeness, DataBatchMeta, EquityTrade, NbboState, Quality,
         Source, Watermark,
     };
+    use core_types::uid::equity_trade_uid;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs;
     use tempfile::TempDir;
 
     #[test]
     fn test_serialize_equity_trade() {
+        let trade_uid = equity_trade_uid(
+            "AAPL",
+            1640995200000000000,
+            Some(1640995200000000000),
+            Some(123456),
+            150.0,
+            100,
+            1,
+            Some("12345"),
+            Some(0),
+            &[1, 2],
+        );
         let trade = EquityTrade {
             symbol: "AAPL".to_string(),
+            trade_uid,
             trade_ts_ns: 1640995200000000000,
             price: 150.0,
             size: 100,
@@ -1506,7 +1535,7 @@ mod tests {
             .equity_trades_to_record_batch(&batch.rows, &batch.meta)
             .unwrap();
         assert_eq!(record_batch.num_rows(), 1);
-        assert_eq!(record_batch.num_columns(), 29);
+        assert_eq!(record_batch.num_columns(), 30);
     }
 
     #[test]
@@ -1519,8 +1548,21 @@ mod tests {
         );
         let mut storage = Storage::new(config);
 
+        let trade_uid = equity_trade_uid(
+            "AAPL",
+            1640995200000000000,
+            Some(1640995200000000000),
+            Some(123456),
+            150.0,
+            100,
+            1,
+            Some("12345"),
+            Some(0),
+            &[1],
+        );
         let trade1 = EquityTrade {
             symbol: "AAPL".to_string(),
+            trade_uid,
             trade_ts_ns: 1640995200000000000, // Same day
             price: 150.0,
             size: 100,

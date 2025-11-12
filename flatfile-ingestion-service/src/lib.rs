@@ -327,19 +327,44 @@ impl FlatfileIngestionService {
             }
         }
         info!("Processing options (OPRA) day: {}", date.format("%Y-%m-%d"));
-        let day_curve_state = {
-            let state = treasury.curve_state_for_date(date).await;
-            if state.read().await.is_none() {
+        let curve_selection = treasury.curve_state_for_date_with_metadata(date).await;
+        let day_curve_state = curve_selection.state.clone();
+        {
+            let curve_guard = day_curve_state.read().await;
+            if curve_guard.is_none() {
                 let msg = format!("missing treasury curve for {}", date);
                 error!("{}", msg);
                 status.set_overall(OverallStatus::Crit);
-                status.push_error(msg);
+                status.push_error(msg.clone());
+                metrics.flag_outdated_dependency(
+                    OPTIONS_DATASET,
+                    date,
+                    "treasury_curve",
+                    None,
+                    Some(msg),
+                );
             } else {
                 status.clear_errors_matching(|m| m.contains("treasury curve"));
                 status.set_overall(OverallStatus::Ok);
+                if let Some(source_date) = curve_selection.source_date {
+                    if source_date < date {
+                        let lag = date.signed_duration_since(source_date).num_days();
+                        metrics.flag_outdated_dependency(
+                            OPTIONS_DATASET,
+                            date,
+                            "treasury_curve",
+                            Some(source_date),
+                            Some(format!(
+                                "curve lagged by {} day(s); latest available {}",
+                                lag, source_date
+                            )),
+                        );
+                    } else {
+                        metrics.clear_outdated_dependency(OPTIONS_DATASET, date);
+                    }
+                }
             }
-            state
-        };
+        }
         let greeks_engine = GreeksEngine::new(
             greeks_cfg,
             nbbo_store,

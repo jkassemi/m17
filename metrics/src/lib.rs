@@ -1,5 +1,6 @@
 // Copyright (c) James Kassemi, SC, US. All rights reserved.
 //! Prometheus metrics. hyper v1.+
+use chrono::NaiveDate;
 use core_types::status::{
     MetricSample, ServiceMetricsReporter, ServiceStatusHandle, ServiceStatusSnapshot,
 };
@@ -48,6 +49,7 @@ pub struct Metrics {
     uptime_gauge: IntGauge,
     start_time: Instant,
     download_bytes_counter: IntCounter,
+    outdated_data: Arc<Mutex<Vec<OutdatedDataSnapshot>>>,
 }
 
 #[derive(Clone)]
@@ -69,6 +71,17 @@ struct CurrentFileState {
     total: u64,
     read: u64,
     started_ns: i64,
+}
+
+#[derive(Clone)]
+pub struct OutdatedDataSnapshot {
+    pub dataset: String,
+    pub target_day: String,
+    pub dependency: String,
+    pub dependency_day: Option<String>,
+    pub lag_days: Option<i64>,
+    pub note: Option<String>,
+    pub detected_ns: i64,
 }
 
 impl Metrics {
@@ -156,6 +169,7 @@ impl Metrics {
             uptime_gauge,
             start_time: Instant::now(),
             download_bytes_counter,
+            outdated_data: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -225,6 +239,61 @@ impl Metrics {
             .collect();
         snapshots.sort_by_key(|snapshot| snapshot.started_ns);
         snapshots
+    }
+
+    pub fn flag_outdated_dependency(
+        &self,
+        dataset: &str,
+        target_day: NaiveDate,
+        dependency: &str,
+        dependency_day: Option<NaiveDate>,
+        note: Option<String>,
+    ) {
+        let target_label = target_day.format("%Y-%m-%d").to_string();
+        let dependency_label = dependency_day.map(|d| d.format("%Y-%m-%d").to_string());
+        let lag_days = dependency_day.map(|d| {
+            let lag = target_day.signed_duration_since(d).num_days();
+            lag.max(0)
+        });
+        let detected_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let normalized_note = note.as_ref().and_then(|n| {
+            let trimmed = n.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        let mut entries = self.outdated_data.lock().unwrap();
+        entries.retain(|entry| !(entry.dataset == dataset && entry.target_day == target_label));
+        entries.push(OutdatedDataSnapshot {
+            dataset: dataset.to_string(),
+            target_day: target_label,
+            dependency: dependency.to_string(),
+            dependency_day: dependency_label,
+            lag_days,
+            note: normalized_note,
+            detected_ns,
+        });
+    }
+
+    pub fn clear_outdated_dependency(&self, dataset: &str, target_day: NaiveDate) {
+        let target_label = target_day.format("%Y-%m-%d").to_string();
+        let mut entries = self.outdated_data.lock().unwrap();
+        entries.retain(|entry| !(entry.dataset == dataset && entry.target_day == target_label));
+    }
+
+    pub fn outdated_data(&self) -> Vec<OutdatedDataSnapshot> {
+        let mut entries = self.outdated_data.lock().unwrap().clone();
+        entries.sort_by(|a, b| {
+            let key_a = (&a.dataset, &a.target_day, a.detected_ns);
+            let key_b = (&b.dataset, &b.target_day, b.detected_ns);
+            key_a.cmp(&key_b)
+        });
+        entries
     }
 
     pub fn track_current_file(self: &Arc<Self>, name: String, total: u64) -> FileProgressGuard {

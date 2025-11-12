@@ -1,5 +1,6 @@
 // Copyright (c) James Kassemi, SC, US. All rights reserved.
 
+use crate::uid::{QuoteUid, TradeUid};
 use serde::{Deserialize, Serialize};
 
 /// Common enums as per spec.
@@ -71,6 +72,7 @@ pub struct Watermark {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptionTrade {
     pub contract: String,
+    pub trade_uid: TradeUid,
     pub contract_direction: char,
     pub strike_price: f64,
     pub underlying: String,
@@ -108,6 +110,7 @@ pub struct OptionTrade {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EquityTrade {
     pub symbol: String,
+    pub trade_uid: TradeUid,
     pub trade_ts_ns: i64,
     pub price: f64,
     pub size: u32,
@@ -142,6 +145,7 @@ pub struct EquityTrade {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Nbbo {
     pub instrument_id: String,
+    pub quote_uid: QuoteUid,
     pub quote_ts_ns: i64,
     pub bid: f64,
     pub ask: f64,

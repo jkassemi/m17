@@ -13,6 +13,7 @@ use core_types::types::{
     AggressorSide, ClassMethod, Completeness, DataBatch, DataBatchMeta, EquityTrade, Nbbo,
     OptionTrade, Quality, QueryScope, Source, Watermark,
 };
+use core_types::uid::{equity_trade_uid, option_trade_uid, quote_uid};
 use csv_async::AsyncReaderBuilder;
 use futures::{Stream, StreamExt};
 use log::info;
@@ -645,16 +646,42 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                         }
                         continue;
                     }
+                    let exchange: i32 = record[3].parse().unwrap_or(0);
+                    let trade_ts_ns = record[5].parse().unwrap_or(0);
+                    let price = record[6].parse().unwrap_or(0.0);
+                    let seq: u64 = record[7].parse().unwrap_or(0);
+                    let participant_ts_ns: i64 = record[8].parse().unwrap_or(0);
+                    let size: u32 = record[9].parse().unwrap_or(0);
+                    let correction: i32 = record[2].parse().unwrap_or(0);
+                    let trade_id_value = record[4].to_string();
+                    let conditions: Vec<i32> = record[1]
+                        .split(',')
+                        .filter_map(|s| s.trim().parse().ok())
+                        .collect();
+                    let trade_uid = equity_trade_uid(
+                        &symbol,
+                        trade_ts_ns,
+                        Some(participant_ts_ns),
+                        Some(seq as u64),
+                        price,
+                        size,
+                        exchange,
+                        if trade_id_value.is_empty() {
+                            None
+                        } else {
+                            Some(trade_id_value.as_str())
+                        },
+                        Some(correction),
+                        &conditions,
+                    );
                     let trade = EquityTrade {
                         symbol,
-                        trade_ts_ns: record[5].parse().unwrap_or(0),
-                        price: record[6].parse().unwrap_or(0.0),
-                        size: record[9].parse().unwrap_or(0),
-                        conditions: record[1]
-                            .split(',')
-                            .filter_map(|s| s.trim().parse().ok())
-                            .collect(),
-                        exchange: record[3].parse().unwrap_or(0),
+                        trade_uid,
+                        trade_ts_ns,
+                        price,
+                        size,
+                        conditions,
+                        exchange,
                         aggressor_side: AggressorSide::Unknown,
                         class_method: ClassMethod::Unknown,
                         aggressor_offset_mid_bp: None,
@@ -671,11 +698,11 @@ async fn process_equity_trades_stream<S: SourceTrait>(
                         source: Source::Flatfile,
                         quality: Quality::Prelim,
                         watermark_ts_ns: 0,
-                        trade_id: Some(record[4].to_string()),
-                        seq: Some(record[7].parse().unwrap_or(0)),
-                        participant_ts_ns: Some(record[8].parse().unwrap_or(0)),
+                        trade_id: Some(trade_id_value),
+                        seq: Some(seq),
+                        participant_ts_ns: Some(participant_ts_ns),
                         tape: Some(record[10].to_string()),
-                        correction: Some(record[2].parse().unwrap_or(0)),
+                        correction: Some(correction),
                         trf_id: Some(record[11].to_string()),
                         trf_ts_ns: Some(record[12].parse().unwrap_or(0)),
                     };
@@ -806,6 +833,7 @@ async fn process_nbbo_stream<S: SourceTrait>(
                         record
                             .get(7)
                             .and_then(|s| if s.is_empty() { None } else { s.parse().ok() });
+                    let sequence_number: Option<u64> = record.get(10).and_then(|s| s.parse().ok());
                     let sip_ts: i64 = record[11].parse().unwrap_or(0);
                     // Infer state
                     let state = if ask > 0.0 {
@@ -819,9 +847,21 @@ async fn process_nbbo_stream<S: SourceTrait>(
                     } else {
                         core_types::types::NbboState::Normal
                     };
-
+                    let quote_uid = quote_uid(
+                        &symbol,
+                        sip_ts,
+                        sequence_number,
+                        bid,
+                        ask,
+                        bid_sz,
+                        ask_sz,
+                        Some(bid_ex),
+                        Some(ask_ex),
+                        cond_opt,
+                    );
                     let nbbo = Nbbo {
                         instrument_id: symbol,
+                        quote_uid,
                         quote_ts_ns: sip_ts,
                         bid,
                         ask,
@@ -947,20 +987,36 @@ async fn process_option_trades_stream<S: SourceTrait>(
                             &contract,
                             record.get(6).and_then(|s| s.parse::<i64>().ok()),
                         );
+                    let trade_ts_ns = record[6].parse().unwrap_or(0);
+                    let participant_ts_ns = record.get(4).and_then(|s| s.parse::<i64>().ok());
+                    let price = record[5].parse().unwrap_or(0.0);
+                    let size: u32 = record[7].parse().unwrap_or(0);
+                    let exchange: i32 = record[3].parse().unwrap_or(0);
+                    let conditions: Vec<i32> = record[1]
+                        .split(',')
+                        .filter_map(|s| s.trim().parse().ok())
+                        .collect();
+                    let trade_uid = option_trade_uid(
+                        &contract,
+                        trade_ts_ns,
+                        participant_ts_ns,
+                        price,
+                        size,
+                        exchange,
+                        &conditions,
+                    );
 
                     let trade = OptionTrade {
                         contract: contract.clone(),
+                        trade_uid,
                         contract_direction,
                         strike_price,
                         underlying,
-                        trade_ts_ns: record[6].parse().unwrap_or(0),
-                        price: record[5].parse().unwrap_or(0.0),
-                        size: record[7].parse().unwrap_or(0),
-                        conditions: record[1]
-                            .split(',')
-                            .filter_map(|s| s.trim().parse().ok())
-                            .collect(),
-                        exchange: record[3].parse().unwrap_or(0),
+                        trade_ts_ns,
+                        price,
+                        size,
+                        conditions,
+                        exchange,
                         expiry_ts_ns,
                         aggressor_side: AggressorSide::Unknown,
                         class_method: ClassMethod::Unknown,

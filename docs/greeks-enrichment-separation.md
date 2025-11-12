@@ -65,7 +65,9 @@ data/
 
 ### Identifier Strategy
 
-- Prefer the upstream `trade_id` if present (options data already includes it). When absent, generate `options_trade_uid = blake3(contract || trade_ts_ns || seq || exchange)` during ingestion and persist it in both raw and Greeks datasets.
+- Always use a local blake3-based trade and quote id for both options and equities. We have concerns about trade identifiers from external sources.
+
+- Generate `options_trade_uid = blake3(contract || trade_ts_ns || seq || exchange)` during ingestion and persist it in both raw and Greeks datasets.
 - Store the UID in raw parquet going forward so historical joins are trivial.
 - Greeks parquet only needs the UID plus derived metrics, keeping files slim.
 - NBBO overlay rows reference either `trade_uid` (for options) or `quote_uid` (for equities). For equities we can hash `(symbol, quote_ts_ns, sequence_number)` into `quote_uid` to support joins with storage and DADV calculations.
@@ -109,7 +111,6 @@ Join-friendly representation:
 
 - Use the existing batch pipeline to stream raw rows directly into the Greeks writer during the same process when dependencies are satisfied, avoiding disk rereads in the common case.
 - For reruns, pin parquet row groups in object storage or local cache to minimize IO.
-- Provide a combined “view” in `storage` that lazily joins raw + Greeks for legacy consumers until they migrate.
 - GC queue: manifests with `expires_at` schedule deletions in a priority queue keyed by deadline. Superseded runs enter the queue immediately but respect a short grace window to drain readers. Expired on-the-fly runs default to “never” unless `expires_at` is set.
 
 ## Rollout Plan

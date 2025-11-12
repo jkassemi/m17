@@ -552,13 +552,16 @@ impl TreasuryCurve {
 mod tests {
     use super::*;
     use core_types::types::{Nbbo, NbboState, Quality, Source};
+    use core_types::uid::{option_trade_uid, quote_uid};
 
     const ONE_YEAR_NS: i64 = 31_536_000_000_000_000;
     const BASE_TRADE_TS_NS: i64 = 1_000_100_000;
 
     fn mk_nbbo(sym: &str, ts_ns: i64, bid: f64, ask: f64) -> Nbbo {
+        let quote_uid = quote_uid(sym, ts_ns, None, bid, ask, 1, 1, Some(12), Some(11), None);
         Nbbo {
             instrument_id: sym.to_string(),
+            quote_uid,
             quote_ts_ns: ts_ns,
             bid,
             ask,
@@ -591,8 +594,18 @@ mod tests {
     }
 
     fn sample_trade() -> OptionTrade {
+        let trade_uid = option_trade_uid(
+            "O:SPY250101C00400000",
+            BASE_TRADE_TS_NS,
+            None,
+            1.0,
+            1,
+            11,
+            &[],
+        );
         OptionTrade {
             contract: "O:SPY250101C00400000".to_string(),
+            trade_uid,
             contract_direction: 'C',
             strike_price: 400.0,
             underlying: "SPY".to_string(),

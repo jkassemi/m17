@@ -117,10 +117,13 @@ impl NbboStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_types::uid::quote_uid;
 
     fn mk_nbbo(sym: &str, ts_ns: i64, bid: f64, ask: f64) -> Nbbo {
+        let quote_uid = quote_uid(sym, ts_ns, None, bid, ask, 1, 1, Some(12), Some(11), None);
         Nbbo {
             instrument_id: sym.to_string(),
+            quote_uid,
             quote_ts_ns: ts_ns,
             bid,
             ask,

@@ -18,6 +18,12 @@ use tokio::sync::RwLock;
 type CurveCache = Arc<RwLock<HashMap<NaiveDate, Arc<TreasuryCurve>>>>;
 type LatestCurve = Arc<RwLock<Option<Arc<TreasuryCurve>>>>;
 
+#[derive(Clone)]
+pub struct CurveStateSelection {
+    pub state: LatestCurve,
+    pub source_date: Option<NaiveDate>,
+}
+
 #[async_trait]
 pub trait TreasuryCurveFetcher: Send + Sync {
     async fn fetch_latest(
@@ -289,6 +295,14 @@ impl TreasuryServiceHandle {
 
     pub async fn curve_for_date(&self, date: NaiveDate) -> Option<Arc<TreasuryCurve>> {
         let cache = self.cache.read().await;
+        lookup_curve_on_or_before(&cache, date).map(|(_, curve)| curve)
+    }
+
+    pub async fn curve_for_date_with_metadata(
+        &self,
+        date: NaiveDate,
+    ) -> Option<(NaiveDate, Arc<TreasuryCurve>)> {
+        let cache = self.cache.read().await;
         lookup_curve_on_or_before(&cache, date)
     }
 
@@ -301,9 +315,22 @@ impl TreasuryServiceHandle {
         Arc::clone(&self.latest)
     }
 
+    pub async fn curve_state_for_date_with_metadata(&self, date: NaiveDate) -> CurveStateSelection {
+        let (initial_curve, source_date) = {
+            let cache = self.cache.read().await;
+            match lookup_curve_on_or_before(&cache, date) {
+                Some((curve_date, curve)) => (Some(curve), Some(curve_date)),
+                None => (None, None),
+            }
+        };
+        CurveStateSelection {
+            state: Arc::new(RwLock::new(initial_curve)),
+            source_date,
+        }
+    }
+
     pub async fn curve_state_for_date(&self, date: NaiveDate) -> LatestCurve {
-        let initial = self.curve_for_date(date).await;
-        Arc::new(RwLock::new(initial))
+        self.curve_state_for_date_with_metadata(date).await.state
     }
 
     pub async fn latest_curve_date(&self) -> Option<NaiveDate> {
@@ -314,15 +341,15 @@ impl TreasuryServiceHandle {
 fn lookup_curve_on_or_before(
     cache: &HashMap<NaiveDate, Arc<TreasuryCurve>>,
     date: NaiveDate,
-) -> Option<Arc<TreasuryCurve>> {
+) -> Option<(NaiveDate, Arc<TreasuryCurve>)> {
     if let Some(curve) = cache.get(&date) {
-        return Some(curve.clone());
+        return Some((date, curve.clone()));
     }
     cache
         .iter()
         .filter(|(candidate, _)| **candidate <= date)
         .max_by_key(|(candidate, _)| *candidate)
-        .map(|(_, curve)| curve.clone())
+        .map(|(candidate, curve)| (*candidate, curve.clone()))
 }
 
 async fn fetch_latest_treasury_curve(

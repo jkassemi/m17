@@ -6,6 +6,7 @@ use core_types::opra::parse_opra_contract;
 use core_types::types::{
     AggressorSide, ClassMethod, EquityTrade, Nbbo, NbboState, OptionTrade, Quality, Source,
 };
+use core_types::uid::{equity_trade_uid, option_trade_uid, quote_uid};
 use futures::{
     stream::{SplitSink, SplitStream},
     SinkExt, Stream, StreamExt,
@@ -349,6 +350,8 @@ fn raw_quote_to_nbbo(raw: RawQuote) -> Option<Nbbo> {
     let quote_ts_ns = millis_to_ns(raw.ts_ms);
     let bid = raw.bid_price;
     let ask = raw.ask_price;
+    let bid_sz = raw.bid_size.unwrap_or(0);
+    let ask_sz = raw.ask_size.unwrap_or(0);
     let state = if bid > ask {
         NbboState::Crossed
     } else if (bid - ask).abs() < f64::EPSILON {
@@ -356,13 +359,26 @@ fn raw_quote_to_nbbo(raw: RawQuote) -> Option<Nbbo> {
     } else {
         NbboState::Normal
     };
+    let quote_uid = quote_uid(
+        &instrument,
+        quote_ts_ns,
+        None,
+        bid,
+        ask,
+        bid_sz,
+        ask_sz,
+        raw.bid_exchange,
+        raw.ask_exchange,
+        raw.condition,
+    );
     Some(Nbbo {
         instrument_id: instrument,
+        quote_uid,
         quote_ts_ns,
         bid,
         ask,
-        bid_sz: raw.bid_size.unwrap_or(0),
-        ask_sz: raw.ask_size.unwrap_or(0),
+        bid_sz,
+        ask_sz,
         state,
         condition: raw.condition,
         best_bid_venue: raw.bid_exchange,
@@ -379,17 +395,30 @@ fn raw_option_trade_to_row(raw: RawOptionTrade) -> Option<OptionTrade> {
         return None;
     }
     let trade_ts_ns = millis_to_ns(raw.ts_ms);
+    let size = raw.size.unwrap_or(0);
+    let exchange = raw.exchange.unwrap_or(0);
+    let conditions = raw.conditions.unwrap_or_default();
     let (dir, strike, expiry_ts_ns, underlying) = parse_opra_contract(&contract, Some(trade_ts_ns));
+    let trade_uid = option_trade_uid(
+        &contract,
+        trade_ts_ns,
+        None,
+        raw.price,
+        size,
+        exchange,
+        &conditions,
+    );
     Some(OptionTrade {
         contract,
+        trade_uid,
         contract_direction: dir,
         strike_price: strike,
         underlying,
         trade_ts_ns,
         price: raw.price,
-        size: raw.size.unwrap_or(0),
-        conditions: raw.conditions.unwrap_or_default(),
-        exchange: raw.exchange.unwrap_or(0),
+        size,
+        conditions,
+        exchange,
         expiry_ts_ns,
         aggressor_side: AggressorSide::Unknown,
         class_method: ClassMethod::Unknown,
@@ -422,13 +451,31 @@ fn millis_to_ns(ms: i64) -> i64 {
 
 fn raw_equity_trade_to_row(raw: RawEquityTrade) -> Option<EquityTrade> {
     let symbol = raw.sym?;
+    let trade_ts_ns = millis_to_ns(raw.ts_ms);
+    let size = raw.size.unwrap_or(0);
+    let exchange = raw.exchange.unwrap_or(0);
+    let conditions = raw.conditions.unwrap_or_default();
+    let trade_id = raw.trade_id;
+    let trade_uid = equity_trade_uid(
+        &symbol,
+        trade_ts_ns,
+        None,
+        None,
+        raw.price,
+        size,
+        exchange,
+        trade_id.as_deref(),
+        None,
+        &conditions,
+    );
     Some(EquityTrade {
         symbol,
-        trade_ts_ns: millis_to_ns(raw.ts_ms),
+        trade_uid,
+        trade_ts_ns,
         price: raw.price,
-        size: raw.size.unwrap_or(0),
-        conditions: raw.conditions.unwrap_or_default(),
-        exchange: raw.exchange.unwrap_or(0),
+        size,
+        conditions,
+        exchange,
         aggressor_side: AggressorSide::Unknown,
         class_method: ClassMethod::Unknown,
         aggressor_offset_mid_bp: None,
@@ -444,8 +491,8 @@ fn raw_equity_trade_to_row(raw: RawEquityTrade) -> Option<EquityTrade> {
         tick_size_used: None,
         source: Source::Ws,
         quality: Quality::Prelim,
-        watermark_ts_ns: millis_to_ns(raw.ts_ms),
-        trade_id: raw.trade_id,
+        watermark_ts_ns: trade_ts_ns,
+        trade_id,
         seq: None,
         participant_ts_ns: None,
         tape: None,

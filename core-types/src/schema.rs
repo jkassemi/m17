@@ -9,6 +9,7 @@ use std::sync::Arc;
 pub fn option_trade_schema() -> Schema {
     Schema::new(vec![
         Field::new("contract", DataType::Utf8, false),
+        Field::new("trade_uid", DataType::FixedSizeBinary(16), false),
         Field::new("contract_direction", DataType::Utf8, false),
         Field::new("strike_price", DataType::Float64, false),
         Field::new("underlying", DataType::Utf8, false),
@@ -51,6 +52,7 @@ pub fn option_trade_schema() -> Schema {
 pub fn equity_trade_schema() -> Schema {
     Schema::new(vec![
         Field::new("symbol", DataType::Utf8, false),
+        Field::new("trade_uid", DataType::FixedSizeBinary(16), false),
         Field::new("trade_ts_ns", DataType::Int64, false),
         Field::new("price", DataType::Float64, false),
         Field::new("size", DataType::UInt32, false),
@@ -90,6 +92,7 @@ pub fn equity_trade_schema() -> Schema {
 pub fn nbbo_schema() -> Schema {
     Schema::new(vec![
         Field::new("instrument_id", DataType::Utf8, false),
+        Field::new("quote_uid", DataType::FixedSizeBinary(16), false),
         Field::new("quote_ts_ns", DataType::Int64, false),
         Field::new("bid", DataType::Float64, false),
         Field::new("ask", DataType::Float64, false),

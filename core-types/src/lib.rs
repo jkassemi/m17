@@ -8,3 +8,4 @@ pub mod retry;
 pub mod schema;
 pub mod status;
 pub mod types;
+pub mod uid;

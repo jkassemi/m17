@@ -1,12 +1,20 @@
-use std::{env, net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{
+    collections::HashSet,
+    env, net::SocketAddr,
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+};
 
 use core_types::config::DateRange;
 use thiserror::Error;
 use time::macros::date;
 use window_space::{
-    WindowRangeConfig, WindowSpace,
+    SymbolId, WindowRangeConfig, WindowSpace,
     config::{DEFAULT_MAX_SYMBOLS, WindowSpaceConfig},
 };
+
+const DEV_SYMBOLS: &[&str] = &["AAPL", "F", "TSLA", "NVDA", "GME", "SPY"];
 
 /// Deployment target for the binary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,19 +48,34 @@ pub struct AppConfig {
     pub options_ws_url: &'static str,
     pub secrets: Secrets,
     pub flatfile: FlatfileSettings,
+    pub symbol_universe: Option<Arc<HashSet<String>>>,
 }
 
 impl AppConfig {
     pub fn load(env: Environment) -> Result<Self, ConfigError> {
+        let symbol_universe = symbol_universe_for(env);
+        let mut ledger = ledger_config_for(env);
+        ledger.max_symbols = symbol_universe
+            .as_ref()
+            .map(|set| {
+                let limit = set.len();
+                assert!(
+                    limit <= SymbolId::MAX as usize,
+                    "symbol universe size exceeds SymbolId capacity"
+                );
+                limit as SymbolId
+            })
+            .unwrap_or(DEFAULT_MAX_SYMBOLS);
         Ok(Self {
             env,
-            ledger: ledger_config_for(env),
+            ledger,
             metrics_addr: metrics_addr_for(env),
             rest_base_url: "https://api.massive.com",
             stocks_ws_url: "wss://socket.massive.com/stocks",
             options_ws_url: "wss://socket.massive.com/options",
             secrets: Secrets::from_env()?,
             flatfile: FlatfileSettings::for_env(env),
+            symbol_universe,
         })
     }
 
@@ -96,12 +119,7 @@ fn ledger_config_for(env: Environment) -> WindowSpaceConfig {
         Environment::Prod => PathBuf::from("/home/james/ledger.state"),
     };
 
-    let mut cfg = WindowSpaceConfig::new(ledger_state_dir, session_windows(env));
-    cfg.max_symbols = match env {
-        Environment::Dev => DEFAULT_MAX_SYMBOLS,
-        Environment::Prod => DEFAULT_MAX_SYMBOLS,
-    };
-    cfg
+    WindowSpaceConfig::new(ledger_state_dir, session_windows(env))
 }
 
 fn metrics_addr_for(env: Environment) -> SocketAddr {
@@ -129,6 +147,15 @@ fn session_windows(env: Environment) -> WindowSpace {
             )
         }
         Environment::Prod => WindowSpace::from_range(&base),
+    }
+}
+
+fn symbol_universe_for(env: Environment) -> Option<Arc<HashSet<String>>> {
+    match env {
+        Environment::Dev => Some(Arc::new(
+            DEV_SYMBOLS.iter().map(|sym| sym.to_string()).collect(),
+        )),
+        Environment::Prod => None,
     }
 }
 

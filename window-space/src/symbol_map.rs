@@ -37,7 +37,7 @@ impl SymbolMap {
         max_symbols: SymbolId,
     ) -> Result<Self, SymbolMapError> {
         let path = path.as_ref().to_path_buf();
-        let forward = if path.exists() {
+        let mut forward = if path.exists() {
             let bytes = fs::read(&path)?;
             if bytes.is_empty() {
                 Vec::new()
@@ -49,6 +49,11 @@ impl SymbolMap {
         } else {
             Vec::new()
         };
+
+        let limit = max_symbols as usize;
+        if forward.len() > limit {
+            forward.truncate(limit);
+        }
 
         let mut reverse = HashMap::new();
         for (idx, symbol) in forward.iter().enumerate() {

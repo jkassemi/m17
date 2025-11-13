@@ -12,12 +12,13 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::rt::TokioIo;
-use prometheus::{Encoder, IntGaugeVec, Opts, Registry, TextEncoder};
+use prometheus::{Encoder, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
 use tokio::{net::TcpListener, sync::oneshot};
 use trade_flatfile_engine::{DownloadMetrics, DownloadSnapshot};
 use window_space::{
     payload::SlotKind,
     slot_metrics::{SlotCountsSnapshot, SlotMetrics, SlotMetricsSnapshot},
+    WindowSpaceController,
 };
 
 pub struct MetricsServer {
@@ -29,6 +30,7 @@ impl MetricsServer {
     pub fn start(
         slot_metrics: Arc<SlotMetrics>,
         download_metrics: Arc<DownloadMetrics>,
+        controller: Arc<WindowSpaceController>,
         addr: SocketAddr,
     ) -> Self {
         static LOG_ONCE: OnceLock<()> = OnceLock::new();
@@ -38,7 +40,13 @@ impl MetricsServer {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let handle = thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().expect("start metrics runtime");
-            runtime.block_on(run_http(slot_metrics, download_metrics, addr, shutdown_rx));
+            runtime.block_on(run_http(
+                slot_metrics,
+                download_metrics,
+                controller,
+                addr,
+                shutdown_rx,
+            ));
         });
         Self {
             shutdown: Some(shutdown_tx),
@@ -59,6 +67,7 @@ impl MetricsServer {
 async fn run_http(
     slot_metrics: Arc<SlotMetrics>,
     download_metrics: Arc<DownloadMetrics>,
+    controller: Arc<WindowSpaceController>,
     addr: SocketAddr,
     mut shutdown: oneshot::Receiver<()>,
 ) {
@@ -79,8 +88,17 @@ async fn run_http(
                         let exporter = exporter.clone();
                         let slot_metrics = Arc::clone(&slot_metrics);
                         let download_metrics = Arc::clone(&download_metrics);
+                        let controller = Arc::clone(&controller);
                         tokio::spawn(async move {
-                            if let Err(err) = serve_connection(stream, exporter, slot_metrics, download_metrics).await {
+                            if let Err(err) = serve_connection(
+                                stream,
+                                exporter,
+                                slot_metrics,
+                                download_metrics,
+                                controller,
+                            )
+                            .await
+                            {
                                 eprintln!("metrics connection error: {err}");
                             }
                         });
@@ -99,14 +117,22 @@ async fn serve_connection(
     exporter: Arc<MetricsExporter>,
     slot_metrics: Arc<SlotMetrics>,
     download_metrics: Arc<DownloadMetrics>,
+    controller: Arc<WindowSpaceController>,
 ) -> Result<(), hyper::Error> {
     let io = TokioIo::new(stream);
     let service = service_fn(move |req: Request<Incoming>| {
         let exporter = exporter.clone();
         let slot_metrics = Arc::clone(&slot_metrics);
         let download_metrics = Arc::clone(&download_metrics);
+        let controller = Arc::clone(&controller);
         async move {
-            let response = handle_request(req, exporter, slot_metrics, download_metrics);
+            let response = handle_request(
+                req,
+                exporter,
+                slot_metrics,
+                download_metrics,
+                controller,
+            );
             Ok::<_, hyper::Error>(response)
         }
     });
@@ -119,6 +145,7 @@ fn handle_request(
     exporter: Arc<MetricsExporter>,
     slot_metrics: Arc<SlotMetrics>,
     download_metrics: Arc<DownloadMetrics>,
+    controller: Arc<WindowSpaceController>,
 ) -> Response<Full<Bytes>> {
     if req.uri().path() != "/metrics" {
         return Response::builder()
@@ -128,8 +155,9 @@ fn handle_request(
     }
     let snapshot = slot_metrics.snapshot();
     let downloads = download_metrics.snapshot();
+    let symbol_count = controller.symbol_count();
     let body = exporter
-        .render(snapshot, &downloads)
+        .render(snapshot, &downloads, symbol_count)
         .unwrap_or_else(|_| b"metrics_unavailable".to_vec());
     Response::builder()
         .status(200)
@@ -144,6 +172,7 @@ struct MetricsExporter {
     window_gauge: IntGaugeVec,
     download_streamed: IntGaugeVec,
     download_remaining: IntGaugeVec,
+    symbol_count: IntGauge,
 }
 
 impl MetricsExporter {
@@ -193,12 +222,21 @@ impl MetricsExporter {
         registry
             .register(Box::new(download_remaining.clone()))
             .expect("register download remaining");
+        let symbol_count = IntGauge::with_opts(Opts::new(
+            "windowspace_symbol_count",
+            "Current number of symbols tracked in the window space",
+        ))
+        .expect("symbol count gauge");
+        registry
+            .register(Box::new(symbol_count.clone()))
+            .expect("register symbol count gauge");
         Self {
             registry,
             slot_gauge,
             window_gauge,
             download_streamed,
             download_remaining,
+            symbol_count,
         }
     }
 
@@ -206,6 +244,7 @@ impl MetricsExporter {
         &self,
         snapshot: SlotMetricsSnapshot,
         downloads: &[DownloadSnapshot],
+        symbols: usize,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         self.window_gauge
             .with_label_values(&["trade"])
@@ -216,6 +255,7 @@ impl MetricsExporter {
         self.record_slots(&snapshot.trade_slots);
         self.record_slots(&snapshot.enrichment_slots);
         self.record_downloads(downloads);
+        self.symbol_count.set(symbols as i64);
         let metric_families = self.registry.gather();
         let mut buffer = Vec::new();
         TextEncoder::new().encode(&metric_families, &mut buffer)?;

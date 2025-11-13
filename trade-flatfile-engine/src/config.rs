@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use crate::download_metrics::DownloadMetrics;
 use core_types::config::DateRange;
@@ -18,6 +18,7 @@ pub struct FlatfileRuntimeConfig {
     pub progress_update_ms: u64,
     pub progress_logging: bool,
     pub download_metrics: Arc<DownloadMetrics>,
+    pub symbol_universe: Option<Arc<HashSet<String>>>,
 }
 
 impl FlatfileRuntimeConfig {
@@ -27,5 +28,13 @@ impl FlatfileRuntimeConfig {
 
     pub fn artifact_root(&self) -> PathBuf {
         self.state_dir.join("trade-flatfile").join("artifacts")
+    }
+
+    pub fn allows_symbol(&self, symbol: &str) -> bool {
+        if let Some(filter) = &self.symbol_universe {
+            filter.contains(symbol)
+        } else {
+            true
+        }
     }
 }

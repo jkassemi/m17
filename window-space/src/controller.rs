@@ -401,6 +401,11 @@ impl WindowSpaceController {
         Arc::clone(&self.slot_metrics)
     }
 
+    pub fn symbol_count(&self) -> usize {
+        let map = self.symbol_map.read();
+        map.len()
+    }
+
     #[deprecated(since = "0.1.0", note = "Use window_idx_for_timestamp() instead")]
     pub fn minute_idx_for_timestamp(&self, timestamp: i64) -> Option<WindowIndex> {
         self.window_idx_for_timestamp(timestamp)

@@ -53,6 +53,7 @@ fn run() -> Result<(), AppError> {
         progress_update_ms: config.flatfile.progress_update_ms,
         progress_logging: args.progress_logging,
         download_metrics: Arc::clone(&download_metrics),
+        symbol_universe: config.symbol_universe.clone(),
     };
     let option_trade_engine =
         OptionTradeFlatfileEngine::new(flatfile_cfg.clone(), controller.clone());
@@ -108,6 +109,7 @@ fn run() -> Result<(), AppError> {
     let metrics_server = MetricsServer::start(
         controller.slot_metrics(),
         download_metrics,
+        Arc::clone(&controller),
         config.metrics_addr,
     );
     wait_for_shutdown_signal()?;

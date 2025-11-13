@@ -330,6 +330,9 @@ impl OptionTradeInner {
         symbol: &str,
         window_idx: WindowIndex,
     ) -> Result<SymbolWindow<OptionTradeRecord>, FlatfileError> {
+        if !self.config.allows_symbol(symbol) {
+            return Ok(SymbolWindow::skipped(symbol, window_idx));
+        }
         let key = WindowKey {
             symbol: symbol.to_string(),
             window_idx,
@@ -575,6 +578,9 @@ impl OptionQuoteInner {
         symbol: &str,
         window_idx: WindowIndex,
     ) -> Result<SymbolWindow<QuoteRecord>, FlatfileError> {
+        if !self.config.allows_symbol(symbol) {
+            return Ok(SymbolWindow::skipped(symbol, window_idx));
+        }
         let key = WindowKey {
             symbol: symbol.to_string(),
             window_idx,
@@ -825,6 +831,9 @@ impl UnderlyingTradeInner {
         symbol: &str,
         window_idx: WindowIndex,
     ) -> Result<SymbolWindow<UnderlyingTradeRecord>, FlatfileError> {
+        if !self.config.allows_symbol(symbol) {
+            return Ok(SymbolWindow::skipped(symbol, window_idx));
+        }
         let key = WindowKey {
             symbol: symbol.to_string(),
             window_idx,
@@ -1075,6 +1084,9 @@ impl UnderlyingQuoteInner {
         symbol: &str,
         window_idx: WindowIndex,
     ) -> Result<SymbolWindow<QuoteRecord>, FlatfileError> {
+        if !self.config.allows_symbol(symbol) {
+            return Ok(SymbolWindow::skipped(symbol, window_idx));
+        }
         let key = WindowKey {
             symbol: symbol.to_string(),
             window_idx,

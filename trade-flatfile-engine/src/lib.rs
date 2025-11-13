@@ -43,11 +43,6 @@ use engine_api::{
 };
 use errors::FlatfileError;
 use futures::StreamExt;
-use ledger::{
-    LedgerController, MinuteIndex, SlotStatus,
-    mapping::{QuoteBatchPayload, TradeBatchPayload},
-    payload::{PayloadMeta, PayloadType, SlotKind, TradeSlotKind},
-};
 use log::{error, info, warn};
 use minute_bucket::{HasTimestamp, MinuteBucket};
 use parking_lot::Mutex;
@@ -58,6 +53,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use trading_calendar::{Market, TradingCalendar};
+use window_space::{
+    MinuteIndex, SlotStatus, WindowSpaceController,
+    mapping::{QuoteBatchPayload, TradeBatchPayload},
+    payload::{PayloadMeta, PayloadType, SlotKind, TradeSlotKind},
+};
 
 const OPTION_TRADE_SCHEMA_VERSION: u8 = 1;
 const QUOTE_SCHEMA_VERSION: u8 = 1;
@@ -81,7 +81,7 @@ pub struct UnderlyingQuoteFlatfileEngine {
 
 struct OptionTradeInner {
     config: FlatfileRuntimeConfig,
-    ledger: Arc<LedgerController>,
+    ledger: Arc<WindowSpaceController>,
     client: Client,
     state: Mutex<EngineRuntimeState>,
     batch_seq: AtomicU32,
@@ -90,7 +90,7 @@ struct OptionTradeInner {
 
 struct OptionQuoteInner {
     config: FlatfileRuntimeConfig,
-    ledger: Arc<LedgerController>,
+    ledger: Arc<WindowSpaceController>,
     client: Client,
     state: Mutex<EngineRuntimeState>,
     batch_seq: AtomicU32,
@@ -99,7 +99,7 @@ struct OptionQuoteInner {
 
 struct UnderlyingTradeInner {
     config: FlatfileRuntimeConfig,
-    ledger: Arc<LedgerController>,
+    ledger: Arc<WindowSpaceController>,
     client: Client,
     state: Mutex<EngineRuntimeState>,
     batch_seq: AtomicU32,
@@ -108,7 +108,7 @@ struct UnderlyingTradeInner {
 
 struct UnderlyingQuoteInner {
     config: FlatfileRuntimeConfig,
-    ledger: Arc<LedgerController>,
+    ledger: Arc<WindowSpaceController>,
     client: Client,
     state: Mutex<EngineRuntimeState>,
     batch_seq: AtomicU32,
@@ -116,7 +116,7 @@ struct UnderlyingQuoteInner {
 }
 
 impl OptionTradeInner {
-    fn new(config: FlatfileRuntimeConfig, ledger: Arc<LedgerController>) -> Self {
+    fn new(config: FlatfileRuntimeConfig, ledger: Arc<WindowSpaceController>) -> Self {
         Self {
             client: make_s3_client(&config),
             ledger,
@@ -283,7 +283,7 @@ impl OptionTradeInner {
 }
 
 impl OptionQuoteInner {
-    fn new(config: FlatfileRuntimeConfig, ledger: Arc<LedgerController>) -> Self {
+    fn new(config: FlatfileRuntimeConfig, ledger: Arc<WindowSpaceController>) -> Self {
         Self {
             client: make_s3_client(&config),
             ledger,
@@ -444,7 +444,7 @@ impl OptionQuoteInner {
 }
 
 impl UnderlyingTradeInner {
-    fn new(config: FlatfileRuntimeConfig, ledger: Arc<LedgerController>) -> Self {
+    fn new(config: FlatfileRuntimeConfig, ledger: Arc<WindowSpaceController>) -> Self {
         Self {
             client: make_s3_client(&config),
             ledger,
@@ -605,7 +605,7 @@ impl UnderlyingTradeInner {
 }
 
 impl UnderlyingQuoteInner {
-    fn new(config: FlatfileRuntimeConfig, ledger: Arc<LedgerController>) -> Self {
+    fn new(config: FlatfileRuntimeConfig, ledger: Arc<WindowSpaceController>) -> Self {
         Self {
             client: make_s3_client(&config),
             ledger,
@@ -1461,7 +1461,7 @@ struct MinuteKey {
 }
 
 impl OptionTradeFlatfileEngine {
-    pub fn new(config: FlatfileRuntimeConfig, ledger: Arc<LedgerController>) -> Self {
+    pub fn new(config: FlatfileRuntimeConfig, ledger: Arc<WindowSpaceController>) -> Self {
         let inner = OptionTradeInner::new(config, ledger);
         Self {
             inner: Arc::new(inner),
@@ -1514,7 +1514,7 @@ impl Engine for OptionTradeFlatfileEngine {
 }
 
 impl OptionQuoteFlatfileEngine {
-    pub fn new(config: FlatfileRuntimeConfig, ledger: Arc<LedgerController>) -> Self {
+    pub fn new(config: FlatfileRuntimeConfig, ledger: Arc<WindowSpaceController>) -> Self {
         let inner = OptionQuoteInner::new(config, ledger);
         Self {
             inner: Arc::new(inner),
@@ -1567,7 +1567,7 @@ impl Engine for OptionQuoteFlatfileEngine {
 }
 
 impl UnderlyingTradeFlatfileEngine {
-    pub fn new(config: FlatfileRuntimeConfig, ledger: Arc<LedgerController>) -> Self {
+    pub fn new(config: FlatfileRuntimeConfig, ledger: Arc<WindowSpaceController>) -> Self {
         let inner = UnderlyingTradeInner::new(config, ledger);
         Self {
             inner: Arc::new(inner),
@@ -1620,7 +1620,7 @@ impl Engine for UnderlyingTradeFlatfileEngine {
 }
 
 impl UnderlyingQuoteFlatfileEngine {
-    pub fn new(config: FlatfileRuntimeConfig, ledger: Arc<LedgerController>) -> Self {
+    pub fn new(config: FlatfileRuntimeConfig, ledger: Arc<WindowSpaceController>) -> Self {
         let inner = UnderlyingQuoteInner::new(config, ledger);
         Self {
             inner: Arc::new(inner),

@@ -8,8 +8,8 @@ pub enum FlatfileError {
     Sdk(String),
     #[error("csv error: {0}")]
     Csv(#[from] csv_async::Error),
-    #[error("ledger error: {0}")]
-    Ledger(#[from] ledger::LedgerError),
+    #[error("window space error: {0}")]
+    Ledger(#[from] window_space::WindowSpaceError),
     #[error("arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
     #[error("parquet error: {0}")]

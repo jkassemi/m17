@@ -1,4 +1,8 @@
-# Ledger Controller Specification & Migration Plan
+# Window Space Controller Specification & Migration Plan
+
+> WindowSpace defines the temporal grid; `Window` handles expose data references; storage remains pluggable (memory-mapped files today).
+
+Formerly referred to as the "ledger" controller, this document tracks the same initiative under the new naming.
 
 ## Background & Objectives
 
@@ -291,7 +295,7 @@ Use `[ ]` / `[x]` to track progress.
     (rf_rate.map, trades.map, quotes.map, aggressor.map, greeks.map, aggregate.map)
     with well-defined payload schemas (TradeBatchPayload, QuoteBatchPayload, etc.) and
     automatic payload-id generation.
-- Implemented LedgerController to bootstrap state, resolve symbols, expose all
+- Implemented WindowSpaceController to bootstrap state, resolve symbols, expose all
     setter APIs (set_option_trade_ref, set_option_quote_ref, set_greeks_ref, etc.), handle pending/
     clear operations, provide minute_idx_for_timestamp, and gate access to the payload
     stores via mutexes.
@@ -301,7 +305,7 @@ Use `[ ]` / `[x]` to track progress.
 ### Orchestrator (`m17`)
 
 - [ ] Construct the `m17` crate that boots ledgers, loads snapshots, and registers engines as modules.
-- [ ] Define the shared `Engine` trait (start/stop, health probes, priority-region hooks) plus orchestration context objects (handles to `LedgerController`, payload stores, priority store, metrics emitters).
+- [ ] Define the shared `Engine` trait (start/stop, health probes, priority-region hooks) plus orchestration context objects (handles to `WindowSpaceController`, payload stores, priority store, metrics emitters).
 - [ ] Implement supervision logic for backpressure, repairs, and graceful shutdown.
 - [ ] Integrate the first real engine (treasury or trade-flatfile) to validate the registration APIs before wiring the remaining engines.
 

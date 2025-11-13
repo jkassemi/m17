@@ -58,7 +58,7 @@ pub fn artifact_path(
     family: &str,
     date: chrono::NaiveDate,
     symbol: &str,
-    minute_idx: ledger::MinuteIndex,
+    minute_idx: window_space::MinuteIndex,
     ext: &str,
 ) -> String {
     let safe_symbol = sanitized_symbol(symbol);

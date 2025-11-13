@@ -1,12 +1,12 @@
 use std::{env, path::PathBuf, str::FromStr};
 
 use core_types::config::DateRange;
-use ledger::{
-    WindowRangeConfig, WindowSpace,
-    config::{DEFAULT_MAX_SYMBOLS, LedgerConfig},
-};
 use thiserror::Error;
 use time::Duration;
+use window_space::{
+    WindowRangeConfig, WindowSpace,
+    config::{DEFAULT_MAX_SYMBOLS, WindowSpaceConfig},
+};
 
 /// Deployment target for the binary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +33,7 @@ impl FromStr for Environment {
 #[derive(Clone)]
 pub struct AppConfig {
     pub env: Environment,
-    pub ledger: LedgerConfig,
+    pub ledger: WindowSpaceConfig,
     pub rest_base_url: &'static str,
     pub stocks_ws_url: &'static str,
     pub options_ws_url: &'static str,
@@ -88,13 +88,13 @@ impl FlatfileSettings {
     }
 }
 
-fn ledger_config_for(env: Environment) -> LedgerConfig {
+fn ledger_config_for(env: Environment) -> WindowSpaceConfig {
     let ledger_state_dir = match env {
         Environment::Dev => PathBuf::from("/home/james/m17/ledger.state"),
         Environment::Prod => PathBuf::from("/home/james/ledger.state"),
     };
 
-    let mut cfg = LedgerConfig::new(ledger_state_dir, session_windows(env));
+    let mut cfg = WindowSpaceConfig::new(ledger_state_dir, session_windows(env));
     cfg.max_symbols = match env {
         Environment::Dev => DEFAULT_MAX_SYMBOLS,
         Environment::Prod => DEFAULT_MAX_SYMBOLS,

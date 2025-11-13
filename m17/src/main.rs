@@ -15,14 +15,15 @@ use std::{
 use config::{AppConfig, ConfigError, Environment};
 use core_types::config::DateRange;
 use engine_api::{Engine, EngineError};
-use ledger::{
-    LedgerController, LedgerError, LedgerSlotStatusSnapshot, LedgerStorageReport, WindowSpace,
-};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use trade_flatfile_engine::{
     FlatfileRuntimeConfig, OptionQuoteFlatfileEngine, OptionTradeFlatfileEngine,
     UnderlyingQuoteFlatfileEngine, UnderlyingTradeFlatfileEngine,
+};
+use window_space::{
+    WindowSpace, WindowSpaceController, WindowSpaceError, WindowSpaceSlotStatusSnapshot,
+    WindowSpaceStorageReport,
 };
 
 fn main() {
@@ -41,7 +42,8 @@ fn run() -> Result<(), AppError> {
     };
 
     config.ledger.ensure_dirs()?;
-    let (controller_inner, storage_report) = LedgerController::bootstrap(config.ledger.clone())?;
+    let (controller_inner, storage_report) =
+        WindowSpaceController::bootstrap(config.ledger.clone())?;
     let controller = Arc::new(controller_inner);
     let flatfile_cfg = FlatfileRuntimeConfig {
         label: config.env_label(),
@@ -65,17 +67,17 @@ fn run() -> Result<(), AppError> {
         UnderlyingQuoteFlatfileEngine::new(flatfile_cfg, controller.clone());
 
     println!(
-        "m17 orchestrator booted in {:?} mode; ledger state at {:?}",
+        "m17 orchestrator booted in {:?} mode; window space state at {:?}",
         config.env,
         config.ledger.state_dir()
     );
     match ledger_window_summary(&config.ledger.window_space) {
         Some(summary) => println!(
-            "Ledger capacity: up to {} symbols across {} minutes ({} -> {})",
+            "Window space capacity: up to {} symbols across {} minutes ({} -> {})",
             config.ledger.max_symbols, summary.minutes, summary.start_label, summary.end_label
         ),
         None => println!(
-            "Ledger capacity: up to {} symbols with no configured window range",
+            "Window space capacity: up to {} symbols with no configured window range",
             config.ledger.max_symbols
         ),
     }
@@ -135,7 +137,7 @@ enum AppError {
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
-    Ledger(#[from] LedgerError),
+    Ledger(#[from] WindowSpaceError),
     #[error(transparent)]
     Engine(#[from] EngineError),
     #[error("failed to install signal handler: {0}")]
@@ -190,7 +192,7 @@ fn describe_flatfile_ranges(ranges: &[DateRange]) -> String {
         .join("; ")
 }
 
-fn log_storage_summary(report: &LedgerStorageReport) {
+fn log_storage_summary(report: &WindowSpaceStorageReport) {
     println!(
         "Trade ledger file: {} (size={} bytes, created_at={}, init_time={})",
         report.trade.path.display(),
@@ -234,14 +236,14 @@ struct LedgerStatusLogger {
 }
 
 impl LedgerStatusLogger {
-    fn spawn(controller: Arc<LedgerController>, interval: Duration) -> Self {
+    fn spawn(controller: Arc<WindowSpaceController>, interval: Duration) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let handle = thread::spawn(move || {
             while !stop_clone.load(Ordering::Relaxed) {
                 match controller.slot_status_snapshot() {
                     Ok(snapshot) => log_snapshot(&snapshot),
-                    Err(err) => eprintln!("failed to snapshot ledger slots: {err}"),
+                    Err(err) => eprintln!("failed to snapshot window space slots: {err}"),
                 }
                 if stop_clone.load(Ordering::Relaxed) {
                     break;
@@ -272,7 +274,7 @@ impl Drop for LedgerStatusLogger {
     }
 }
 
-fn log_snapshot(snapshot: &LedgerSlotStatusSnapshot) {
+fn log_snapshot(snapshot: &WindowSpaceSlotStatusSnapshot) {
     println!();
     println!("{snapshot}");
 }

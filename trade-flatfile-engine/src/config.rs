@@ -15,6 +15,7 @@ pub struct FlatfileRuntimeConfig {
     pub date_ranges: Vec<DateRange>,
     pub batch_size: usize,
     pub progress_update_ms: u64,
+    pub progress_logging: bool,
 }
 
 impl FlatfileRuntimeConfig {

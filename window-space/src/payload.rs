@@ -13,7 +13,6 @@ pub enum PayloadType {
     Quote = 3,
     Aggressor = 4,
     Greeks = 5,
-    Aggregate = 6,
 }
 
 /// Logical status of a slot inside a window row.
@@ -160,72 +159,30 @@ impl TradeSlotKind {
     }
 }
 
-/// Aggregation window kinds for enrichment slots.
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum AggregateWindowKind {
-    W1m,
-    W5m,
-    W10m,
-    W30m,
-    W1h,
-    W4h,
-}
-
-impl AggregateWindowKind {
-    pub fn slot_index(&self) -> usize {
-        match self {
-            AggregateWindowKind::W1m => 1,
-            AggregateWindowKind::W5m => 2,
-            AggregateWindowKind::W10m => 3,
-            AggregateWindowKind::W30m => 4,
-            AggregateWindowKind::W1h => 5,
-            AggregateWindowKind::W4h => 6,
-        }
-    }
-}
-
 /// Slot kinds for the enrichment ledger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EnrichmentSlotKind {
     Greeks,
-    Aggregate(AggregateWindowKind),
 }
 
 impl EnrichmentSlotKind {
-    pub const ALL: [Self; 7] = [
-        EnrichmentSlotKind::Greeks,
-        EnrichmentSlotKind::Aggregate(AggregateWindowKind::W1m),
-        EnrichmentSlotKind::Aggregate(AggregateWindowKind::W5m),
-        EnrichmentSlotKind::Aggregate(AggregateWindowKind::W10m),
-        EnrichmentSlotKind::Aggregate(AggregateWindowKind::W30m),
-        EnrichmentSlotKind::Aggregate(AggregateWindowKind::W1h),
-        EnrichmentSlotKind::Aggregate(AggregateWindowKind::W4h),
-    ];
+    pub const ALL: [Self; 1] = [EnrichmentSlotKind::Greeks];
 
     pub fn index(&self) -> usize {
         match self {
             EnrichmentSlotKind::Greeks => 0,
-            EnrichmentSlotKind::Aggregate(kind) => kind.slot_index(),
         }
     }
 
     pub fn payload_type(&self) -> PayloadType {
         match self {
             EnrichmentSlotKind::Greeks => PayloadType::Greeks,
-            EnrichmentSlotKind::Aggregate(_) => PayloadType::Aggregate,
         }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
             EnrichmentSlotKind::Greeks => "greeks",
-            EnrichmentSlotKind::Aggregate(AggregateWindowKind::W1m) => "agg_1m",
-            EnrichmentSlotKind::Aggregate(AggregateWindowKind::W5m) => "agg_5m",
-            EnrichmentSlotKind::Aggregate(AggregateWindowKind::W10m) => "agg_10m",
-            EnrichmentSlotKind::Aggregate(AggregateWindowKind::W30m) => "agg_30m",
-            EnrichmentSlotKind::Aggregate(AggregateWindowKind::W1h) => "agg_1h",
-            EnrichmentSlotKind::Aggregate(AggregateWindowKind::W4h) => "agg_4h",
         }
     }
 }

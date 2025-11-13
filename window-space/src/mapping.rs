@@ -7,8 +7,6 @@ use std::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json;
 
-use crate::payload::AggregateWindowKind;
-
 /// Treasury curve snapshot applied across many symbols.
 /// Engines store the scaled tenor array directly; no external artifact is needed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -66,17 +64,6 @@ pub struct GreeksPayload {
     pub rf_rate_payload_id: u32,
     pub greeks_version: u32,
     pub artifact_uri: String,
-    pub checksum: u32,
-}
-
-/// Rolling aggregate statistics (1m/5m/… windows) anchored to the window start timestamp.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AggregatePayload {
-    pub schema_version: u8,
-    pub window_ts: i64,
-    pub window: AggregateWindowKind,
-    pub source_span: (u32, u32),
-    pub stats_uri: String,
     pub checksum: u32,
 }
 
@@ -143,7 +130,6 @@ pub struct PayloadStores {
     pub quotes: MappingStore<QuoteBatchPayload>,
     pub aggressor: MappingStore<AggressorPayload>,
     pub greeks: MappingStore<GreeksPayload>,
-    pub aggregate: MappingStore<AggregatePayload>,
 }
 
 impl PayloadStores {
@@ -155,7 +141,6 @@ impl PayloadStores {
             quotes: MappingStore::load(base.join("quotes.map"))?,
             aggressor: MappingStore::load(base.join("aggressor.map"))?,
             greeks: MappingStore::load(base.join("greeks.map"))?,
-            aggregate: MappingStore::load(base.join("aggregate.map"))?,
         })
     }
 }

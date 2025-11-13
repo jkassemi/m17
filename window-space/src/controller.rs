@@ -7,10 +7,7 @@ use crate::{
     error::{Result, WindowSpaceError},
     ledger::{EnrichmentWindowSpace, TradeWindowSpace, WindowRow},
     mapping::PayloadStores,
-    payload::{
-        AggregateWindowKind, EnrichmentSlotKind, PayloadMeta, Slot, SlotKind, SlotStatus,
-        TradeSlotKind,
-    },
+    payload::{EnrichmentSlotKind, PayloadMeta, Slot, SlotKind, SlotStatus, TradeSlotKind},
     storage::WindowSpaceFileStats,
     symbol_map::{SymbolId, SymbolMap},
     window::{WindowIndex, WindowMeta, WindowSpace},
@@ -253,24 +250,6 @@ impl WindowSpaceController {
             symbol_id,
             window_idx,
             EnrichmentSlotKind::Greeks,
-            meta,
-            expected_version,
-        )?)
-    }
-
-    pub fn set_aggregate_ref(
-        &self,
-        symbol: &str,
-        window_idx: WindowIndex,
-        window: AggregateWindowKind,
-        meta: PayloadMeta,
-        expected_version: Option<u32>,
-    ) -> Result<Slot> {
-        let symbol_id = self.resolve_symbol(symbol)?;
-        Ok(self.enrichment_window_space.write_slot(
-            symbol_id,
-            window_idx,
-            EnrichmentSlotKind::Aggregate(window),
             meta,
             expected_version,
         )?)

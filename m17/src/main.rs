@@ -4,7 +4,7 @@ use std::{
     env, process,
     str::FromStr,
     sync::{
-        Arc,
+        Arc, Once,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -15,6 +15,7 @@ use std::{
 use config::{AppConfig, ConfigError, Environment};
 use core_types::config::DateRange;
 use engine_api::{Engine, EngineError};
+use log::{LevelFilter, Log, Metadata, Record};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use trade_flatfile_engine::{
@@ -27,6 +28,7 @@ use window_space::{
 };
 
 fn main() {
+    init_logger();
     if let Err(err) = run() {
         eprintln!("m17 failed: {err}");
         process::exit(1);
@@ -36,10 +38,8 @@ fn main() {
 const STATUS_LOG_INTERVAL_SECS: u64 = 30;
 
 fn run() -> Result<(), AppError> {
-    let config = {
-        let env = parse_environment()?;
-        AppConfig::load(env)?
-    };
+    let args = parse_cli_args()?;
+    let config = AppConfig::load(args.env)?;
 
     config.ledger.ensure_dirs()?;
     let (controller_inner, storage_report) =
@@ -56,6 +56,7 @@ fn run() -> Result<(), AppError> {
         date_ranges: config.flatfile.date_ranges.clone(),
         batch_size: config.flatfile.batch_size,
         progress_update_ms: config.flatfile.progress_update_ms,
+        progress_logging: args.progress_logging,
     };
     let option_trade_engine =
         OptionTradeFlatfileEngine::new(flatfile_cfg.clone(), controller.clone());
@@ -125,14 +126,31 @@ fn run() -> Result<(), AppError> {
     Ok(())
 }
 
-fn parse_environment() -> Result<Environment, AppError> {
-    let arg = env::args().nth(1).ok_or(AppError::Usage)?;
-    Environment::from_str(&arg).map_err(AppError::from)
+struct CliArgs {
+    env: Environment,
+    progress_logging: bool,
+}
+
+fn parse_cli_args() -> Result<CliArgs, AppError> {
+    let mut args = env::args().skip(1);
+    let env_arg = args.next().ok_or(AppError::Usage)?;
+    let env = Environment::from_str(&env_arg).map_err(AppError::from)?;
+    let mut progress_logging = false;
+    for arg in args {
+        match arg.as_str() {
+            "--debug-progress" => progress_logging = true,
+            flag => return Err(AppError::UnknownFlag(flag.to_string())),
+        }
+    }
+    Ok(CliArgs {
+        env,
+        progress_logging,
+    })
 }
 
 #[derive(Debug, Error)]
 enum AppError {
-    #[error("usage: m17 <dev|prod>")]
+    #[error("usage: m17 <dev|prod> [--debug-progress]")]
     Usage,
     #[error(transparent)]
     Config(#[from] ConfigError),
@@ -144,6 +162,8 @@ enum AppError {
     Signal(#[from] ctrlc::Error),
     #[error("failed while waiting for shutdown signal: {0}")]
     ShutdownWait(#[from] mpsc::RecvError),
+    #[error("unknown flag: {0}")]
+    UnknownFlag(String),
 }
 
 struct WindowSummary {
@@ -290,4 +310,39 @@ fn sleep_with_stop(stop: &AtomicBool, interval: Duration) {
         thread::sleep(sleep_for);
         remaining = remaining.saturating_sub(sleep_for);
     }
+}
+
+static LOGGER: SimpleLogger = SimpleLogger;
+
+fn init_logger() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        log::set_logger(&LOGGER).expect("install logger");
+        let level = env::var("RUST_LOG")
+            .ok()
+            .and_then(|value| value.parse::<LevelFilter>().ok())
+            .unwrap_or(LevelFilter::Info);
+        log::set_max_level(level);
+    });
+}
+
+struct SimpleLogger;
+
+impl Log for SimpleLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &Record) {
+        if self.enabled(record.metadata()) {
+            println!(
+                "[{}] {}: {}",
+                record.level(),
+                record.target(),
+                record.args()
+            );
+        }
+    }
+
+    fn flush(&self) {}
 }

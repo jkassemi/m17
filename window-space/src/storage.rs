@@ -10,7 +10,6 @@ use time::OffsetDateTime;
 
 const WINDOW_SPACE_MAGIC: &[u8; 8] = b"M17LEDGR";
 const WINDOW_SPACE_HEADER_SIZE: usize = 64;
-const ZERO_CHUNK_LEN: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct WindowSpaceFileStats {
@@ -59,9 +58,8 @@ impl WindowSpaceFile {
                 },
             )
         } else {
-            file.set_len(0)?;
             let start = Instant::now();
-            zero_fill(&mut file, total_len)?;
+            file.set_len(total_len)?;
             let duration = start.elapsed();
             let header = WindowSpaceFileHeader::new(&options);
             write_header(&mut file, &header)?;
@@ -106,18 +104,6 @@ fn compute_total_len(options: &WindowSpaceFileOptions) -> io::Result<u64> {
         .checked_add(WINDOW_SPACE_HEADER_SIZE)
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "window-space size overflow"))?;
     Ok(total as u64)
-}
-
-fn zero_fill(file: &mut File, total_len: u64) -> io::Result<()> {
-    file.seek(SeekFrom::Start(0))?;
-    let zero_block = vec![0u8; ZERO_CHUNK_LEN];
-    let mut remaining = total_len;
-    while remaining > 0 {
-        let write_len = remaining.min(ZERO_CHUNK_LEN as u64) as usize;
-        file.write_all(&zero_block[..write_len])?;
-        remaining -= write_len as u64;
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy)]

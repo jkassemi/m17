@@ -109,12 +109,6 @@ impl WindowRow for TradeWindowRow {
 pub struct EnrichmentWindowRow {
     pub header: WindowRowHeader,
     pub greeks: Slot,
-    pub aggs_1m: Slot,
-    pub aggs_5m: Slot,
-    pub aggs_10m: Slot,
-    pub aggs_30m: Slot,
-    pub aggs_1h: Slot,
-    pub aggs_4h: Slot,
 }
 
 impl Default for EnrichmentWindowRow {
@@ -122,12 +116,6 @@ impl Default for EnrichmentWindowRow {
         Self {
             header: WindowRowHeader::default(),
             greeks: Slot::default(),
-            aggs_1m: Slot::default(),
-            aggs_5m: Slot::default(),
-            aggs_10m: Slot::default(),
-            aggs_30m: Slot::default(),
-            aggs_1h: Slot::default(),
-            aggs_4h: Slot::default(),
         }
     }
 }
@@ -143,12 +131,6 @@ impl WindowRow for EnrichmentWindowRow {
     fn slot(&self, index: usize) -> &Slot {
         match index {
             0 => &self.greeks,
-            1 => &self.aggs_1m,
-            2 => &self.aggs_5m,
-            3 => &self.aggs_10m,
-            4 => &self.aggs_30m,
-            5 => &self.aggs_1h,
-            6 => &self.aggs_4h,
             _ => panic!("invalid enrichment slot index {index}"),
         }
     }
@@ -156,12 +138,6 @@ impl WindowRow for EnrichmentWindowRow {
     fn slot_mut(&mut self, index: usize) -> &mut Slot {
         match index {
             0 => &mut self.greeks,
-            1 => &mut self.aggs_1m,
-            2 => &mut self.aggs_5m,
-            3 => &mut self.aggs_10m,
-            4 => &mut self.aggs_30m,
-            5 => &mut self.aggs_1h,
-            6 => &mut self.aggs_4h,
             _ => panic!("invalid enrichment slot index {index}"),
         }
     }

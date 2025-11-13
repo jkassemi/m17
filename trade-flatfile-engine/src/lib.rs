@@ -135,7 +135,7 @@ impl OptionTradeInner {
             if cancel.is_cancelled() {
                 break;
             }
-            if let Err(err) = self.process_options_day(date).await {
+            if let Err(err) = self.process_options_day(date, cancel.clone()).await {
                 error!("option trade day {} failed: {err}", date);
             }
         }
@@ -145,7 +145,11 @@ impl OptionTradeInner {
         );
     }
 
-    async fn process_options_day(&self, date: NaiveDate) -> Result<(), FlatfileError> {
+    async fn process_options_day(
+        &self,
+        date: NaiveDate,
+        cancel: CancellationToken,
+    ) -> Result<(), FlatfileError> {
         let key = format!(
             "us_options_opra/trades_v1/{}/{:02}/{}-{:02}-{:02}.csv.gz",
             date.year(),
@@ -159,13 +163,14 @@ impl OptionTradeInner {
             self.config.label, key
         );
         let stream = fetch_stream(&self.client, &self.config, &key).await?;
-        self.consume_option_trades(date, stream).await
+        self.consume_option_trades(date, stream, cancel).await
     }
 
     async fn consume_option_trades<R>(
         &self,
         date: NaiveDate,
         reader: R,
+        cancel: CancellationToken,
     ) -> Result<(), FlatfileError>
     where
         R: AsyncRead + Unpin + Send,
@@ -179,6 +184,13 @@ impl OptionTradeInner {
         let mut last_progress = Instant::now();
         let interval = Duration::from_millis(self.config.progress_update_ms.max(10));
         while let Some(record) = records.next().await {
+            if cancel.is_cancelled() {
+                info!(
+                    "[{}] option trade ingestion cancelled while streaming {}",
+                    self.config.label, date
+                );
+                return Ok(());
+            }
             let record = record?;
             if record.len() < 8 {
                 continue;
@@ -200,7 +212,7 @@ impl OptionTradeInner {
                     .or_insert_with(WindowBucket::new)
                     .observe(trade);
                 processed_rows += 1;
-                if last_progress.elapsed() >= interval {
+                if self.config.progress_logging && last_progress.elapsed() >= interval {
                     info!(
                         "[{}] streamed {} option trades for {}",
                         self.config.label, processed_rows, date
@@ -208,6 +220,13 @@ impl OptionTradeInner {
                     last_progress = Instant::now();
                 }
             }
+        }
+        if cancel.is_cancelled() {
+            info!(
+                "[{}] option trade ingestion cancelled before persisting {}",
+                self.config.label, date
+            );
+            return Ok(());
         }
         for (key, bucket) in buckets.into_iter() {
             self.persist_option_trade_bucket(date, key, bucket)?;
@@ -302,7 +321,7 @@ impl OptionQuoteInner {
             if cancel.is_cancelled() {
                 break;
             }
-            if let Err(err) = self.process_option_quotes_day(date).await {
+            if let Err(err) = self.process_option_quotes_day(date, cancel.clone()).await {
                 error!("option quote day {} failed: {err}", date);
             }
         }
@@ -312,7 +331,11 @@ impl OptionQuoteInner {
         );
     }
 
-    async fn process_option_quotes_day(&self, date: NaiveDate) -> Result<(), FlatfileError> {
+    async fn process_option_quotes_day(
+        &self,
+        date: NaiveDate,
+        cancel: CancellationToken,
+    ) -> Result<(), FlatfileError> {
         let key = format!(
             "us_options_opra/quotes_v1/{}/{:02}/{}-{:02}-{:02}.csv.gz",
             date.year(),
@@ -326,13 +349,14 @@ impl OptionQuoteInner {
             self.config.label, key
         );
         let stream = fetch_stream(&self.client, &self.config, &key).await?;
-        self.consume_option_quotes(date, stream).await
+        self.consume_option_quotes(date, stream, cancel).await
     }
 
     async fn consume_option_quotes<R>(
         &self,
         date: NaiveDate,
         reader: R,
+        cancel: CancellationToken,
     ) -> Result<(), FlatfileError>
     where
         R: AsyncRead + Unpin + Send,
@@ -346,6 +370,13 @@ impl OptionQuoteInner {
         let mut last_progress = Instant::now();
         let interval = Duration::from_millis(self.config.progress_update_ms.max(10));
         while let Some(record) = records.next().await {
+            if cancel.is_cancelled() {
+                info!(
+                    "[{}] option quote ingestion cancelled while streaming {}",
+                    self.config.label, date
+                );
+                return Ok(());
+            }
             let record = record?;
             if record.len() < 12 {
                 continue;
@@ -361,7 +392,7 @@ impl OptionQuoteInner {
                     .or_insert_with(WindowBucket::new)
                     .observe(quote);
                 processed_rows += 1;
-                if last_progress.elapsed() >= interval {
+                if self.config.progress_logging && last_progress.elapsed() >= interval {
                     info!(
                         "[{}] streamed {} option quotes for {}",
                         self.config.label, processed_rows, date
@@ -369,6 +400,13 @@ impl OptionQuoteInner {
                     last_progress = Instant::now();
                 }
             }
+        }
+        if cancel.is_cancelled() {
+            info!(
+                "[{}] option quote ingestion cancelled before persisting {}",
+                self.config.label, date
+            );
+            return Ok(());
         }
         for (key, bucket) in buckets.into_iter() {
             self.persist_option_quote_bucket(date, key, bucket)?;
@@ -463,7 +501,7 @@ impl UnderlyingTradeInner {
             if cancel.is_cancelled() {
                 break;
             }
-            if let Err(err) = self.process_equity_trades_day(date).await {
+            if let Err(err) = self.process_equity_trades_day(date, cancel.clone()).await {
                 error!("underlying trades day {} failed: {err}", date);
             }
         }
@@ -473,7 +511,11 @@ impl UnderlyingTradeInner {
         );
     }
 
-    async fn process_equity_trades_day(&self, date: NaiveDate) -> Result<(), FlatfileError> {
+    async fn process_equity_trades_day(
+        &self,
+        date: NaiveDate,
+        cancel: CancellationToken,
+    ) -> Result<(), FlatfileError> {
         let key = format!(
             "us_stocks_sip/trades_v1/{}/{:02}/{}-{:02}-{:02}.csv.gz",
             date.year(),
@@ -487,13 +529,14 @@ impl UnderlyingTradeInner {
             self.config.label, key
         );
         let stream = fetch_stream(&self.client, &self.config, &key).await?;
-        self.consume_underlying_trades(date, stream).await
+        self.consume_underlying_trades(date, stream, cancel).await
     }
 
     async fn consume_underlying_trades<R>(
         &self,
         date: NaiveDate,
         reader: R,
+        cancel: CancellationToken,
     ) -> Result<(), FlatfileError>
     where
         R: AsyncRead + Unpin + Send,
@@ -507,6 +550,13 @@ impl UnderlyingTradeInner {
         let mut last_progress = Instant::now();
         let interval = Duration::from_millis(self.config.progress_update_ms.max(10));
         while let Some(record) = records.next().await {
+            if cancel.is_cancelled() {
+                info!(
+                    "[{}] underlying trade ingestion cancelled while streaming {}",
+                    self.config.label, date
+                );
+                return Ok(());
+            }
             let record = record?;
             if record.len() < 12 {
                 continue;
@@ -522,7 +572,7 @@ impl UnderlyingTradeInner {
                     .or_insert_with(WindowBucket::new)
                     .observe(trade);
                 processed_rows += 1;
-                if last_progress.elapsed() >= interval {
+                if self.config.progress_logging && last_progress.elapsed() >= interval {
                     info!(
                         "[{}] streamed {} underlying trades for {}",
                         self.config.label, processed_rows, date
@@ -530,6 +580,13 @@ impl UnderlyingTradeInner {
                     last_progress = Instant::now();
                 }
             }
+        }
+        if cancel.is_cancelled() {
+            info!(
+                "[{}] underlying trade ingestion cancelled before persisting {}",
+                self.config.label, date
+            );
+            return Ok(());
         }
         for (key, bucket) in buckets.into_iter() {
             self.persist_underlying_trade_bucket(date, key, bucket)?;
@@ -624,7 +681,7 @@ impl UnderlyingQuoteInner {
             if cancel.is_cancelled() {
                 break;
             }
-            if let Err(err) = self.process_equity_quotes_day(date).await {
+            if let Err(err) = self.process_equity_quotes_day(date, cancel.clone()).await {
                 error!("underlying quotes day {} failed: {err}", date);
             }
         }
@@ -634,7 +691,11 @@ impl UnderlyingQuoteInner {
         );
     }
 
-    async fn process_equity_quotes_day(&self, date: NaiveDate) -> Result<(), FlatfileError> {
+    async fn process_equity_quotes_day(
+        &self,
+        date: NaiveDate,
+        cancel: CancellationToken,
+    ) -> Result<(), FlatfileError> {
         let key = format!(
             "us_stocks_sip/quotes_v1/{}/{:02}/{}-{:02}-{:02}.csv.gz",
             date.year(),
@@ -648,13 +709,14 @@ impl UnderlyingQuoteInner {
             self.config.label, key
         );
         let stream = fetch_stream(&self.client, &self.config, &key).await?;
-        self.consume_underlying_quotes(date, stream).await
+        self.consume_underlying_quotes(date, stream, cancel).await
     }
 
     async fn consume_underlying_quotes<R>(
         &self,
         date: NaiveDate,
         reader: R,
+        cancel: CancellationToken,
     ) -> Result<(), FlatfileError>
     where
         R: AsyncRead + Unpin + Send,
@@ -668,6 +730,13 @@ impl UnderlyingQuoteInner {
         let mut last_progress = Instant::now();
         let interval = Duration::from_millis(self.config.progress_update_ms.max(10));
         while let Some(record) = records.next().await {
+            if cancel.is_cancelled() {
+                info!(
+                    "[{}] underlying quote ingestion cancelled while streaming {}",
+                    self.config.label, date
+                );
+                return Ok(());
+            }
             let record = record?;
             if record.len() < 12 {
                 continue;
@@ -683,7 +752,7 @@ impl UnderlyingQuoteInner {
                     .or_insert_with(WindowBucket::new)
                     .observe(quote);
                 processed_rows += 1;
-                if last_progress.elapsed() >= interval {
+                if self.config.progress_logging && last_progress.elapsed() >= interval {
                     info!(
                         "[{}] streamed {} underlying quotes for {}",
                         self.config.label, processed_rows, date
@@ -691,6 +760,13 @@ impl UnderlyingQuoteInner {
                     last_progress = Instant::now();
                 }
             }
+        }
+        if cancel.is_cancelled() {
+            info!(
+                "[{}] underlying quote ingestion cancelled before persisting {}",
+                self.config.label, date
+            );
+            return Ok(());
         }
         for (key, bucket) in buckets.into_iter() {
             self.persist_underlying_quote_bucket(date, key, bucket)?;
@@ -1303,9 +1379,17 @@ fn stop_runtime(
         EngineRuntimeState::Running(bundle) => bundle,
         EngineRuntimeState::Stopped => return Err(EngineError::NotRunning),
     };
-    bundle.cancel.cancel();
-    if let Err(err) = bundle.runtime.block_on(async { bundle.handle.await }) {
-        error!("{label} engine join error: {err}");
+    let RuntimeBundle {
+        runtime,
+        handle,
+        cancel,
+    } = bundle;
+    cancel.cancel();
+    handle.abort();
+    if let Err(err) = runtime.block_on(async { handle.await }) {
+        if !err.is_cancelled() {
+            error!("{label} engine join error: {err}");
+        }
     }
     info!("[{}] {} engine stopped", config_label, label);
     Ok(())

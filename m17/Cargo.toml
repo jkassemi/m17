@@ -11,3 +11,4 @@ thiserror = "1"
 time = { version = "0.3", default-features = false, features = ["alloc", "formatting", "parsing"] }
 core-types = { path = "../core-types" }
 ctrlc = "3"
+log = "0.4"

@@ -24,6 +24,7 @@ pub enum SlotStatus {
     Pending = 1,
     Filled = 2,
     Cleared = 3,
+    Retired = 4,
 }
 
 /// Metadata recorded for each slot column.
@@ -63,6 +64,9 @@ impl Slot {
     }
 
     pub fn mark_pending(&mut self) {
+        if self.status == SlotStatus::Filled {
+            return;
+        }
         self.status = SlotStatus::Pending;
         self.last_updated_ns = current_time_ns();
     }
@@ -74,6 +78,15 @@ impl Slot {
         self.checksum = meta.checksum;
         self.status = SlotStatus::Filled;
         self.last_updated_ns = meta.last_updated_ns.unwrap_or_else(current_time_ns);
+    }
+
+    pub fn retire(&mut self) {
+        self.payload_type = PayloadType::Unknown;
+        self.status = SlotStatus::Retired;
+        self.payload_id = 0;
+        self.checksum = 0;
+        self.version = self.version.wrapping_add(1);
+        self.last_updated_ns = current_time_ns();
     }
 }
 

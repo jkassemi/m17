@@ -12,3 +12,8 @@ time = { version = "0.3", default-features = false, features = ["alloc", "format
 core-types = { path = "../core-types" }
 ctrlc = "3"
 log = "0.4"
+prometheus = "0.14"
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1.7", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1.3"

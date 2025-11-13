@@ -1,5 +1,6 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
+use crate::download_metrics::DownloadMetrics;
 use core_types::config::DateRange;
 
 /// Runtime wiring supplied by the orchestrator.
@@ -16,6 +17,7 @@ pub struct FlatfileRuntimeConfig {
     pub batch_size: usize,
     pub progress_update_ms: u64,
     pub progress_logging: bool,
+    pub download_metrics: Arc<DownloadMetrics>,
 }
 
 impl FlatfileRuntimeConfig {

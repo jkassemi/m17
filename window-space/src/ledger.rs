@@ -7,6 +7,7 @@ use crate::{
     payload::{
         EnrichmentSlotKind, PayloadMeta, PayloadType, Slot, SlotKind, SlotStatus, TradeSlotKind,
     },
+    slot_metrics::{SlotMetrics, StoreKind},
     storage::{WindowSpaceFile, WindowSpaceFileOptions, WindowSpaceFileStats},
     symbol_map::SymbolId,
     window::{WindowIndex, WindowMeta, WindowSpace},
@@ -152,13 +153,20 @@ impl TradeWindowSpace {
         path: &Path,
         max_symbols: SymbolId,
         window_space: Arc<WindowSpace>,
+        slot_metrics: Option<Arc<SlotMetrics>>,
     ) -> Result<(Self, WindowSpaceFileStats), WindowSpaceError> {
         let window_count = window_space.len();
         let (storage, stats) =
             RowStorage::new(path, window_count, max_symbols, TRADE_ROW_SCHEMA_VERSION)?;
         Ok((
             Self {
-                core: WindowSpaceCore::new(storage, window_space),
+                core: WindowSpaceCore::new(
+                    storage,
+                    window_space,
+                    slot_metrics,
+                    StoreKind::Trade,
+                    trade_slot_kinds(),
+                ),
             },
             stats,
         ))
@@ -223,6 +231,19 @@ impl TradeWindowSpace {
             })
     }
 
+    pub fn mark_retired(
+        &self,
+        symbol_id: SymbolId,
+        window_idx: WindowIndex,
+        kind: TradeSlotKind,
+    ) -> Result<Slot, SlotWriteError> {
+        self.core
+            .mutate_slot(symbol_id, window_idx, kind.index(), |slot| {
+                slot.retire();
+                Ok(())
+            })
+    }
+
     pub fn get_row(
         &self,
         symbol_id: SymbolId,
@@ -261,6 +282,7 @@ impl EnrichmentWindowSpace {
         path: &Path,
         max_symbols: SymbolId,
         window_space: Arc<WindowSpace>,
+        slot_metrics: Option<Arc<SlotMetrics>>,
     ) -> Result<(Self, WindowSpaceFileStats), WindowSpaceError> {
         let window_count = window_space.len();
         let (storage, stats) = RowStorage::new(
@@ -271,7 +293,13 @@ impl EnrichmentWindowSpace {
         )?;
         Ok((
             Self {
-                core: WindowSpaceCore::new(storage, window_space),
+                core: WindowSpaceCore::new(
+                    storage,
+                    window_space,
+                    slot_metrics,
+                    StoreKind::Enrichment,
+                    enrichment_slot_kinds(),
+                ),
             },
             stats,
         ))
@@ -336,6 +364,19 @@ impl EnrichmentWindowSpace {
             })
     }
 
+    pub fn mark_retired(
+        &self,
+        symbol_id: SymbolId,
+        window_idx: WindowIndex,
+        kind: EnrichmentSlotKind,
+    ) -> Result<Slot, SlotWriteError> {
+        self.core
+            .mutate_slot(symbol_id, window_idx, kind.index(), |slot| {
+                slot.retire();
+                Ok(())
+            })
+    }
+
     pub fn get_row(
         &self,
         symbol_id: SymbolId,
@@ -368,6 +409,22 @@ impl EnrichmentWindowSpace {
     }
 }
 
+fn trade_slot_kinds() -> Vec<SlotKind> {
+    TradeSlotKind::ALL
+        .iter()
+        .copied()
+        .map(SlotKind::Trade)
+        .collect()
+}
+
+fn enrichment_slot_kinds() -> Vec<SlotKind> {
+    EnrichmentSlotKind::ALL
+        .iter()
+        .copied()
+        .map(SlotKind::Enrichment)
+        .collect()
+}
+
 #[deprecated(
     since = "0.1.0",
     note = "TradeLedger has been renamed to TradeWindowSpace; update imports to window_space::TradeWindowSpace"
@@ -393,15 +450,27 @@ struct WindowSpaceCore<Row: WindowRow> {
     storage: RowStorage<Row>,
     allocations: RwLock<Vec<bool>>,
     window_space: Arc<WindowSpace>,
+    slot_metrics: Option<Arc<SlotMetrics>>,
+    store_kind: StoreKind,
+    slot_kinds: Vec<SlotKind>,
 }
 
 impl<Row: WindowRow> WindowSpaceCore<Row> {
-    fn new(storage: RowStorage<Row>, window_space: Arc<WindowSpace>) -> Self {
+    fn new(
+        storage: RowStorage<Row>,
+        window_space: Arc<WindowSpace>,
+        slot_metrics: Option<Arc<SlotMetrics>>,
+        store_kind: StoreKind,
+        slot_kinds: Vec<SlotKind>,
+    ) -> Self {
         let allocations = vec![false; storage.max_symbols()];
         Self {
             storage,
             allocations: RwLock::new(allocations),
             window_space,
+            slot_metrics,
+            store_kind,
+            slot_kinds,
         }
     }
 
@@ -433,6 +502,9 @@ impl<Row: WindowRow> WindowSpaceCore<Row> {
             self.storage
                 .initialize_symbol(symbol_id, &self.window_space);
             allocations[idx] = true;
+            if let Some(metrics) = &self.slot_metrics {
+                metrics.record_symbol_bootstrap(self.store_kind, &self.slot_kinds);
+            }
         }
         Ok(())
     }
@@ -461,8 +533,15 @@ impl<Row: WindowRow> WindowSpaceCore<Row> {
             let row_ptr = self.storage.row_ptr(symbol_id, window_idx_usize);
             let row = &mut *row_ptr;
             let slot = row.slot_mut(slot_index);
+            let previous = *slot;
             mutator(slot)?;
-            Ok(*slot)
+            let updated = *slot;
+            if let Some(metrics) = &self.slot_metrics {
+                if let Some(slot_kind) = self.slot_kinds.get(slot_index).copied() {
+                    metrics.record_transition(slot_kind, previous.status, updated.status);
+                }
+            }
+            Ok(updated)
         }
     }
 
@@ -512,7 +591,8 @@ impl<Row: WindowRow> WindowSpaceCore<Row> {
         drop(guard);
         for idx in start..self.storage.window_count() {
             let row = self.storage.read_row(symbol_id, idx);
-            if row.slot(slot_index).status != SlotStatus::Filled {
+            let status = row.slot(slot_index).status;
+            if status != SlotStatus::Filled && status != SlotStatus::Retired {
                 return Ok(Some(idx as WindowIndex));
             }
         }
@@ -654,7 +734,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let trade_path = dir.path().join("trade-ledger.dat");
         let (ledger, _stats) =
-            TradeWindowSpace::bootstrap(trade_path.as_path(), 4, window()).unwrap();
+            TradeWindowSpace::bootstrap(trade_path.as_path(), 4, window(), None).unwrap();
 
         ledger.ensure_symbol(0).unwrap();
         let meta = PayloadMeta::new(PayloadType::Trade, 42, 1, 777);
@@ -674,7 +754,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let enrich_path = dir.path().join("enrich-ledger.dat");
         let (ledger, _stats) =
-            EnrichmentWindowSpace::bootstrap(enrich_path.as_path(), 4, window()).unwrap();
+            EnrichmentWindowSpace::bootstrap(enrich_path.as_path(), 4, window(), None).unwrap();
 
         ledger.ensure_symbol(1).unwrap();
         let meta = PayloadMeta::new(PayloadType::Greeks, 5, 2, 111);

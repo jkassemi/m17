@@ -15,6 +15,7 @@ pub mod error;
 pub mod ledger;
 pub mod mapping;
 pub mod payload;
+pub mod slot_metrics;
 mod storage;
 pub mod symbol_map;
 pub mod window;

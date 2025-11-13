@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf, str::FromStr};
+use std::{env, net::SocketAddr, path::PathBuf, str::FromStr};
 
 use core_types::config::DateRange;
 use thiserror::Error;
@@ -34,6 +34,7 @@ impl FromStr for Environment {
 pub struct AppConfig {
     pub env: Environment,
     pub ledger: WindowSpaceConfig,
+    pub metrics_addr: SocketAddr,
     pub rest_base_url: &'static str,
     pub stocks_ws_url: &'static str,
     pub options_ws_url: &'static str,
@@ -46,6 +47,7 @@ impl AppConfig {
         Ok(Self {
             env,
             ledger: ledger_config_for(env),
+            metrics_addr: metrics_addr_for(env),
             rest_base_url: "https://api.massive.com",
             stocks_ws_url: "wss://socket.massive.com/stocks",
             options_ws_url: "wss://socket.massive.com/options",
@@ -100,6 +102,13 @@ fn ledger_config_for(env: Environment) -> WindowSpaceConfig {
         Environment::Prod => DEFAULT_MAX_SYMBOLS,
     };
     cfg
+}
+
+fn metrics_addr_for(env: Environment) -> SocketAddr {
+    match env {
+        Environment::Dev => "127.0.0.1:9095".parse().expect("valid metrics addr"),
+        Environment::Prod => "127.0.0.1:9095".parse().expect("valid metrics addr"),
+    }
 }
 
 fn session_windows(env: Environment) -> WindowSpace {

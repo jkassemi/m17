@@ -8,6 +8,7 @@ use crate::{
     ledger::{EnrichmentWindowSpace, TradeWindowSpace, WindowRow},
     mapping::PayloadStores,
     payload::{EnrichmentSlotKind, PayloadMeta, Slot, SlotKind, SlotStatus, TradeSlotKind},
+    slot_metrics::{SlotMetrics, SlotStateSnapshot},
     storage::WindowSpaceFileStats,
     symbol_map::{SymbolId, SymbolMap},
     window::{WindowIndex, WindowMeta, WindowSpace},
@@ -20,6 +21,7 @@ pub struct WindowSpaceController {
     symbol_map: RwLock<SymbolMap>,
     payload_stores: Mutex<PayloadStores>,
     window_space: Arc<WindowSpace>,
+    slot_metrics: Arc<SlotMetrics>,
 }
 
 impl WindowSpaceController {
@@ -28,12 +30,14 @@ impl WindowSpaceController {
         let symbol_map_path = config.symbol_map_path();
         let symbol_map = SymbolMap::load_or_init(&symbol_map_path, config.max_symbols)?;
         let window_space = Arc::new(config.window_space.clone());
+        let slot_metrics = SlotMetrics::new(window_space.len());
 
         let trade_path = config.trade_ledger_path();
         let (trade_window_space_inner, trade_stats) = TradeWindowSpace::bootstrap(
             trade_path.as_path(),
             config.max_symbols,
             window_space.clone(),
+            Some(Arc::clone(&slot_metrics)),
         )?;
         let trade_window_space = Arc::new(trade_window_space_inner);
         let enrichment_path = config.enrichment_ledger_path();
@@ -41,6 +45,7 @@ impl WindowSpaceController {
             enrichment_path.as_path(),
             config.max_symbols,
             window_space.clone(),
+            Some(Arc::clone(&slot_metrics)),
         )?;
         let enrichment_window_space = Arc::new(enrichment_window_space_inner);
 
@@ -67,6 +72,13 @@ impl WindowSpaceController {
 
         let payload_stores = PayloadStores::load(config.state_dir())?;
 
+        rebuild_slot_metrics(
+            &slot_metrics,
+            &trade_window_space,
+            &enrichment_window_space,
+            &symbol_map,
+        )?;
+
         let report = WindowSpaceStorageReport::from_stats(trade_stats, enrichment_stats);
 
         Ok((
@@ -77,6 +89,7 @@ impl WindowSpaceController {
                 symbol_map: RwLock::new(symbol_map),
                 payload_stores: Mutex::new(payload_stores),
                 window_space,
+                slot_metrics,
             },
             report,
         ))
@@ -297,6 +310,24 @@ impl WindowSpaceController {
         Ok(slot_meta)
     }
 
+    pub fn retire_slot(
+        &self,
+        symbol: &str,
+        window_idx: WindowIndex,
+        slot: SlotKind,
+    ) -> Result<Slot> {
+        let symbol_id = self.resolve_symbol(symbol)?;
+        let slot_meta = match slot {
+            SlotKind::Trade(kind) => self
+                .trade_window_space
+                .mark_retired(symbol_id, window_idx, kind)?,
+            SlotKind::Enrichment(kind) => self
+                .enrichment_window_space
+                .mark_retired(symbol_id, window_idx, kind)?,
+        };
+        Ok(slot_meta)
+    }
+
     pub fn get_trade_row(
         &self,
         symbol: &str,
@@ -366,6 +397,10 @@ impl WindowSpaceController {
         self.window_space.window(window_idx).copied()
     }
 
+    pub fn slot_metrics(&self) -> Arc<SlotMetrics> {
+        Arc::clone(&self.slot_metrics)
+    }
+
     #[deprecated(since = "0.1.0", note = "Use window_idx_for_timestamp() instead")]
     pub fn minute_idx_for_timestamp(&self, timestamp: i64) -> Option<WindowIndex> {
         self.window_idx_for_timestamp(timestamp)
@@ -432,6 +467,7 @@ pub struct SlotStatusCounts {
     pub pending: usize,
     pub filled: usize,
     pub cleared: usize,
+    pub retired: usize,
 }
 
 impl SlotStatusCounts {
@@ -441,11 +477,12 @@ impl SlotStatusCounts {
             SlotStatus::Pending => self.pending += 1,
             SlotStatus::Filled => self.filled += 1,
             SlotStatus::Cleared => self.cleared += 1,
+            SlotStatus::Retired => self.retired += 1,
         }
     }
 
     pub fn total(&self) -> usize {
-        self.empty + self.pending + self.filled + self.cleared
+        self.empty + self.pending + self.filled + self.cleared + self.retired
     }
 
     pub fn is_zero(&self) -> bool {
@@ -457,8 +494,8 @@ impl fmt::Display for SlotStatusCounts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "empty={}, pending={}, filled={}, cleared={}",
-            self.empty, self.pending, self.filled, self.cleared
+            "empty={}, pending={}, filled={}, cleared={}, retired={}",
+            self.empty, self.pending, self.filled, self.cleared, self.retired
         )
     }
 }
@@ -518,6 +555,49 @@ impl fmt::Display for WindowSpaceSlotStatusSnapshot {
     }
 }
 
+fn rebuild_slot_metrics(
+    metrics: &SlotMetrics,
+    trade_space: &TradeWindowSpace,
+    enrichment_space: &EnrichmentWindowSpace,
+    symbol_map: &SymbolMap,
+) -> Result<()> {
+    let mut trade_counts = vec![SlotStateSnapshot::default(); TradeSlotKind::ALL.len()];
+    let mut enrichment_counts = vec![SlotStateSnapshot::default(); EnrichmentSlotKind::ALL.len()];
+    let mut trade_windows = 0u64;
+    let mut enrichment_windows = 0u64;
+    for (symbol_id, _) in symbol_map.iter() {
+        trade_space
+            .with_symbol_rows(symbol_id, |rows| {
+                trade_windows += rows.len() as u64;
+                for row in rows {
+                    for kind in TradeSlotKind::ALL {
+                        let slot = row.slot(kind.index());
+                        trade_counts[kind.index()].increment(slot.status, 1);
+                    }
+                }
+            })
+            .map_err(WindowSpaceError::from)?;
+        enrichment_space
+            .with_symbol_rows(symbol_id, |rows| {
+                enrichment_windows += rows.len() as u64;
+                for row in rows {
+                    for kind in EnrichmentSlotKind::ALL {
+                        let slot = row.slot(kind.index());
+                        enrichment_counts[kind.index()].increment(slot.status, 1);
+                    }
+                }
+            })
+            .map_err(WindowSpaceError::from)?;
+    }
+    metrics.replace_counts(
+        trade_windows,
+        enrichment_windows,
+        &trade_counts,
+        &enrichment_counts,
+    );
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PendingHandle {
     pub symbol_id: SymbolId,
@@ -550,17 +630,20 @@ mod tests {
         payload::{PayloadMeta, PayloadType, SlotKind, TradeSlotKind},
         window::WindowSpace,
     };
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
-    #[test]
-    fn controller_sets_and_reads_slots() {
+    fn bootstrap_controller() -> (WindowSpaceController, TempDir) {
         let dir = tempdir().unwrap();
         let window = WindowSpace::standard(1_600_000_000);
         let mut config = WindowSpaceConfig::new(dir.path().to_path_buf(), window);
         config.max_symbols = 32;
-
         let (controller, _) = WindowSpaceController::bootstrap(config).unwrap();
+        (controller, dir)
+    }
 
+    #[test]
+    fn controller_sets_and_reads_slots() {
+        let (controller, _dir) = bootstrap_controller();
         let meta = PayloadMeta::new(PayloadType::Trade, 1, 5, 123);
         controller
             .set_option_trade_ref("AAPL", 0, meta, None)
@@ -572,5 +655,41 @@ mod tests {
         controller
             .mark_pending("AAPL", 1, SlotKind::Trade(TradeSlotKind::OptionQuote))
             .expect("mark pending");
+    }
+
+    #[test]
+    fn slot_metrics_update_on_slot_transitions() {
+        let (controller, _dir) = bootstrap_controller();
+        let metrics = controller.slot_metrics();
+        assert_eq!(
+            metrics.snapshot().trade_slots.len(),
+            TradeSlotKind::ALL.len()
+        );
+
+        let meta_pending = PayloadMeta::new(PayloadType::Trade, 5, 1, 99);
+        controller
+            .mark_pending("MSFT", 0, SlotKind::Trade(TradeSlotKind::OptionTrade))
+            .expect("mark pending");
+        let snapshot = metrics.snapshot();
+        let option_trade = snapshot
+            .trade_slots
+            .iter()
+            .find(|s| matches!(s.slot, SlotKind::Trade(TradeSlotKind::OptionTrade)))
+            .unwrap();
+        assert!(option_trade.counts.pending > 0);
+
+        controller
+            .set_option_trade_ref("MSFT", 0, meta_pending, None)
+            .expect("fill slot");
+        let snapshot = metrics.snapshot();
+        let option_trade = snapshot
+            .trade_slots
+            .iter()
+            .find(|s| matches!(s.slot, SlotKind::Trade(TradeSlotKind::OptionTrade)))
+            .unwrap();
+        assert!(
+            option_trade.counts.filled > 0,
+            "expected filled count to increase after write"
+        );
     }
 }

@@ -1,14 +1,10 @@
 mod config;
+mod metrics;
 
 use std::{
     env, process,
     str::FromStr,
-    sync::{
-        Arc, Once,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
-    thread,
+    sync::{Arc, Once, mpsc},
     time::Duration,
 };
 
@@ -16,15 +12,15 @@ use config::{AppConfig, ConfigError, Environment};
 use core_types::config::DateRange;
 use engine_api::{Engine, EngineError};
 use log::{LevelFilter, Log, Metadata, Record};
+use metrics::MetricsServer;
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use trade_flatfile_engine::{
-    FlatfileRuntimeConfig, OptionQuoteFlatfileEngine, OptionTradeFlatfileEngine,
+    DownloadMetrics, FlatfileRuntimeConfig, OptionQuoteFlatfileEngine, OptionTradeFlatfileEngine,
     UnderlyingQuoteFlatfileEngine, UnderlyingTradeFlatfileEngine,
 };
 use window_space::{
-    WindowSpace, WindowSpaceController, WindowSpaceError, WindowSpaceSlotStatusSnapshot,
-    WindowSpaceStorageReport,
+    WindowSpace, WindowSpaceController, WindowSpaceError, WindowSpaceStorageReport,
 };
 
 fn main() {
@@ -35,8 +31,6 @@ fn main() {
     }
 }
 
-const STATUS_LOG_INTERVAL_SECS: u64 = 30;
-
 fn run() -> Result<(), AppError> {
     let args = parse_cli_args()?;
     let config = AppConfig::load(args.env)?;
@@ -45,6 +39,7 @@ fn run() -> Result<(), AppError> {
     let (controller_inner, storage_report) =
         WindowSpaceController::bootstrap(config.ledger.clone())?;
     let controller = Arc::new(controller_inner);
+    let download_metrics = Arc::new(DownloadMetrics::new());
     let flatfile_cfg = FlatfileRuntimeConfig {
         label: config.env_label(),
         state_dir: config.ledger.state_dir().to_path_buf(),
@@ -57,6 +52,7 @@ fn run() -> Result<(), AppError> {
         batch_size: config.flatfile.batch_size,
         progress_update_ms: config.flatfile.progress_update_ms,
         progress_logging: args.progress_logging,
+        download_metrics: Arc::clone(&download_metrics),
     };
     let option_trade_engine =
         OptionTradeFlatfileEngine::new(flatfile_cfg.clone(), controller.clone());
@@ -109,17 +105,18 @@ fn run() -> Result<(), AppError> {
     log_engine_health("underlying-trade-flatfile", &underlying_trade_engine);
     log_engine_health("underlying-quote-flatfile", &underlying_quote_engine);
     println!("Flatfile engines are running; press Ctrl+C to shut down.");
-    let status_logger = LedgerStatusLogger::spawn(
-        controller.clone(),
-        Duration::from_secs(STATUS_LOG_INTERVAL_SECS),
+    let metrics_server = MetricsServer::start(
+        controller.slot_metrics(),
+        download_metrics,
+        config.metrics_addr,
     );
     wait_for_shutdown_signal()?;
     println!("Shutdown signal received; stopping flatfile engines...");
-    status_logger.shutdown();
     underlying_quote_engine.stop()?;
     underlying_trade_engine.stop()?;
     option_quote_engine.stop()?;
     option_trade_engine.stop()?;
+    metrics_server.shutdown();
 
     // Keep controller alive for the lifetime of engines.
     drop(controller);
@@ -248,68 +245,6 @@ fn wait_for_shutdown_signal() -> Result<(), AppError> {
 fn log_engine_health(label: &str, engine: &dyn Engine) {
     let health = engine.health();
     println!("{label} status: {:?} ({:?})", health.status, health.detail);
-}
-
-struct LedgerStatusLogger {
-    stop: Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
-impl LedgerStatusLogger {
-    fn spawn(controller: Arc<WindowSpaceController>, interval: Duration) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = Arc::clone(&stop);
-        let handle = thread::spawn(move || {
-            while !stop_clone.load(Ordering::Relaxed) {
-                match controller.slot_status_snapshot() {
-                    Ok(snapshot) => log_snapshot(&snapshot),
-                    Err(err) => eprintln!("failed to snapshot window space slots: {err}"),
-                }
-                if stop_clone.load(Ordering::Relaxed) {
-                    break;
-                }
-                sleep_with_stop(&stop_clone, interval);
-            }
-        });
-        Self {
-            stop,
-            handle: Some(handle),
-        }
-    }
-
-    fn shutdown(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for LedgerStatusLogger {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-fn log_snapshot(snapshot: &WindowSpaceSlotStatusSnapshot) {
-    println!();
-    println!("{snapshot}");
-}
-
-fn sleep_with_stop(stop: &AtomicBool, interval: Duration) {
-    let mut remaining = interval;
-    const STEP: Duration = Duration::from_millis(500);
-    while remaining > Duration::ZERO {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        let sleep_for = if remaining > STEP { STEP } else { remaining };
-        thread::sleep(sleep_for);
-        remaining = remaining.saturating_sub(sleep_for);
-    }
 }
 
 static LOGGER: SimpleLogger = SimpleLogger;

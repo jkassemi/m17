@@ -1,16 +1,20 @@
 mod artifacts;
 mod config;
+mod download_metrics;
 mod errors;
 mod window_bucket;
 
 pub use config::FlatfileRuntimeConfig;
+pub use download_metrics::{DownloadMetrics, DownloadSnapshot};
 
 use std::{
     collections::HashMap,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -46,7 +50,7 @@ use futures::StreamExt;
 use log::{error, info, warn};
 use parking_lot::Mutex;
 use tokio::{
-    io::{AsyncRead, BufReader},
+    io::{AsyncRead, BufReader, ReadBuf},
     runtime::Runtime,
     task::JoinHandle,
 };
@@ -162,8 +166,11 @@ impl OptionTradeInner {
             "[{}] ingesting option trades from {}",
             self.config.label, key
         );
-        let stream = fetch_stream(&self.client, &self.config, &key).await?;
-        self.consume_option_trades(date, stream, cancel).await
+        let (stream, token) =
+            fetch_stream(&self.client, &self.config, &key, TradeSlotKind::OptionTrade).await?;
+        let result = self.consume_option_trades(date, stream, cancel).await;
+        drop(token);
+        result
     }
 
     async fn consume_option_trades<R>(
@@ -207,6 +214,13 @@ impl OptionTradeInner {
                     }
                 };
                 let bucket_key = WindowKey { symbol, window_idx };
+                if !buckets.contains_key(&bucket_key) {
+                    ensure_slot_pending(
+                        &self.ledger,
+                        &bucket_key,
+                        SlotKind::Trade(TradeSlotKind::OptionTrade),
+                    )?;
+                }
                 buckets
                     .entry(bucket_key)
                     .or_insert_with(WindowBucket::new)
@@ -348,8 +362,11 @@ impl OptionQuoteInner {
             "[{}] ingesting option quotes from {}",
             self.config.label, key
         );
-        let stream = fetch_stream(&self.client, &self.config, &key).await?;
-        self.consume_option_quotes(date, stream, cancel).await
+        let (stream, token) =
+            fetch_stream(&self.client, &self.config, &key, TradeSlotKind::OptionQuote).await?;
+        let result = self.consume_option_quotes(date, stream, cancel).await;
+        drop(token);
+        result
     }
 
     async fn consume_option_quotes<R>(
@@ -387,6 +404,13 @@ impl OptionQuoteInner {
                     None => continue,
                 };
                 let key = WindowKey { symbol, window_idx };
+                if !buckets.contains_key(&key) {
+                    ensure_slot_pending(
+                        &self.ledger,
+                        &key,
+                        SlotKind::Trade(TradeSlotKind::OptionQuote),
+                    )?;
+                }
                 buckets
                     .entry(key)
                     .or_insert_with(WindowBucket::new)
@@ -528,8 +552,16 @@ impl UnderlyingTradeInner {
             "[{}] ingesting underlying trades from {}",
             self.config.label, key
         );
-        let stream = fetch_stream(&self.client, &self.config, &key).await?;
-        self.consume_underlying_trades(date, stream, cancel).await
+        let (stream, token) = fetch_stream(
+            &self.client,
+            &self.config,
+            &key,
+            TradeSlotKind::UnderlyingTrade,
+        )
+        .await?;
+        let result = self.consume_underlying_trades(date, stream, cancel).await;
+        drop(token);
+        result
     }
 
     async fn consume_underlying_trades<R>(
@@ -567,6 +599,13 @@ impl UnderlyingTradeInner {
                     None => continue,
                 };
                 let key = WindowKey { symbol, window_idx };
+                if !buckets.contains_key(&key) {
+                    ensure_slot_pending(
+                        &self.ledger,
+                        &key,
+                        SlotKind::Trade(TradeSlotKind::UnderlyingTrade),
+                    )?;
+                }
                 buckets
                     .entry(key)
                     .or_insert_with(WindowBucket::new)
@@ -708,8 +747,16 @@ impl UnderlyingQuoteInner {
             "[{}] ingesting underlying quotes from {}",
             self.config.label, key
         );
-        let stream = fetch_stream(&self.client, &self.config, &key).await?;
-        self.consume_underlying_quotes(date, stream, cancel).await
+        let (stream, token) = fetch_stream(
+            &self.client,
+            &self.config,
+            &key,
+            TradeSlotKind::UnderlyingQuote,
+        )
+        .await?;
+        let result = self.consume_underlying_quotes(date, stream, cancel).await;
+        drop(token);
+        result
     }
 
     async fn consume_underlying_quotes<R>(
@@ -747,6 +794,13 @@ impl UnderlyingQuoteInner {
                     None => continue,
                 };
                 let key = WindowKey { symbol, window_idx };
+                if !buckets.contains_key(&key) {
+                    ensure_slot_pending(
+                        &self.ledger,
+                        &key,
+                        SlotKind::Trade(TradeSlotKind::UnderlyingQuote),
+                    )?;
+                }
                 buckets
                     .entry(key)
                     .or_insert_with(WindowBucket::new)
@@ -893,7 +947,8 @@ async fn fetch_stream(
     client: &Client,
     config: &FlatfileRuntimeConfig,
     key: &str,
-) -> Result<Box<dyn AsyncRead + Unpin + Send>, FlatfileError> {
+    slot: TradeSlotKind,
+) -> Result<(Box<dyn AsyncRead + Unpin + Send>, DownloadToken), FlatfileError> {
     let resp = client
         .get_object()
         .bucket(config.bucket.clone())
@@ -901,11 +956,70 @@ async fn fetch_stream(
         .send()
         .await
         .map_err(|err| FlatfileError::Sdk(err.to_string()))?;
+    let total_bytes = resp.content_length().map(|val| val as u64);
+    config.download_metrics.reset(slot, total_bytes);
     let body: ByteStream = resp.body;
     let reader = body.into_async_read();
-    let buf = BufReader::new(reader);
+    let counting_reader = CountingReader::new(reader, Arc::clone(&config.download_metrics), slot);
+    let buf = BufReader::new(counting_reader);
     let decoder = GzipDecoder::new(buf);
-    Ok(Box::new(decoder))
+    let token = DownloadToken::new(Arc::clone(&config.download_metrics), slot);
+    Ok((Box::new(decoder), token))
+}
+
+struct CountingReader<R> {
+    inner: R,
+    metrics: Arc<DownloadMetrics>,
+    slot: TradeSlotKind,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R, metrics: Arc<DownloadMetrics>, slot: TradeSlotKind) -> Self {
+        Self {
+            inner,
+            metrics,
+            slot,
+        }
+    }
+}
+
+impl<R> AsyncRead for CountingReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            let after = buf.filled().len();
+            let read = after.saturating_sub(before);
+            if read > 0 {
+                self.metrics.add_streamed(self.slot, read as u64);
+            }
+        }
+        poll
+    }
+}
+
+struct DownloadToken {
+    metrics: Arc<DownloadMetrics>,
+    slot: TradeSlotKind,
+}
+
+impl DownloadToken {
+    fn new(metrics: Arc<DownloadMetrics>, slot: TradeSlotKind) -> Self {
+        Self { metrics, slot }
+    }
+}
+
+impl Drop for DownloadToken {
+    fn drop(&mut self) {
+        self.metrics.complete(self.slot);
+    }
 }
 
 fn parse_option_trade_row(record: &csv_async::StringRecord) -> Option<(String, OptionTradeRecord)> {
@@ -1552,6 +1666,15 @@ fn window_start_ns(
         .window_meta(window_idx)
         .map(|meta| meta.start_ts)
         .ok_or(FlatfileError::MissingWindowMeta { window_idx })
+}
+
+fn ensure_slot_pending(
+    ledger: &WindowSpaceController,
+    key: &WindowKey,
+    slot: SlotKind,
+) -> Result<(), FlatfileError> {
+    ledger.mark_pending(&key.symbol, key.window_idx, slot)?;
+    Ok(())
 }
 
 impl OptionTradeFlatfileEngine {

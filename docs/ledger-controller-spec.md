@@ -27,16 +27,17 @@ Let's not worry yet about backup/restoration outside of a manual shell script ex
 
 - Precompute all market-open minute windows for a calendar year (390 windows per full session).
 - Introduce a dense symbol axis: each tradable instrument is assigned a `SymbolId` (u16) the first time it appears, capped at 10 000 per active year. The controller maintains a compact `SymbolMap { symbol_id → symbol }` plus the inverse map for lookups.
-- Every ledger now stores `num_symbols × 390` rows per trading day. We allocate the entire matrix upfront so each `(symbol_id, minute_idx)` slot has a deterministic offset in the memory-mapped file.
-- `window_id = <year>:<session_seq>:<minute_seq>` still exists for bookkeeping, but runtime addressing uses `(symbol_id, minute_idx)` with the knowledge that minute `idx` corresponds to `[start_ts, start_ts + 60s)`.
+- Every ledger now stores `num_symbols × 390` rows per trading day. We allocate the entire matrix upfront so each `(symbol_id, window_idx)` slot has a deterministic offset in the memory-mapped file.
+- `window_id = <year>:<session_seq>:<minute_seq>` still exists for bookkeeping, but runtime addressing uses `(symbol_id, window_idx)` with the knowledge that each window stores its own `[start_ts, start_ts + duration)` span.
 - Keep the active year resident in memory while persisting every mmapped file under a configurable `ledger.state/` directory that cron-backed scripts archive and restore. With 10 000 symbols and 390 minutes, the trade ledger consumes ~600 MiB/day and the enrichment ledger ~900 MiB/day, both acceptable for resident memory.
+- Window duration is configurable. Operators choose how many windows to precompute per session (`session_windows`) and the duration (seconds) of each window (`window_duration_secs`). `WindowMeta` carries the `duration_secs` so downstream services never assume a 60-second span.
 
 Note: The 10K cap is more than appropriate given the scope of this project. We'll reevaluate or address migrations/updates more thoroughly when the project's been running for 3 months.
 
 ### Row Schema
 
 ```
-- WindowRow { symbol_id, minute_idx, start_ts, end_ts, schema_version, slots }
+- WindowRow { symbol_id, window_idx, start_ts, end_ts, schema_version, slots }
 - Slots are dense structs padded to 32 or 64 bytes (depending on ledger), so offsets remain constant across the memory-mapped file.
 
   Slot {
@@ -77,21 +78,21 @@ All payloads embed a `schema_version` so consumers can reject incompatible recor
 - `quote.map`
   - `QuotePayload { schema_version: u8, batch_id: u32, first_ts: i64, last_ts: i64, nbbo_sample_count: u32, artifact_uri: String }`
 - `aggressor.map`
-  - `AggressorPayload { schema_version: u8, minute_ts: i64, trade_payload_id: u32, quote_payload_id: u32, observation_count: u32, artifact_uri: String }`
+  - `AggressorPayload { schema_version: u8, window_ts: i64, trade_payload_id: u32, quote_payload_id: u32, observation_count: u32, artifact_uri: String }`
 - `greeks.map`
-  - `GreeksPayload { schema_version: u8, minute_ts: i64, rf_rate_payload_id: u32, greeks_version: u32, artifact_uri: String, checksum: u32 }`
+  - `GreeksPayload { schema_version: u8, window_ts: i64, rf_rate_payload_id: u32, greeks_version: u32, artifact_uri: String, checksum: u32 }`
 - `aggregate.map`
-  - `AggregatePayload { schema_version: u8, minute_ts: i64, window: AggregateWindow, source_span: (u32, u32), stats_uri: String }`
+  - `AggregatePayload { schema_version: u8, window_ts: i64, window: AggregateWindow, source_span: (u32, u32), stats_uri: String }`
   - `AggregateWindow` is a `u8` enum (1m, 5m, 10m, 30m, 1h, 4h). `source_span` stores `(start_symbol_row, end_symbol_row)` indexes so audit tools can rehydrate the contributing rows without recomputing.
 
 Every payload struct ends with a variable-length URI or inline metadata blob, allowing engines to point to Parquet, Arrow, or custom chunk files without expanding the ledger itself.
 
 ### Ledger Variants
 
-- `TradeLedger` is responsible for sourcing data (treasury, trades, quotes) and the derived aggressor view needed by downstream workers. Each ledger instance contains:
+- `TradeWindowSpace` is responsible for sourcing data (treasury, trades, quotes) and the derived aggressor view needed by downstream workers. Each ledger instance contains:
   - `symbol_map`: `SymbolId ↔ symbol`.
-  - `window_rows: Vec<[TradeWindowRow; 390]>` grouped by symbol so `rows[symbol_id][minute_idx]` yields the struct instantly.
-- `EnrichmentLedger` receives downstream overlays and aggregates that operate on trade ledger payloads. It mirrors the same dense window layout but uses `EnrichmentWindowRow` (seven slots) instead of four.
+  - `window_rows: Vec<[TradeWindowRow; 390]>` grouped by symbol so `rows[symbol_id][window_idx]` yields the struct instantly.
+- `EnrichmentWindowSpace` receives downstream overlays and aggregates that operate on trade ledger payloads. It mirrors the same dense window layout but uses `EnrichmentWindowRow` (seven slots) instead of four.
 - Ledgers expose lightweight iterators for a symbol or minute slice so workers can process contiguous ranges efficiently (cache-friendly scans during repairs/backfills).
 
 ### Symbol Map Lifecycle
@@ -123,44 +124,44 @@ Each engine owns a focused scope, exposes a shared `Engine` trait (`start(ctx)`,
 
 ### `treasury-engine`
 
-- Inputs: upstream treasury feed client plus `TradeLedger` handle for `rf_rate_ref` writes.
+- Inputs: upstream treasury feed client plus `TradeWindowSpace` handle for `rf_rate_ref` writes.
 - Behavior: ingest `RfRatePayload` updates, compute `valid_from/valid_to`, and walk all applicable symbols to write the new payload ID into every minute within the validity range. Carries forward rates until superseded.
 - Outputs: `rf_rate.map` payloads + slot updates; publishes metrics for curve lag and per-symbol update counts.
 
 ### `trade-flatfile-engine`
 
-- Inputs: batch/flatfile trade connectors, symbol resolver, `TradeLedger` handle.
+- Inputs: batch/flatfile trade connectors, symbol resolver, `TradeWindowSpace` handle.
 - Behavior: walk historical files, batch trades per minute, append `TradeBatchPayload` records, write `option_trade_ref` slots, and mark `Pending` while processing. Provides hooks for repair/rewind via `clear_slot`.
 - Outputs: trade payload IDs, `option_trade_ref` slot transitions, ingestion metrics (latency, record count, file offsets).
 
 ### `trade-ws-engine`
 
-- Inputs: realtime websocket feeds, incremental checkpoint state, `TradeLedger` handle.
+- Inputs: realtime websocket feeds, incremental checkpoint state, `TradeWindowSpace` handle.
 - Behavior: stream trades minute-by-minute, emit `TradeBatchPayload` artifacts (or inline buffers) once the minute closes, write `option_trade_ref` slots immediately so downstream consumers see near-real-time updates.
 - Outputs: trade payload IDs, real-time ingestion metrics (lag, dropped messages, reconnect counters).
 
 ### `quote-engine`
 
-- Inputs: quote/NBBO feeds, `TradeLedger` handle for `option_quote_ref` slots.
+- Inputs: quote/NBBO feeds, `TradeWindowSpace` handle for `option_quote_ref` slots.
 - Behavior: batch quotes per minute, persist `QuotePayload`, and write slots once both payload and checksum are ready.
 - Outputs: quote payload IDs, slot updates, metrics for quote lag and NBBO coverage.
 
 ### `nbbo-engine`
 
-- Inputs: `TradeLedger` view (trade+quote refs) plus write access to `option_aggressor_ref` slots.
+- Inputs: `TradeWindowSpace` view (trade+quote refs) plus write access to `option_aggressor_ref` slots.
 - Behavior: scan windows where both trade and quote refs are `Filled`, compute aggressor/NBBO payloads, append `AggressorPayload`, and store references. Retries when dependencies clear. After writing quotes, set quote refs to `Prune`.
 - Outputs: aggressor payload IDs, slot updates, dependency lag metrics.
 
 ### `greeks-engine`
 
-- Inputs: `TradeLedger` (for rf/trade/quote/aggressor context) and `EnrichmentLedger` write handle.
+- Inputs: `TradeWindowSpace` (for rf/trade/quote/aggressor context) and `EnrichmentWindowSpace` write handle.
 - Behavior: recompute greeks whenever treasury version or upstream payloads change, append `GreeksPayload`, and fill `greeks_ref`. Uses CAS to avoid stomping newer writes.
 - Outputs: greeks payload IDs, slot transitions, recompute counters keyed by treasury version.
 
 ### `aggregation-engine`
 
-- Inputs: read-only `EnrichmentLedger` + `TradeLedger` (for source data) and write access to enrichment aggregate slots.
-- Behavior: for each minute `T`, compute rolling aggregates per configured window (1m/5m/10m/30m/1h/4h), append `AggregatePayload` entries, and write the results to the slot whose `minute_idx` equals the window start (`T`, `T+5m`, …). Re-entrant runs only touch windows assigned to the current invocation.
+- Inputs: read-only `EnrichmentWindowSpace` + `TradeWindowSpace` (for source data) and write access to enrichment aggregate slots.
+- Behavior: for each minute `T`, compute rolling aggregates per configured window (1m/5m/10m/30m/1h/4h), append `AggregatePayload` entries, and write the results to the slot whose `window_idx` equals the window start (`T`, `T+5m`, …). Re-entrant runs only touch windows assigned to the current invocation.
 - Outputs: aggregate payload IDs, slot transitions, metrics for window coverage and backlog.
 
 ## Legacy Crate Inventory & Retirement Plan
@@ -169,7 +170,7 @@ Existing workspace crates (e.g., `orchestrator/`, `treasury-ingestion-service/`,
 
 ## Controller Responsibilities
 
-1. **Ledger-specialized APIs**: ingestion/materialization services call explicit setters on the trade or enrichment ledger (`set_rf_rate_ref`, `set_option_trade_ref`, `set_option_quote_ref`, `set_underlying_trade_ref`, `set_underlying_quote_ref`, `set_option_aggressor_ref`, `set_underlying_aggressor_ref`, `set_greeks_ref`, `set_aggs_ref_*`). Each setter accepts `(symbol_id, minute_idx, payload_type, payload_id, checksum, version)` plus optional expected version for CAS semantics and automatically manages the slot status (`Pending` → `Filled`).
+1. **Ledger-specialized APIs**: ingestion/materialization services call explicit setters on the trade or enrichment ledger (`set_rf_rate_ref`, `set_option_trade_ref`, `set_option_quote_ref`, `set_underlying_trade_ref`, `set_underlying_quote_ref`, `set_option_aggressor_ref`, `set_underlying_aggressor_ref`, `set_greeks_ref`, `set_aggs_ref_*`). Each setter accepts `(symbol_id, window_idx, payload_type, payload_id, checksum, version)` plus optional expected version for CAS semantics and automatically manages the slot status (`Pending` → `Filled`).
 2. **Window-scoped coordination**: workers already know which symbol+minute windows they own while ingesting, backfilling, or repairing. They fetch that row, verify prerequisites locally, and update only the column they own—no central dependency graph, mutation queue, or fan-out triggers.
 3. **Durability & restart**: mutations land in the mmap-backed file immediately; the OS flush policy is sufficient durability for the first iteration. Restarts remap the file and rebuild lightweight indexes—there is no WAL or changestream to replay.
 4. **Concurrency control**: per-row compare-and-swap guards ensure two writers cannot race on the same slot; the controller returns a conflict error if a caller’s expected version regresses.
@@ -177,43 +178,43 @@ Existing workspace crates (e.g., `orchestrator/`, `treasury-ingestion-service/`,
 
 ## API Surface
 
-All APIs address windows via `(symbol_id, minute_idx)`. Helpers exist to translate `symbol` → `symbol_id` (allocating a new ID if below the 10 000 cap) and `timestamp` → `minute_idx`.
+All APIs address windows via `(symbol_id, window_idx)`. Helpers exist to translate `symbol` → `symbol_id` (allocating a new ID if below the 10 000 cap) and `timestamp` → `window_idx`.
 
-### TradeLedger APIs
+### TradeWindowSpace APIs
 
-- `set_rf_rate_ref(symbol_id, minute_idx, payload_meta)`  
+- `set_rf_rate_ref(symbol_id, window_idx, payload_meta)`  
   Stores a risk-free-rate/treasury slice reference for that symbol+minute (used primarily for index/ETF symbols).
-- `set_option_trade_ref(symbol_id, minute_idx, payload_meta)`  
+- `set_option_trade_ref(symbol_id, window_idx, payload_meta)`  
   Writes the option trade batch reference (usually an immutable partition ID).
-- `set_option_quote_ref(symbol_id, minute_idx, payload_meta)`  
+- `set_option_quote_ref(symbol_id, window_idx, payload_meta)`  
   Writes the option quote/NBBO inputs captured for the minute.
-- `set_underlying_trade_ref(symbol_id, minute_idx, payload_meta)`  
+- `set_underlying_trade_ref(symbol_id, window_idx, payload_meta)`  
   Writes the underlying (equity) trade payload reference.
-- `set_underlying_quote_ref(symbol_id, minute_idx, payload_meta)`  
+- `set_underlying_quote_ref(symbol_id, window_idx, payload_meta)`  
   Writes the underlying (equity) quote/NBBO payload reference.
-- `set_option_aggressor_ref(symbol_id, minute_idx, payload_meta)` and `set_underlying_aggressor_ref(...)`  
+- `set_option_aggressor_ref(symbol_id, window_idx, payload_meta)` and `set_underlying_aggressor_ref(...)`  
   Store the aggressor/NBBO outputs derived from the respective trade+quote payloads.
 
 Each setter accepts `payload_meta = { payload_type: PayloadType, payload_id: u32, version: u32, checksum: u32, last_updated_ns }`. The controller enforces that the provided `payload_type` matches the slot’s allowed enum.
 
-### EnrichmentLedger APIs
+### EnrichmentWindowSpace APIs
 
-- `set_greeks_ref(symbol_id, minute_idx, payload_meta)`
-- `set_aggs_ref_{1m,5m,10m,30m,1h,4h}(symbol_id, minute_idx, payload_meta)`
+- `set_greeks_ref(symbol_id, window_idx, payload_meta)`
+- `set_aggs_ref_{1m,5m,10m,30m,1h,4h}(symbol_id, window_idx, payload_meta)`
 
-These setters behave the same as TradeLedger writes but target the enrichment slots. Aggregation windows are rolling: a `5m` aggregate stored at minute `T` covers `[T, T+5m)` and the aggregation engine writes to every `minute_idx` it evaluates. For example, when invoked for minute `T` it fills `T, T+5m, T+10m, …`; when invoked at `T+1m` it writes `T+1m, T+6m, …` without mutating previously written rows. Downstream readers always interpret `minute_idx` as “window start”.
+These setters behave the same as TradeWindowSpace writes but target the enrichment slots. Aggregation windows are rolling: a `5m` aggregate stored at minute `T` covers `[T, T+5m)` and the aggregation engine writes to every `window_idx` it evaluates. For example, when invoked for minute `T` it fills `T, T+5m, T+10m, …`; when invoked at `T+1m` it writes `T+1m, T+6m, …` without mutating previously written rows. Downstream readers always interpret `window_idx` as “window start”.
 
 ### Common Helpers
 
-- `clear_slot(ledger_kind, slot_kind, symbol_id, minute_idx, cause)` resets a column to `Cleared` (or `Empty` if never touched) and records the operator cause for audit; `last_updated_ns` reflects the clear time for lag analysis.
-- `get_trade_row(symbol_id, minute_idx)` / `get_enrichment_row(symbol_id, minute_idx)` return the current row (including slot metadata).
-- `iter_symbol(symbol_id, range)` and `iter_minute(minute_idx, symbol_range)` expose cache-friendly iterators for workers.
+- `clear_slot(ledger_kind, slot_kind, symbol_id, window_idx, cause)` resets a column to `Cleared` (or `Empty` if never touched) and records the operator cause for audit; `last_updated_ns` reflects the clear time for lag analysis.
+- `get_trade_row(symbol_id, window_idx)` / `get_enrichment_row(symbol_id, window_idx)` return the current row (including slot metadata).
+- `iter_symbol(symbol_id, range)` and `iter_minute(window_idx, symbol_range)` expose cache-friendly iterators for workers.
 - `resolve_symbol(symbol) -> SymbolId` allocates IDs lazily until the 10 000-symbol cap is reached (hard-coded guard for now).
-- `mark_pending(ledger_kind, slot_kind, symbol_id, minute_idx)` is an optional helper for workers to claim a slot when they enqueue work; it flips status to `Pending` and updates `last_updated_ns` without changing payload metadata.
+- `mark_pending(ledger_kind, slot_kind, symbol_id, window_idx)` is an optional helper for workers to claim a slot when they enqueue work; it flips status to `Pending` and updates `last_updated_ns` without changing payload metadata.
 
 ## Worker Coordination
 
-- Each `*-engine` crate maintains its own backlog of `(symbol_id, minute_idx)` entries (e.g., “next minute to ingest”, “range needing repair”). Before starting work, the worker marks the slot `Pending` (via a lightweight `mark_pending` helper) so operators can observe intent; once the payload is written it transitions to `Filled`.
+- Each `*-engine` crate maintains its own backlog of `(symbol_id, window_idx)` entries (e.g., “next minute to ingest”, “range needing repair”). Before starting work, the worker marks the slot `Pending` (via a lightweight `mark_pending` helper) so operators can observe intent; once the payload is written it transitions to `Filled`.
 - Priority regions (described below) override the default queue ordering. Workers must consult the shared priority table before selecting the next unit of work and bias toward the highest-priority outstanding region.
 - Backfills or repairs simply `clear_slot` before writing replacements; no controller-managed retry/trigger queue exists.
 - Because coordination is per-window, workers also own their own concurrency/backpressure limits. The ledger controller only enforces schema + version safety and persists the results.
@@ -224,7 +225,7 @@ These setters behave the same as TradeLedger writes but target the enrichment sl
 - Regions are stored in a small shared index (e.g., `BTreeMap<(symbol_id, start_ts), PriorityRegion>`) persisted alongside the ledger. A symbol can own multiple overlapping regions; the controller merges or reorders them by explicit `priority` (higher number = sooner).
 - Engines poll the priority store before popping work from their default queues. Implementation guideline:
   1. Pull the highest-priority outstanding region whose `priority > default`.
-  2. Expand it into the constituent minutes and push those `(symbol_id, minute_idx)` entries to the front of the worker’s queue.
+  2. Expand it into the constituent minutes and push those `(symbol_id, window_idx)` entries to the front of the worker’s queue.
   3. As each row reaches the desired state (slot filled, checksum verified), mark that minute complete inside the region tracker.
   4. Once all minutes in the interval are healthy, the controller retires the region automatically.
 - The TUI (see `interface-thoughts.md`) issues priority regions when an operator selects a symbol+time range; repairs or automated anomaly detectors can do the same with lower priority levels.
@@ -239,7 +240,7 @@ These setters behave the same as TradeLedger writes but target the enrichment sl
 ## Persistence & Memory Strategy
 
 - **Memory-mapped ledger file**: pre-layout the active year of windows into a fixed-size file; `mmap` it read-write so in-memory updates persist via the OS page cache without a separate WAL. Each slot struct carries a version/checksum so partial writes can be detected and corrected on restart.
-- **In-process view**: wrap the mapped memory as `&mut [SymbolRows]` where each entry contains the 390-minute array. Addressing `(symbol_id, minute_idx)` becomes a simple double index; no hash lookups are needed at runtime.
+- **In-process view**: wrap the mapped memory as `&mut [SymbolRows]` where each entry contains the 390-minute array. Addressing `(symbol_id, window_idx)` becomes a simple double index; no hash lookups are needed at runtime.
 - **Snapshots**: bundle `scripts/archive-ledger.sh`, a cron-invoked helper that tars and checksums the entire `ledger.state/` directory (ledgers, mapping files, symbol map). Restores untar the archive into place before remapping.
 - **Horizon**: keep six months of completed windows (prior to current date) mapped read-write, and pre-map the next six months for upcoming sessions. Older data lives on disk inside `ledger.state/` but remains unmapped unless explicitly loaded for audits.
 
@@ -256,7 +257,7 @@ These setters behave the same as TradeLedger writes but target the enrichment sl
 
 ## Ingestion Engines & Orchestrator Integration
 
-- Single binary: the `m17` orchestrator crate hosts the ledgers and controller in-process. It builds/loads both ledgers plus all payload mapping files, replays the latest snapshot, and hands shared handles (e.g., `Arc<TradeLedger>`, `Arc<EnrichmentLedger>`) to each engine module.
+- Single binary: the `m17` orchestrator crate hosts the ledgers and controller in-process. It builds/loads both ledgers plus all payload mapping files, replays the latest snapshot, and hands shared handles (e.g., `Arc<TradeWindowSpace>`, `Arc<EnrichmentWindowSpace>`) to each engine module.
 - Engines (treasury, trade-flatfile, trade-ws, quote, nbbo, greeks, aggregation) run event loops that call the ledger setters defined in the `ledger` crate. Aggressor workers consume the trade rows once both `option_trade_ref` and `option_quote_ref` exist and publish their payload IDs back into the trade ledger.
 - Greeks/aggregation engines take two handles: the trade ledger for source refs and the enrichment ledger for their outputs. They dereference payload IDs via the mapping tables as needed, then publish overlays/aggregates via enrichment setters.
 - Orchestrator supervises engines: if the ledgers detect backpressure, symbol-cap exhaustion, or priority-region starvation, `m17` can pause/resume loops, initiate repairs via ledger APIs, or clear/replay ranges.
@@ -273,7 +274,7 @@ Use `[ ]` / `[x]` to track progress.
 
 ### Design Finalization
 
-- [x] Ratify schema, typed setter API, treasury fill semantics, and rolling aggregation behavior (see Row Schema, API Surface, Treasury Cadence, and EnrichmentLedger sections).
+- [x] Ratify schema, typed setter API, treasury fill semantics, and rolling aggregation behavior (see Row Schema, API Surface, Treasury Cadence, and EnrichmentWindowSpace sections).
 - [x] Document payload schemas for each mapping file (`rf_rate`, `trade`, `quote`, `aggressor`, `greeks`, `aggregate`).
 - [x] Define symbol-map lifecycle (allocation, eviction rules, snapshot format).
 - [x] Finalize crate boundaries (`m17`, `ledger`, each `*-engine`) and shared traits the orchestrator uses to drive engines (see Crate Layout & Worker Naming plus Ingestion Engines & Orchestrator Integration).
@@ -287,7 +288,7 @@ Use `[ ]` / `[x]` to track progress.
 
 • Ledger & Controller Implementation Summary (ebb259a and 568415b)
 
-- Built a reusable ledger crate with dense TradeLedger/EnrichmentLedger row
+- Built a reusable ledger crate with dense TradeWindowSpace/EnrichmentWindowSpace row
     structures, slot semantics (PayloadType, SlotStatus, CAS checks), and a
     WindowSpace helper for precomputing the 390-minute lattice plus timestamp→minute
     lookups.
@@ -297,7 +298,7 @@ Use `[ ]` / `[x]` to track progress.
     automatic payload-id generation.
 - Implemented WindowSpaceController to bootstrap state, resolve symbols, expose all
     setter APIs (set_option_trade_ref, set_option_quote_ref, set_greeks_ref, etc.), handle pending/
-    clear operations, provide minute_idx_for_timestamp, and gate access to the payload
+    clear operations, provide window_idx_for_timestamp, and gate access to the payload
     stores via mutexes.
 - Added unit tests covering slot type enforcement, version conflicts, window lookup
     accuracy, and controller write/read flows; cargo test -p ledger passes.
@@ -386,13 +387,13 @@ How a trade engine writes a option_trade_ref - early concept:
 
   Trade engine pseudocode
 
-  let minute_idx = controller
-      .minute_idx_for_timestamp(window_start_ts)
+  let window_idx = controller
+      .window_idx_for_timestamp(window_start_ts)
       .expect("window in range");
 
   let trade_batch = TradeBatchPayload {
       schema_version: 1,
-      minute_ts: window_start_ts,
+      window_ts: window_start_ts,
       batch_id: next_batch_id(),
       first_trade_ts,
       last_trade_ts,
@@ -407,4 +408,4 @@ How a trade engine writes a option_trade_ref - early concept:
   };
 
   let meta = PayloadMeta::new(PayloadType::Trade, payload_id, version, checksum);
-  controller.set_option_trade_ref(symbol, minute_idx, meta, None)?;
+  controller.set_option_trade_ref(symbol, window_idx, meta, None)?;

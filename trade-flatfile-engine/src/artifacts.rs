@@ -58,7 +58,7 @@ pub fn artifact_path(
     family: &str,
     date: chrono::NaiveDate,
     symbol: &str,
-    minute_idx: window_space::MinuteIndex,
+    window_idx: window_space::WindowIndex,
     ext: &str,
 ) -> String {
     let safe_symbol = sanitized_symbol(symbol);
@@ -69,7 +69,7 @@ pub fn artifact_path(
         date.year(),
         date.month(),
         date.day(),
-        minute_idx,
+        window_idx,
         safe_symbol,
         ext
     )

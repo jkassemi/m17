@@ -1,4 +1,5 @@
 use thiserror::Error;
+use window_space::WindowIndex;
 
 #[derive(Debug, Error)]
 pub enum FlatfileError {
@@ -14,4 +15,6 @@ pub enum FlatfileError {
     Arrow(#[from] arrow::error::ArrowError),
     #[error("parquet error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
+    #[error("window metadata missing for window_idx {window_idx}")]
+    MissingWindowMeta { window_idx: WindowIndex },
 }

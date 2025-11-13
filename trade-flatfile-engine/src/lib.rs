@@ -1,7 +1,7 @@
 mod artifacts;
 mod config;
 mod errors;
-mod minute_bucket;
+mod window_bucket;
 
 pub use config::FlatfileRuntimeConfig;
 
@@ -44,7 +44,6 @@ use engine_api::{
 use errors::FlatfileError;
 use futures::StreamExt;
 use log::{error, info, warn};
-use minute_bucket::{HasTimestamp, MinuteBucket};
 use parking_lot::Mutex;
 use tokio::{
     io::{AsyncRead, BufReader},
@@ -53,8 +52,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use trading_calendar::{Market, TradingCalendar};
+use window_bucket::{HasTimestamp, WindowBucket};
 use window_space::{
-    MinuteIndex, SlotStatus, WindowSpaceController,
+    SlotStatus, WindowIndex, WindowSpaceController,
     mapping::{QuoteBatchPayload, TradeBatchPayload},
     payload::{PayloadMeta, PayloadType, SlotKind, TradeSlotKind},
 };
@@ -173,7 +173,7 @@ impl OptionTradeInner {
         let buf = BufReader::new(reader);
         let mut csv_reader = AsyncReaderBuilder::new().trim(Trim::All).create_reader(buf);
         let mut records = csv_reader.records();
-        let mut buckets: HashMap<MinuteKey, MinuteBucket<OptionTradeRecord>> =
+        let mut buckets: HashMap<WindowKey, WindowBucket<OptionTradeRecord>> =
             HashMap::with_capacity(self.config.batch_size.max(1024));
         let mut processed_rows = 0usize;
         let mut last_progress = Instant::now();
@@ -184,7 +184,7 @@ impl OptionTradeInner {
                 continue;
             }
             if let Some((symbol, trade)) = parse_option_trade_row(&record) {
-                let minute_idx = match self.minute_idx_for_timestamp(trade.trade_ts_ns) {
+                let window_idx = match self.window_idx_for_timestamp(trade.trade_ts_ns) {
                     Some(idx) => idx,
                     None => {
                         warn!(
@@ -194,10 +194,10 @@ impl OptionTradeInner {
                         continue;
                     }
                 };
-                let bucket_key = MinuteKey { symbol, minute_idx };
+                let bucket_key = WindowKey { symbol, window_idx };
                 buckets
                     .entry(bucket_key)
-                    .or_insert_with(MinuteBucket::new)
+                    .or_insert_with(WindowBucket::new)
                     .observe(trade);
                 processed_rows += 1;
                 if last_progress.elapsed() >= interval {
@@ -218,16 +218,16 @@ impl OptionTradeInner {
     fn persist_option_trade_bucket(
         &self,
         date: NaiveDate,
-        key: MinuteKey,
-        bucket: MinuteBucket<OptionTradeRecord>,
+        key: WindowKey,
+        bucket: WindowBucket<OptionTradeRecord>,
     ) -> Result<(), FlatfileError> {
-        let row = self.ledger.get_trade_row(&key.symbol, key.minute_idx)?;
+        let row = self.ledger.get_trade_row(&key.symbol, key.window_idx)?;
         if row.option_trade_ref.status == SlotStatus::Filled {
             return Ok(());
         }
         self.ledger.mark_pending(
             &key.symbol,
-            key.minute_idx,
+            key.window_idx,
             SlotKind::Trade(TradeSlotKind::OptionTrade),
         )?;
         let batch = option_trade_batch(&bucket.records)?;
@@ -236,13 +236,13 @@ impl OptionTradeInner {
             "options/trades",
             date,
             &key.symbol,
-            key.minute_idx,
+            key.window_idx,
             "parquet",
         );
         let artifact = write_record_batch(&self.config, &relative_path, &batch)?;
         let payload = TradeBatchPayload {
             schema_version: OPTION_TRADE_SCHEMA_VERSION,
-            minute_ts: bucket.minute_start_ns,
+            window_ts: window_start_ns(&self.ledger, key.window_idx)?,
             batch_id: self.batch_seq.fetch_add(1, Ordering::Relaxed) + 1,
             first_trade_ts: bucket.first_ts,
             last_trade_ts: bucket.last_ts,
@@ -257,11 +257,11 @@ impl OptionTradeInner {
         let meta = PayloadMeta::new(PayloadType::Trade, payload_id, 1, artifact.checksum);
         if let Err(err) = self
             .ledger
-            .set_option_trade_ref(&key.symbol, key.minute_idx, meta, None)
+            .set_option_trade_ref(&key.symbol, key.window_idx, meta, None)
         {
             self.ledger.clear_slot(
                 &key.symbol,
-                key.minute_idx,
+                key.window_idx,
                 SlotKind::Trade(TradeSlotKind::OptionTrade),
             )?;
             return Err(err.into());
@@ -269,8 +269,8 @@ impl OptionTradeInner {
         Ok(())
     }
 
-    fn minute_idx_for_timestamp(&self, ts_ns: i64) -> Option<MinuteIndex> {
-        self.ledger.minute_idx_for_timestamp(ts_ns / 1_000_000_000)
+    fn window_idx_for_timestamp(&self, ts_ns: i64) -> Option<WindowIndex> {
+        self.ledger.window_idx_for_timestamp(ts_ns / 1_000_000_000)
     }
 
     fn stop(&self, label: &str) -> EngineResult<()> {
@@ -340,7 +340,7 @@ impl OptionQuoteInner {
         let buf = BufReader::new(reader);
         let mut csv_reader = AsyncReaderBuilder::new().trim(Trim::All).create_reader(buf);
         let mut records = csv_reader.records();
-        let mut buckets: HashMap<MinuteKey, MinuteBucket<QuoteRecord>> =
+        let mut buckets: HashMap<WindowKey, WindowBucket<QuoteRecord>> =
             HashMap::with_capacity(self.config.batch_size.max(1024));
         let mut processed_rows = 0usize;
         let mut last_progress = Instant::now();
@@ -351,14 +351,14 @@ impl OptionQuoteInner {
                 continue;
             }
             if let Some((symbol, quote)) = parse_quote_row(&record, QuoteSource::Option) {
-                let minute_idx = match self.minute_idx_for_timestamp(quote.quote_ts_ns) {
+                let window_idx = match self.window_idx_for_timestamp(quote.quote_ts_ns) {
                     Some(idx) => idx,
                     None => continue,
                 };
-                let key = MinuteKey { symbol, minute_idx };
+                let key = WindowKey { symbol, window_idx };
                 buckets
                     .entry(key)
-                    .or_insert_with(MinuteBucket::new)
+                    .or_insert_with(WindowBucket::new)
                     .observe(quote);
                 processed_rows += 1;
                 if last_progress.elapsed() >= interval {
@@ -379,16 +379,16 @@ impl OptionQuoteInner {
     fn persist_option_quote_bucket(
         &self,
         date: NaiveDate,
-        key: MinuteKey,
-        bucket: MinuteBucket<QuoteRecord>,
+        key: WindowKey,
+        bucket: WindowBucket<QuoteRecord>,
     ) -> Result<(), FlatfileError> {
-        let row = self.ledger.get_trade_row(&key.symbol, key.minute_idx)?;
+        let row = self.ledger.get_trade_row(&key.symbol, key.window_idx)?;
         if row.option_quote_ref.status == SlotStatus::Filled {
             return Ok(());
         }
         self.ledger.mark_pending(
             &key.symbol,
-            key.minute_idx,
+            key.window_idx,
             SlotKind::Trade(TradeSlotKind::OptionQuote),
         )?;
         let batch = quote_batch(&bucket.records)?;
@@ -397,13 +397,13 @@ impl OptionQuoteInner {
             "options/quotes",
             date,
             &key.symbol,
-            key.minute_idx,
+            key.window_idx,
             "parquet",
         );
         let artifact = write_record_batch(&self.config, &relative_path, &batch)?;
         let payload = QuoteBatchPayload {
             schema_version: QUOTE_SCHEMA_VERSION,
-            minute_ts: bucket.minute_start_ns,
+            window_ts: window_start_ns(&self.ledger, key.window_idx)?,
             batch_id: self.batch_seq.fetch_add(1, Ordering::Relaxed) + 1,
             first_quote_ts: bucket.first_ts,
             last_quote_ts: bucket.last_ts,
@@ -418,11 +418,11 @@ impl OptionQuoteInner {
         let meta = PayloadMeta::new(PayloadType::Quote, payload_id, 1, artifact.checksum);
         if let Err(err) = self
             .ledger
-            .set_option_quote_ref(&key.symbol, key.minute_idx, meta, None)
+            .set_option_quote_ref(&key.symbol, key.window_idx, meta, None)
         {
             self.ledger.clear_slot(
                 &key.symbol,
-                key.minute_idx,
+                key.window_idx,
                 SlotKind::Trade(TradeSlotKind::OptionQuote),
             )?;
             return Err(err.into());
@@ -430,8 +430,8 @@ impl OptionQuoteInner {
         Ok(())
     }
 
-    fn minute_idx_for_timestamp(&self, ts_ns: i64) -> Option<MinuteIndex> {
-        self.ledger.minute_idx_for_timestamp(ts_ns / 1_000_000_000)
+    fn window_idx_for_timestamp(&self, ts_ns: i64) -> Option<WindowIndex> {
+        self.ledger.window_idx_for_timestamp(ts_ns / 1_000_000_000)
     }
 
     fn stop(&self, label: &str) -> EngineResult<()> {
@@ -501,7 +501,7 @@ impl UnderlyingTradeInner {
         let buf = BufReader::new(reader);
         let mut csv_reader = AsyncReaderBuilder::new().trim(Trim::All).create_reader(buf);
         let mut records = csv_reader.records();
-        let mut buckets: HashMap<MinuteKey, MinuteBucket<UnderlyingTradeRecord>> =
+        let mut buckets: HashMap<WindowKey, WindowBucket<UnderlyingTradeRecord>> =
             HashMap::with_capacity(self.config.batch_size.max(1024));
         let mut processed_rows = 0usize;
         let mut last_progress = Instant::now();
@@ -512,14 +512,14 @@ impl UnderlyingTradeInner {
                 continue;
             }
             if let Some((symbol, trade)) = parse_underlying_trade_row(&record) {
-                let minute_idx = match self.minute_idx_for_timestamp(trade.trade_ts_ns) {
+                let window_idx = match self.window_idx_for_timestamp(trade.trade_ts_ns) {
                     Some(idx) => idx,
                     None => continue,
                 };
-                let key = MinuteKey { symbol, minute_idx };
+                let key = WindowKey { symbol, window_idx };
                 buckets
                     .entry(key)
-                    .or_insert_with(MinuteBucket::new)
+                    .or_insert_with(WindowBucket::new)
                     .observe(trade);
                 processed_rows += 1;
                 if last_progress.elapsed() >= interval {
@@ -540,16 +540,16 @@ impl UnderlyingTradeInner {
     fn persist_underlying_trade_bucket(
         &self,
         date: NaiveDate,
-        key: MinuteKey,
-        bucket: MinuteBucket<UnderlyingTradeRecord>,
+        key: WindowKey,
+        bucket: WindowBucket<UnderlyingTradeRecord>,
     ) -> Result<(), FlatfileError> {
-        let row = self.ledger.get_trade_row(&key.symbol, key.minute_idx)?;
+        let row = self.ledger.get_trade_row(&key.symbol, key.window_idx)?;
         if row.underlying_trade_ref.status == SlotStatus::Filled {
             return Ok(());
         }
         self.ledger.mark_pending(
             &key.symbol,
-            key.minute_idx,
+            key.window_idx,
             SlotKind::Trade(TradeSlotKind::UnderlyingTrade),
         )?;
         let batch = underlying_trade_batch(&bucket.records)?;
@@ -558,13 +558,13 @@ impl UnderlyingTradeInner {
             "underlying/trades",
             date,
             &key.symbol,
-            key.minute_idx,
+            key.window_idx,
             "parquet",
         );
         let artifact = write_record_batch(&self.config, &relative_path, &batch)?;
         let payload = TradeBatchPayload {
             schema_version: UNDERLYING_TRADE_SCHEMA_VERSION,
-            minute_ts: bucket.minute_start_ns,
+            window_ts: window_start_ns(&self.ledger, key.window_idx)?,
             batch_id: self.batch_seq.fetch_add(1, Ordering::Relaxed) + 1,
             first_trade_ts: bucket.first_ts,
             last_trade_ts: bucket.last_ts,
@@ -579,11 +579,11 @@ impl UnderlyingTradeInner {
         let meta = PayloadMeta::new(PayloadType::Trade, payload_id, 1, artifact.checksum);
         if let Err(err) =
             self.ledger
-                .set_underlying_trade_ref(&key.symbol, key.minute_idx, meta, None)
+                .set_underlying_trade_ref(&key.symbol, key.window_idx, meta, None)
         {
             self.ledger.clear_slot(
                 &key.symbol,
-                key.minute_idx,
+                key.window_idx,
                 SlotKind::Trade(TradeSlotKind::UnderlyingTrade),
             )?;
             return Err(err.into());
@@ -591,8 +591,8 @@ impl UnderlyingTradeInner {
         Ok(())
     }
 
-    fn minute_idx_for_timestamp(&self, ts_ns: i64) -> Option<MinuteIndex> {
-        self.ledger.minute_idx_for_timestamp(ts_ns / 1_000_000_000)
+    fn window_idx_for_timestamp(&self, ts_ns: i64) -> Option<WindowIndex> {
+        self.ledger.window_idx_for_timestamp(ts_ns / 1_000_000_000)
     }
 
     fn stop(&self, label: &str) -> EngineResult<()> {
@@ -662,7 +662,7 @@ impl UnderlyingQuoteInner {
         let buf = BufReader::new(reader);
         let mut csv_reader = AsyncReaderBuilder::new().trim(Trim::All).create_reader(buf);
         let mut records = csv_reader.records();
-        let mut buckets: HashMap<MinuteKey, MinuteBucket<QuoteRecord>> =
+        let mut buckets: HashMap<WindowKey, WindowBucket<QuoteRecord>> =
             HashMap::with_capacity(self.config.batch_size.max(1024));
         let mut processed_rows = 0usize;
         let mut last_progress = Instant::now();
@@ -673,14 +673,14 @@ impl UnderlyingQuoteInner {
                 continue;
             }
             if let Some((symbol, quote)) = parse_quote_row(&record, QuoteSource::Underlying) {
-                let minute_idx = match self.minute_idx_for_timestamp(quote.quote_ts_ns) {
+                let window_idx = match self.window_idx_for_timestamp(quote.quote_ts_ns) {
                     Some(idx) => idx,
                     None => continue,
                 };
-                let key = MinuteKey { symbol, minute_idx };
+                let key = WindowKey { symbol, window_idx };
                 buckets
                     .entry(key)
-                    .or_insert_with(MinuteBucket::new)
+                    .or_insert_with(WindowBucket::new)
                     .observe(quote);
                 processed_rows += 1;
                 if last_progress.elapsed() >= interval {
@@ -701,16 +701,16 @@ impl UnderlyingQuoteInner {
     fn persist_underlying_quote_bucket(
         &self,
         date: NaiveDate,
-        key: MinuteKey,
-        bucket: MinuteBucket<QuoteRecord>,
+        key: WindowKey,
+        bucket: WindowBucket<QuoteRecord>,
     ) -> Result<(), FlatfileError> {
-        let row = self.ledger.get_trade_row(&key.symbol, key.minute_idx)?;
+        let row = self.ledger.get_trade_row(&key.symbol, key.window_idx)?;
         if row.underlying_quote_ref.status == SlotStatus::Filled {
             return Ok(());
         }
         self.ledger.mark_pending(
             &key.symbol,
-            key.minute_idx,
+            key.window_idx,
             SlotKind::Trade(TradeSlotKind::UnderlyingQuote),
         )?;
         let batch = quote_batch(&bucket.records)?;
@@ -719,13 +719,13 @@ impl UnderlyingQuoteInner {
             "underlying/quotes",
             date,
             &key.symbol,
-            key.minute_idx,
+            key.window_idx,
             "parquet",
         );
         let artifact = write_record_batch(&self.config, &relative_path, &batch)?;
         let payload = QuoteBatchPayload {
             schema_version: QUOTE_SCHEMA_VERSION,
-            minute_ts: bucket.minute_start_ns,
+            window_ts: window_start_ns(&self.ledger, key.window_idx)?,
             batch_id: self.batch_seq.fetch_add(1, Ordering::Relaxed) + 1,
             first_quote_ts: bucket.first_ts,
             last_quote_ts: bucket.last_ts,
@@ -740,11 +740,11 @@ impl UnderlyingQuoteInner {
         let meta = PayloadMeta::new(PayloadType::Quote, payload_id, 1, artifact.checksum);
         if let Err(err) =
             self.ledger
-                .set_underlying_quote_ref(&key.symbol, key.minute_idx, meta, None)
+                .set_underlying_quote_ref(&key.symbol, key.window_idx, meta, None)
         {
             self.ledger.clear_slot(
                 &key.symbol,
-                key.minute_idx,
+                key.window_idx,
                 SlotKind::Trade(TradeSlotKind::UnderlyingQuote),
             )?;
             return Err(err.into());
@@ -752,8 +752,8 @@ impl UnderlyingQuoteInner {
         Ok(())
     }
 
-    fn minute_idx_for_timestamp(&self, ts_ns: i64) -> Option<MinuteIndex> {
-        self.ledger.minute_idx_for_timestamp(ts_ns / 1_000_000_000)
+    fn window_idx_for_timestamp(&self, ts_ns: i64) -> Option<WindowIndex> {
+        self.ledger.window_idx_for_timestamp(ts_ns / 1_000_000_000)
     }
 
     fn stop(&self, label: &str) -> EngineResult<()> {
@@ -1455,9 +1455,19 @@ struct RuntimeBundle {
 }
 
 #[derive(Hash, Eq, PartialEq, Clone)]
-struct MinuteKey {
+struct WindowKey {
     symbol: String,
-    minute_idx: MinuteIndex,
+    window_idx: WindowIndex,
+}
+
+fn window_start_ns(
+    ledger: &WindowSpaceController,
+    window_idx: WindowIndex,
+) -> Result<i64, FlatfileError> {
+    ledger
+        .window_meta(window_idx)
+        .map(|meta| meta.start_ts)
+        .ok_or(FlatfileError::MissingWindowMeta { window_idx })
 }
 
 impl OptionTradeFlatfileEngine {

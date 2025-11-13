@@ -2,7 +2,7 @@ use std::{env, path::PathBuf, str::FromStr};
 
 use core_types::config::DateRange;
 use thiserror::Error;
-use time::Duration;
+use time::macros::date;
 use window_space::{
     WindowRangeConfig, WindowSpace,
     config::{DEFAULT_MAX_SYMBOLS, WindowSpaceConfig},
@@ -106,13 +106,16 @@ fn session_windows(env: Environment) -> WindowSpace {
     let base = WindowRangeConfig::default();
     match env {
         Environment::Dev => {
-            let start = base.anchor_date - Duration::days(14);
-            let end = base.anchor_date + Duration::days(14);
+            let start = date!(2025 - 11 - 01);
+            let end = date!(2025 - 11 - 30);
+            let windows_per_session = (base.session_windows / 10).max(1);
+            let ten_min_window_secs: u32 = 10 * 60;
             WindowSpace::from_bounds(
                 start,
                 end,
                 base.session_open,
-                base.session_minutes,
+                windows_per_session,
+                ten_min_window_secs,
                 base.schema_version,
             )
         }

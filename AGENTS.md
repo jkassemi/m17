@@ -1,5 +1,7 @@
 # Repository Guidelines
 
+1. MINIMAL CHANGES. DO NOT EXTRAPOLATE OR EXTEND ENGINEERING BEYOND THE USER'S REQUEST.
+
 ## Project Structure & Module Organization
 
 - Root is a Cargo workspace (`Cargo.toml`) with service crates under directories like `orchestrator/`, `treasury-ingestion-service/`, `tui/`, and shared libraries such as `core-types/`, `metrics/`, and `nbbo-cache/`.

@@ -32,6 +32,14 @@ impl LedgerConfig {
         self.state_dir.join("symbol-map.json")
     }
 
+    pub fn trade_ledger_path(&self) -> PathBuf {
+        self.state_dir.join("trade-ledger.dat")
+    }
+
+    pub fn enrichment_ledger_path(&self) -> PathBuf {
+        self.state_dir.join("enrichment-ledger.dat")
+    }
+
     pub fn ensure_dirs(&self) -> Result<()> {
         if !self.state_dir.exists() {
             fs::create_dir_all(&self.state_dir)?;

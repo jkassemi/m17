@@ -11,13 +11,20 @@ pub mod error;
 pub mod ledger;
 pub mod mapping;
 pub mod payload;
+mod storage;
 pub mod symbol_map;
 pub mod window;
 
 pub use config::LedgerConfig;
-pub use controller::{LedgerController, LedgerSlotStatusSnapshot, PendingHandle, SlotStatusCounts};
+pub use controller::{
+    LedgerController, LedgerSlotStatusSnapshot, LedgerStorageReport, PendingHandle,
+    SlotStatusCounts, StorageSummary,
+};
 pub use error::{ControllerError, LedgerError, SlotWriteError};
 pub use ledger::{EnrichmentLedger, TradeLedger};
 pub use payload::{PayloadMeta, PayloadType, SlotKind, SlotStatus};
 pub use symbol_map::{SymbolId, SymbolMap};
-pub use window::{MINUTES_PER_SESSION, MinuteIndex, WindowMeta, WindowSpace, WindowSpaceBuilder};
+pub use window::{
+    MINUTES_PER_SESSION, MinuteIndex, WindowMeta, WindowRangeConfig, WindowSpace,
+    WindowSpaceBuilder,
+};

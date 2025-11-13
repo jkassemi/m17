@@ -15,7 +15,9 @@ use std::{
 use config::{AppConfig, ConfigError, Environment};
 use core_types::config::DateRange;
 use engine_api::{Engine, EngineError};
-use ledger::{LedgerController, LedgerError, LedgerSlotStatusSnapshot, WindowSpace};
+use ledger::{
+    LedgerController, LedgerError, LedgerSlotStatusSnapshot, LedgerStorageReport, WindowSpace,
+};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use trade_flatfile_engine::{
@@ -39,7 +41,8 @@ fn run() -> Result<(), AppError> {
     };
 
     config.ledger.ensure_dirs()?;
-    let controller = Arc::new(LedgerController::bootstrap(config.ledger.clone())?);
+    let (controller_inner, storage_report) = LedgerController::bootstrap(config.ledger.clone())?;
+    let controller = Arc::new(controller_inner);
     let flatfile_cfg = FlatfileRuntimeConfig {
         label: config.env_label(),
         state_dir: config.ledger.state_dir().to_path_buf(),
@@ -76,6 +79,7 @@ fn run() -> Result<(), AppError> {
             config.ledger.max_symbols
         ),
     }
+    log_storage_summary(&storage_report);
     println!(
         "Massive REST base: {}; stocks WS: {}; options WS: {}",
         config.rest_base_url, config.stocks_ws_url, config.options_ws_url
@@ -184,6 +188,30 @@ fn describe_flatfile_ranges(ranges: &[DateRange]) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+fn log_storage_summary(report: &LedgerStorageReport) {
+    println!(
+        "Trade ledger file: {} (size={} bytes, created_at={}, init_time={})",
+        report.trade.path.display(),
+        report.trade.file_size,
+        format_timestamp(report.trade.created_at_s),
+        format_creation_duration(report.trade.creation_duration)
+    );
+    println!(
+        "Enrichment ledger file: {} (size={} bytes, created_at={}, init_time={})",
+        report.enrichment.path.display(),
+        report.enrichment.file_size,
+        format_timestamp(report.enrichment.created_at_s),
+        format_creation_duration(report.enrichment.creation_duration)
+    );
+}
+
+fn format_creation_duration(duration: Option<Duration>) -> String {
+    match duration {
+        Some(dur) => format!("{:?}", dur),
+        None => "existing".to_string(),
+    }
 }
 
 fn wait_for_shutdown_signal() -> Result<(), AppError> {

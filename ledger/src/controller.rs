@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Arc, time::Duration};
 
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -11,6 +11,7 @@ use crate::{
         AggregateWindowKind, EnrichmentSlotKind, PayloadMeta, Slot, SlotKind, SlotStatus,
         TradeSlotKind,
     },
+    storage::LedgerFileStats,
     symbol_map::{SymbolId, SymbolMap},
     window::{MinuteIndex, WindowSpace},
 };
@@ -25,37 +26,63 @@ pub struct LedgerController {
 }
 
 impl LedgerController {
-    pub fn bootstrap(config: LedgerConfig) -> Result<Self> {
+    pub fn bootstrap(config: LedgerConfig) -> Result<(Self, LedgerStorageReport)> {
         config.ensure_dirs()?;
         let symbol_map_path = config.symbol_map_path();
         let symbol_map = SymbolMap::load_or_init(&symbol_map_path, config.max_symbols)?;
         let window_space = Arc::new(config.window_space.clone());
 
-        let trade_ledger = Arc::new(TradeLedger::new(config.max_symbols, window_space.clone()));
-        let enrichment_ledger = Arc::new(EnrichmentLedger::new(
+        let trade_path = config.trade_ledger_path();
+        let (trade_ledger_inner, trade_stats) = TradeLedger::bootstrap(
+            trade_path.as_path(),
             config.max_symbols,
             window_space.clone(),
-        ));
+        )?;
+        let trade_ledger = Arc::new(trade_ledger_inner);
+        let enrichment_path = config.enrichment_ledger_path();
+        let (enrichment_ledger_inner, enrichment_stats) = EnrichmentLedger::bootstrap(
+            enrichment_path.as_path(),
+            config.max_symbols,
+            window_space.clone(),
+        )?;
+        let enrichment_ledger = Arc::new(enrichment_ledger_inner);
 
         for (symbol_id, _) in symbol_map.iter() {
-            trade_ledger
-                .ensure_symbol(symbol_id)
-                .expect("seed trade ledger");
-            enrichment_ledger
-                .ensure_symbol(symbol_id)
-                .expect("seed enrichment ledger");
+            if trade_stats.created {
+                trade_ledger
+                    .ensure_symbol(symbol_id)
+                    .expect("seed trade ledger");
+            } else {
+                trade_ledger
+                    .mark_symbol_loaded(symbol_id)
+                    .expect("mark trade ledger symbol");
+            }
+            if enrichment_stats.created {
+                enrichment_ledger
+                    .ensure_symbol(symbol_id)
+                    .expect("seed enrichment ledger");
+            } else {
+                enrichment_ledger
+                    .mark_symbol_loaded(symbol_id)
+                    .expect("mark enrichment ledger symbol");
+            }
         }
 
         let payload_stores = PayloadStores::load(config.state_dir())?;
 
-        Ok(Self {
-            config,
-            trade_ledger,
-            enrichment_ledger,
-            symbol_map: RwLock::new(symbol_map),
-            payload_stores: Mutex::new(payload_stores),
-            window_space,
-        })
+        let report = LedgerStorageReport::from_stats(trade_stats, enrichment_stats);
+
+        Ok((
+            Self {
+                config,
+                trade_ledger,
+                enrichment_ledger,
+                symbol_map: RwLock::new(symbol_map),
+                payload_stores: Mutex::new(payload_stores),
+                window_space,
+            },
+            report,
+        ))
     }
 
     pub fn trade_ledger(&self) -> Arc<TradeLedger> {
@@ -357,6 +384,42 @@ impl LedgerController {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct LedgerStorageReport {
+    pub trade: StorageSummary,
+    pub enrichment: StorageSummary,
+}
+
+impl LedgerStorageReport {
+    fn from_stats(trade: LedgerFileStats, enrichment: LedgerFileStats) -> Self {
+        Self {
+            trade: StorageSummary::from(trade),
+            enrichment: StorageSummary::from(enrichment),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StorageSummary {
+    pub path: PathBuf,
+    pub file_size: u64,
+    pub created_at_s: i64,
+    pub created: bool,
+    pub creation_duration: Option<Duration>,
+}
+
+impl From<LedgerFileStats> for StorageSummary {
+    fn from(value: LedgerFileStats) -> Self {
+        Self {
+            path: value.path,
+            file_size: value.file_size,
+            created_at_s: value.created_at_s,
+            created: value.created,
+            creation_duration: value.creation_duration,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SlotStatusCounts {
     pub empty: usize,
@@ -472,7 +535,7 @@ mod tests {
         let mut config = LedgerConfig::new(dir.path().to_path_buf(), window);
         config.max_symbols = 32;
 
-        let controller = LedgerController::bootstrap(config).unwrap();
+        let (controller, _) = LedgerController::bootstrap(config).unwrap();
 
         let meta = PayloadMeta::new(PayloadType::Trade, 1, 5, 123);
         controller

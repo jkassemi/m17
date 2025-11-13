@@ -2,11 +2,11 @@ use std::{env, path::PathBuf, str::FromStr};
 
 use core_types::config::DateRange;
 use ledger::{
+    WindowRangeConfig, WindowSpace,
     config::{DEFAULT_MAX_SYMBOLS, LedgerConfig},
-    window::WindowSpace,
 };
 use thiserror::Error;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::Duration;
 
 /// Deployment target for the binary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,7 +94,7 @@ fn ledger_config_for(env: Environment) -> LedgerConfig {
         Environment::Prod => PathBuf::from("/home/james/ledger.state"),
     };
 
-    let mut cfg = LedgerConfig::new(ledger_state_dir, session_windows());
+    let mut cfg = LedgerConfig::new(ledger_state_dir, session_windows(env));
     cfg.max_symbols = match env {
         Environment::Dev => DEFAULT_MAX_SYMBOLS,
         Environment::Prod => DEFAULT_MAX_SYMBOLS,
@@ -102,8 +102,22 @@ fn ledger_config_for(env: Environment) -> LedgerConfig {
     cfg
 }
 
-fn session_windows() -> WindowSpace {
-    WindowSpace::standard(parse_session_start("2025-01-02T14:30:00Z"))
+fn session_windows(env: Environment) -> WindowSpace {
+    let base = WindowRangeConfig::default();
+    match env {
+        Environment::Dev => {
+            let start = base.anchor_date - Duration::days(14);
+            let end = base.anchor_date + Duration::days(14);
+            WindowSpace::from_bounds(
+                start,
+                end,
+                base.session_open,
+                base.session_minutes,
+                base.schema_version,
+            )
+        }
+        Environment::Prod => WindowSpace::from_range(&base),
+    }
 }
 
 /// Operator-provided credentials pulled from the shell environment.
@@ -128,12 +142,6 @@ fn require_env(key: &str) -> Result<String, ConfigError> {
     env::var(key).map_err(|_| ConfigError::MissingEnv {
         key: key.to_string(),
     })
-}
-
-fn parse_session_start(input: &str) -> i64 {
-    OffsetDateTime::parse(input, &Rfc3339)
-        .unwrap_or_else(|err| panic!("invalid session start timestamp '{input}': {err}"))
-        .unix_timestamp()
 }
 
 #[derive(Debug, Error)]

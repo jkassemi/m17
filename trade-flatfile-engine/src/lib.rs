@@ -8,12 +8,11 @@ pub use config::FlatfileRuntimeConfig;
 pub use download_metrics::{DownloadMetrics, DownloadSnapshot};
 
 use std::{
-    collections::{HashMap, hash_map::Entry},
-    mem,
+    cmp::Ordering,
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, Ordering as AtomicOrdering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -188,9 +187,7 @@ impl OptionTradeInner {
         let buf = BufReader::new(reader);
         let mut csv_reader = AsyncReaderBuilder::new().trim(Trim::All).create_reader(buf);
         let mut records = csv_reader.records();
-        let mut buckets: HashMap<String, WindowBucket<OptionTradeRecord>> =
-            HashMap::with_capacity(self.config.batch_size.max(1024));
-        let mut current_window: Option<WindowIndex> = None;
+        let mut tracker = SymbolTracker::new();
         let mut processed_rows = 0usize;
         let mut last_progress = Instant::now();
         let interval = Duration::from_millis(self.config.progress_update_ms.max(10));
@@ -215,54 +212,28 @@ impl OptionTradeInner {
                         continue;
                     }
                 };
-                advance_window(
-                    &mut current_window,
+                tracker.with_bucket(
+                    &symbol,
                     window_idx,
-                    &mut buckets,
-                    |completed_idx, drained| {
-                        self.flush_option_trade_window(date, completed_idx, drained)
+                    |sym, idx| self.open_option_trade_window(date, sym, idx),
+                    |state| self.finalize_option_trade_state(date, state),
+                    |bucket_opt| {
+                        if let Some(bucket) = bucket_opt {
+                            if let Some(last_ts) = bucket.last_timestamp() {
+                                if ts < last_ts {
+                                    return Err(FlatfileError::TimestampRegression {
+                                        symbol: symbol.clone(),
+                                        window_idx,
+                                        last_ts,
+                                        ts,
+                                    });
+                                }
+                            }
+                            bucket.observe(trade);
+                        }
+                        Ok(())
                     },
                 )?;
-                let key = WindowKey {
-                    symbol: symbol.clone(),
-                    window_idx,
-                };
-                let bucket = match buckets.entry(symbol.clone()) {
-                    Entry::Occupied(entry) => entry.into_mut(),
-                    Entry::Vacant(entry) => {
-                        let status = ensure_slot_pending(
-                            &self.ledger,
-                            &key,
-                            SlotKind::Trade(TradeSlotKind::OptionTrade),
-                        )?;
-                        if status == SlotStatus::Filled {
-                            continue;
-                        }
-                        if status == SlotStatus::Pending {
-                            let relative_path = artifact_path(
-                                &self.config,
-                                "options/trades",
-                                date,
-                                &symbol,
-                                window_idx,
-                                "parquet",
-                            );
-                            cleanup_partial_artifacts(&self.config, &relative_path)?;
-                        }
-                        entry.insert(WindowBucket::new())
-                    }
-                };
-                if let Some(last_ts) = bucket.last_timestamp() {
-                    if ts < last_ts {
-                        return Err(FlatfileError::TimestampRegression {
-                            symbol: symbol.clone(),
-                            window_idx,
-                            last_ts,
-                            ts,
-                        });
-                    }
-                }
-                bucket.observe(trade);
                 processed_rows += 1;
                 if self.config.progress_logging && last_progress.elapsed() >= interval {
                     info!(
@@ -280,12 +251,7 @@ impl OptionTradeInner {
             );
             return Ok(());
         }
-        if let Some(active_idx) = current_window {
-            let drained = mem::take(&mut buckets);
-            if !drained.is_empty() {
-                self.flush_option_trade_window(date, active_idx, drained)?;
-            }
-        }
+        tracker.finish(|state| self.finalize_option_trade_state(date, state))?;
         Ok(())
     }
 
@@ -317,7 +283,7 @@ impl OptionTradeInner {
         let payload = TradeBatchPayload {
             schema_version: OPTION_TRADE_SCHEMA_VERSION,
             window_ts: window_start_ns(&self.ledger, key.window_idx)?,
-            batch_id: self.batch_seq.fetch_add(1, Ordering::Relaxed) + 1,
+            batch_id: self.batch_seq.fetch_add(1, AtomicOrdering::Relaxed) + 1,
             first_trade_ts: bucket.first_ts,
             last_trade_ts: bucket.last_ts,
             record_count: bucket.records.len() as u32,
@@ -343,17 +309,51 @@ impl OptionTradeInner {
         Ok(())
     }
 
-    fn flush_option_trade_window(
+    fn finalize_option_trade_state(
         &self,
         date: NaiveDate,
-        window_idx: WindowIndex,
-        buckets: HashMap<String, WindowBucket<OptionTradeRecord>>,
+        state: SymbolWindow<OptionTradeRecord>,
     ) -> Result<(), FlatfileError> {
-        for (symbol, bucket) in buckets {
-            let key = WindowKey { symbol, window_idx };
+        if let Some(bucket) = state.bucket {
+            let key = WindowKey {
+                symbol: state.symbol,
+                window_idx: state.window_idx,
+            };
             self.persist_option_trade_bucket(date, key, bucket)?;
         }
         Ok(())
+    }
+
+    fn open_option_trade_window(
+        &self,
+        date: NaiveDate,
+        symbol: &str,
+        window_idx: WindowIndex,
+    ) -> Result<SymbolWindow<OptionTradeRecord>, FlatfileError> {
+        let key = WindowKey {
+            symbol: symbol.to_string(),
+            window_idx,
+        };
+        let status = ensure_slot_pending(
+            &self.ledger,
+            &key,
+            SlotKind::Trade(TradeSlotKind::OptionTrade),
+        )?;
+        if status == SlotStatus::Filled {
+            return Ok(SymbolWindow::skipped(symbol, window_idx));
+        }
+        if status == SlotStatus::Pending {
+            let relative_path = artifact_path(
+                &self.config,
+                "options/trades",
+                date,
+                symbol,
+                window_idx,
+                "parquet",
+            );
+            cleanup_partial_artifacts(&self.config, &relative_path)?;
+        }
+        Ok(SymbolWindow::writable(symbol, window_idx))
     }
 
     fn window_idx_for_timestamp(&self, ts_ns: i64) -> Option<WindowIndex> {
@@ -435,9 +435,7 @@ impl OptionQuoteInner {
         let buf = BufReader::new(reader);
         let mut csv_reader = AsyncReaderBuilder::new().trim(Trim::All).create_reader(buf);
         let mut records = csv_reader.records();
-        let mut buckets: HashMap<String, WindowBucket<QuoteRecord>> =
-            HashMap::with_capacity(self.config.batch_size.max(1024));
-        let mut current_window: Option<WindowIndex> = None;
+        let mut tracker = SymbolTracker::new();
         let mut processed_rows = 0usize;
         let mut last_progress = Instant::now();
         let interval = Duration::from_millis(self.config.progress_update_ms.max(10));
@@ -459,54 +457,28 @@ impl OptionQuoteInner {
                     Some(idx) => idx,
                     None => continue,
                 };
-                advance_window(
-                    &mut current_window,
+                tracker.with_bucket(
+                    &symbol,
                     window_idx,
-                    &mut buckets,
-                    |completed_idx, drained| {
-                        self.flush_option_quote_window(date, completed_idx, drained)
+                    |sym, idx| self.open_option_quote_window(date, sym, idx),
+                    |state| self.finalize_option_quote_state(date, state),
+                    |bucket_opt| {
+                        if let Some(bucket) = bucket_opt {
+                            if let Some(last_ts) = bucket.last_timestamp() {
+                                if ts < last_ts {
+                                    return Err(FlatfileError::TimestampRegression {
+                                        symbol: symbol.clone(),
+                                        window_idx,
+                                        last_ts,
+                                        ts,
+                                    });
+                                }
+                            }
+                            bucket.observe(quote);
+                        }
+                        Ok(())
                     },
                 )?;
-                let key = WindowKey {
-                    symbol: symbol.clone(),
-                    window_idx,
-                };
-                let bucket = match buckets.entry(symbol.clone()) {
-                    Entry::Occupied(entry) => entry.into_mut(),
-                    Entry::Vacant(entry) => {
-                        let status = ensure_slot_pending(
-                            &self.ledger,
-                            &key,
-                            SlotKind::Trade(TradeSlotKind::OptionQuote),
-                        )?;
-                        if status == SlotStatus::Filled {
-                            continue;
-                        }
-                        if status == SlotStatus::Pending {
-                            let relative_path = artifact_path(
-                                &self.config,
-                                "options/quotes",
-                                date,
-                                &symbol,
-                                window_idx,
-                                "parquet",
-                            );
-                            cleanup_partial_artifacts(&self.config, &relative_path)?;
-                        }
-                        entry.insert(WindowBucket::new())
-                    }
-                };
-                if let Some(last_ts) = bucket.last_timestamp() {
-                    if ts < last_ts {
-                        return Err(FlatfileError::TimestampRegression {
-                            symbol: symbol.clone(),
-                            window_idx,
-                            last_ts,
-                            ts,
-                        });
-                    }
-                }
-                bucket.observe(quote);
                 processed_rows += 1;
                 if self.config.progress_logging && last_progress.elapsed() >= interval {
                     info!(
@@ -524,12 +496,7 @@ impl OptionQuoteInner {
             );
             return Ok(());
         }
-        if let Some(active_idx) = current_window {
-            let drained = mem::take(&mut buckets);
-            if !drained.is_empty() {
-                self.flush_option_quote_window(date, active_idx, drained)?;
-            }
-        }
+        tracker.finish(|state| self.finalize_option_quote_state(date, state))?;
         Ok(())
     }
 
@@ -561,7 +528,7 @@ impl OptionQuoteInner {
         let payload = QuoteBatchPayload {
             schema_version: QUOTE_SCHEMA_VERSION,
             window_ts: window_start_ns(&self.ledger, key.window_idx)?,
-            batch_id: self.batch_seq.fetch_add(1, Ordering::Relaxed) + 1,
+            batch_id: self.batch_seq.fetch_add(1, AtomicOrdering::Relaxed) + 1,
             first_quote_ts: bucket.first_ts,
             last_quote_ts: bucket.last_ts,
             nbbo_sample_count: bucket.records.len() as u32,
@@ -587,17 +554,51 @@ impl OptionQuoteInner {
         Ok(())
     }
 
-    fn flush_option_quote_window(
+    fn finalize_option_quote_state(
         &self,
         date: NaiveDate,
-        window_idx: WindowIndex,
-        buckets: HashMap<String, WindowBucket<QuoteRecord>>,
+        state: SymbolWindow<QuoteRecord>,
     ) -> Result<(), FlatfileError> {
-        for (symbol, bucket) in buckets {
-            let key = WindowKey { symbol, window_idx };
+        if let Some(bucket) = state.bucket {
+            let key = WindowKey {
+                symbol: state.symbol,
+                window_idx: state.window_idx,
+            };
             self.persist_option_quote_bucket(date, key, bucket)?;
         }
         Ok(())
+    }
+
+    fn open_option_quote_window(
+        &self,
+        date: NaiveDate,
+        symbol: &str,
+        window_idx: WindowIndex,
+    ) -> Result<SymbolWindow<QuoteRecord>, FlatfileError> {
+        let key = WindowKey {
+            symbol: symbol.to_string(),
+            window_idx,
+        };
+        let status = ensure_slot_pending(
+            &self.ledger,
+            &key,
+            SlotKind::Trade(TradeSlotKind::OptionQuote),
+        )?;
+        if status == SlotStatus::Filled {
+            return Ok(SymbolWindow::skipped(symbol, window_idx));
+        }
+        if status == SlotStatus::Pending {
+            let relative_path = artifact_path(
+                &self.config,
+                "options/quotes",
+                date,
+                symbol,
+                window_idx,
+                "parquet",
+            );
+            cleanup_partial_artifacts(&self.config, &relative_path)?;
+        }
+        Ok(SymbolWindow::writable(symbol, window_idx))
     }
 
     fn window_idx_for_timestamp(&self, ts_ns: i64) -> Option<WindowIndex> {
@@ -684,9 +685,7 @@ impl UnderlyingTradeInner {
         let buf = BufReader::new(reader);
         let mut csv_reader = AsyncReaderBuilder::new().trim(Trim::All).create_reader(buf);
         let mut records = csv_reader.records();
-        let mut buckets: HashMap<String, WindowBucket<UnderlyingTradeRecord>> =
-            HashMap::with_capacity(self.config.batch_size.max(1024));
-        let mut current_window: Option<WindowIndex> = None;
+        let mut tracker = SymbolTracker::new();
         let mut processed_rows = 0usize;
         let mut last_progress = Instant::now();
         let interval = Duration::from_millis(self.config.progress_update_ms.max(10));
@@ -708,54 +707,28 @@ impl UnderlyingTradeInner {
                     Some(idx) => idx,
                     None => continue,
                 };
-                advance_window(
-                    &mut current_window,
+                tracker.with_bucket(
+                    &symbol,
                     window_idx,
-                    &mut buckets,
-                    |completed_idx, drained| {
-                        self.flush_underlying_trade_window(date, completed_idx, drained)
+                    |sym, idx| self.open_underlying_trade_window(date, sym, idx),
+                    |state| self.finalize_underlying_trade_state(date, state),
+                    |bucket_opt| {
+                        if let Some(bucket) = bucket_opt {
+                            if let Some(last_ts) = bucket.last_timestamp() {
+                                if ts < last_ts {
+                                    return Err(FlatfileError::TimestampRegression {
+                                        symbol: symbol.clone(),
+                                        window_idx,
+                                        last_ts,
+                                        ts,
+                                    });
+                                }
+                            }
+                            bucket.observe(trade);
+                        }
+                        Ok(())
                     },
                 )?;
-                let key = WindowKey {
-                    symbol: symbol.clone(),
-                    window_idx,
-                };
-                let bucket = match buckets.entry(symbol.clone()) {
-                    Entry::Occupied(entry) => entry.into_mut(),
-                    Entry::Vacant(entry) => {
-                        let status = ensure_slot_pending(
-                            &self.ledger,
-                            &key,
-                            SlotKind::Trade(TradeSlotKind::UnderlyingTrade),
-                        )?;
-                        if status == SlotStatus::Filled {
-                            continue;
-                        }
-                        if status == SlotStatus::Pending {
-                            let relative_path = artifact_path(
-                                &self.config,
-                                "underlying/trades",
-                                date,
-                                &symbol,
-                                window_idx,
-                                "parquet",
-                            );
-                            cleanup_partial_artifacts(&self.config, &relative_path)?;
-                        }
-                        entry.insert(WindowBucket::new())
-                    }
-                };
-                if let Some(last_ts) = bucket.last_timestamp() {
-                    if ts < last_ts {
-                        return Err(FlatfileError::TimestampRegression {
-                            symbol: symbol.clone(),
-                            window_idx,
-                            last_ts,
-                            ts,
-                        });
-                    }
-                }
-                bucket.observe(trade);
                 processed_rows += 1;
                 if self.config.progress_logging && last_progress.elapsed() >= interval {
                     info!(
@@ -773,12 +746,7 @@ impl UnderlyingTradeInner {
             );
             return Ok(());
         }
-        if let Some(active_idx) = current_window {
-            let drained = mem::take(&mut buckets);
-            if !drained.is_empty() {
-                self.flush_underlying_trade_window(date, active_idx, drained)?;
-            }
-        }
+        tracker.finish(|state| self.finalize_underlying_trade_state(date, state))?;
         Ok(())
     }
 
@@ -810,7 +778,7 @@ impl UnderlyingTradeInner {
         let payload = TradeBatchPayload {
             schema_version: UNDERLYING_TRADE_SCHEMA_VERSION,
             window_ts: window_start_ns(&self.ledger, key.window_idx)?,
-            batch_id: self.batch_seq.fetch_add(1, Ordering::Relaxed) + 1,
+            batch_id: self.batch_seq.fetch_add(1, AtomicOrdering::Relaxed) + 1,
             first_trade_ts: bucket.first_ts,
             last_trade_ts: bucket.last_ts,
             record_count: bucket.records.len() as u32,
@@ -836,17 +804,51 @@ impl UnderlyingTradeInner {
         Ok(())
     }
 
-    fn flush_underlying_trade_window(
+    fn finalize_underlying_trade_state(
         &self,
         date: NaiveDate,
-        window_idx: WindowIndex,
-        buckets: HashMap<String, WindowBucket<UnderlyingTradeRecord>>,
+        state: SymbolWindow<UnderlyingTradeRecord>,
     ) -> Result<(), FlatfileError> {
-        for (symbol, bucket) in buckets {
-            let key = WindowKey { symbol, window_idx };
+        if let Some(bucket) = state.bucket {
+            let key = WindowKey {
+                symbol: state.symbol,
+                window_idx: state.window_idx,
+            };
             self.persist_underlying_trade_bucket(date, key, bucket)?;
         }
         Ok(())
+    }
+
+    fn open_underlying_trade_window(
+        &self,
+        date: NaiveDate,
+        symbol: &str,
+        window_idx: WindowIndex,
+    ) -> Result<SymbolWindow<UnderlyingTradeRecord>, FlatfileError> {
+        let key = WindowKey {
+            symbol: symbol.to_string(),
+            window_idx,
+        };
+        let status = ensure_slot_pending(
+            &self.ledger,
+            &key,
+            SlotKind::Trade(TradeSlotKind::UnderlyingTrade),
+        )?;
+        if status == SlotStatus::Filled {
+            return Ok(SymbolWindow::skipped(symbol, window_idx));
+        }
+        if status == SlotStatus::Pending {
+            let relative_path = artifact_path(
+                &self.config,
+                "underlying/trades",
+                date,
+                symbol,
+                window_idx,
+                "parquet",
+            );
+            cleanup_partial_artifacts(&self.config, &relative_path)?;
+        }
+        Ok(SymbolWindow::writable(symbol, window_idx))
     }
 
     fn window_idx_for_timestamp(&self, ts_ns: i64) -> Option<WindowIndex> {
@@ -933,9 +935,7 @@ impl UnderlyingQuoteInner {
         let buf = BufReader::new(reader);
         let mut csv_reader = AsyncReaderBuilder::new().trim(Trim::All).create_reader(buf);
         let mut records = csv_reader.records();
-        let mut buckets: HashMap<String, WindowBucket<QuoteRecord>> =
-            HashMap::with_capacity(self.config.batch_size.max(1024));
-        let mut current_window: Option<WindowIndex> = None;
+        let mut tracker = SymbolTracker::new();
         let mut processed_rows = 0usize;
         let mut last_progress = Instant::now();
         let interval = Duration::from_millis(self.config.progress_update_ms.max(10));
@@ -957,54 +957,28 @@ impl UnderlyingQuoteInner {
                     Some(idx) => idx,
                     None => continue,
                 };
-                advance_window(
-                    &mut current_window,
+                tracker.with_bucket(
+                    &symbol,
                     window_idx,
-                    &mut buckets,
-                    |completed_idx, drained| {
-                        self.flush_underlying_quote_window(date, completed_idx, drained)
+                    |sym, idx| self.open_underlying_quote_window(date, sym, idx),
+                    |state| self.finalize_underlying_quote_state(date, state),
+                    |bucket_opt| {
+                        if let Some(bucket) = bucket_opt {
+                            if let Some(last_ts) = bucket.last_timestamp() {
+                                if ts < last_ts {
+                                    return Err(FlatfileError::TimestampRegression {
+                                        symbol: symbol.clone(),
+                                        window_idx,
+                                        last_ts,
+                                        ts,
+                                    });
+                                }
+                            }
+                            bucket.observe(quote);
+                        }
+                        Ok(())
                     },
                 )?;
-                let key = WindowKey {
-                    symbol: symbol.clone(),
-                    window_idx,
-                };
-                let bucket = match buckets.entry(symbol.clone()) {
-                    Entry::Occupied(entry) => entry.into_mut(),
-                    Entry::Vacant(entry) => {
-                        let status = ensure_slot_pending(
-                            &self.ledger,
-                            &key,
-                            SlotKind::Trade(TradeSlotKind::UnderlyingQuote),
-                        )?;
-                        if status == SlotStatus::Filled {
-                            continue;
-                        }
-                        if status == SlotStatus::Pending {
-                            let relative_path = artifact_path(
-                                &self.config,
-                                "underlying/quotes",
-                                date,
-                                &symbol,
-                                window_idx,
-                                "parquet",
-                            );
-                            cleanup_partial_artifacts(&self.config, &relative_path)?;
-                        }
-                        entry.insert(WindowBucket::new())
-                    }
-                };
-                if let Some(last_ts) = bucket.last_timestamp() {
-                    if ts < last_ts {
-                        return Err(FlatfileError::TimestampRegression {
-                            symbol: symbol.clone(),
-                            window_idx,
-                            last_ts,
-                            ts,
-                        });
-                    }
-                }
-                bucket.observe(quote);
                 processed_rows += 1;
                 if self.config.progress_logging && last_progress.elapsed() >= interval {
                     info!(
@@ -1022,12 +996,7 @@ impl UnderlyingQuoteInner {
             );
             return Ok(());
         }
-        if let Some(active_idx) = current_window {
-            let drained = mem::take(&mut buckets);
-            if !drained.is_empty() {
-                self.flush_underlying_quote_window(date, active_idx, drained)?;
-            }
-        }
+        tracker.finish(|state| self.finalize_underlying_quote_state(date, state))?;
         Ok(())
     }
 
@@ -1059,7 +1028,7 @@ impl UnderlyingQuoteInner {
         let payload = QuoteBatchPayload {
             schema_version: QUOTE_SCHEMA_VERSION,
             window_ts: window_start_ns(&self.ledger, key.window_idx)?,
-            batch_id: self.batch_seq.fetch_add(1, Ordering::Relaxed) + 1,
+            batch_id: self.batch_seq.fetch_add(1, AtomicOrdering::Relaxed) + 1,
             first_quote_ts: bucket.first_ts,
             last_quote_ts: bucket.last_ts,
             nbbo_sample_count: bucket.records.len() as u32,
@@ -1085,17 +1054,51 @@ impl UnderlyingQuoteInner {
         Ok(())
     }
 
-    fn flush_underlying_quote_window(
+    fn finalize_underlying_quote_state(
         &self,
         date: NaiveDate,
-        window_idx: WindowIndex,
-        buckets: HashMap<String, WindowBucket<QuoteRecord>>,
+        state: SymbolWindow<QuoteRecord>,
     ) -> Result<(), FlatfileError> {
-        for (symbol, bucket) in buckets {
-            let key = WindowKey { symbol, window_idx };
+        if let Some(bucket) = state.bucket {
+            let key = WindowKey {
+                symbol: state.symbol,
+                window_idx: state.window_idx,
+            };
             self.persist_underlying_quote_bucket(date, key, bucket)?;
         }
         Ok(())
+    }
+
+    fn open_underlying_quote_window(
+        &self,
+        date: NaiveDate,
+        symbol: &str,
+        window_idx: WindowIndex,
+    ) -> Result<SymbolWindow<QuoteRecord>, FlatfileError> {
+        let key = WindowKey {
+            symbol: symbol.to_string(),
+            window_idx,
+        };
+        let status = ensure_slot_pending(
+            &self.ledger,
+            &key,
+            SlotKind::Trade(TradeSlotKind::UnderlyingQuote),
+        )?;
+        if status == SlotStatus::Filled {
+            return Ok(SymbolWindow::skipped(symbol, window_idx));
+        }
+        if status == SlotStatus::Pending {
+            let relative_path = artifact_path(
+                &self.config,
+                "underlying/quotes",
+                date,
+                symbol,
+                window_idx,
+                "parquet",
+            );
+            cleanup_partial_artifacts(&self.config, &relative_path)?;
+        }
+        Ok(SymbolWindow::writable(symbol, window_idx))
     }
 
     fn window_idx_for_timestamp(&self, ts_ns: i64) -> Option<WindowIndex> {
@@ -1874,6 +1877,103 @@ struct WindowKey {
     window_idx: WindowIndex,
 }
 
+struct SymbolWindow<T> {
+    symbol: String,
+    window_idx: WindowIndex,
+    bucket: Option<WindowBucket<T>>,
+}
+
+impl<T> SymbolWindow<T> {
+    fn writable(symbol: &str, window_idx: WindowIndex) -> Self {
+        Self {
+            symbol: symbol.to_string(),
+            window_idx,
+            bucket: Some(WindowBucket::new()),
+        }
+    }
+
+    fn skipped(symbol: &str, window_idx: WindowIndex) -> Self {
+        Self {
+            symbol: symbol.to_string(),
+            window_idx,
+            bucket: None,
+        }
+    }
+}
+
+struct SymbolTracker<T> {
+    active: Option<SymbolWindow<T>>,
+}
+
+impl<T> SymbolTracker<T> {
+    fn new() -> Self {
+        Self { active: None }
+    }
+
+    fn with_bucket<Init, Flush, F, R>(
+        &mut self,
+        symbol: &str,
+        window_idx: WindowIndex,
+        mut init: Init,
+        mut flush: Flush,
+        f: F,
+    ) -> Result<R, FlatfileError>
+    where
+        Init: FnMut(&str, WindowIndex) -> Result<SymbolWindow<T>, FlatfileError>,
+        Flush: FnMut(SymbolWindow<T>) -> Result<(), FlatfileError>,
+        F: FnOnce(Option<&mut WindowBucket<T>>) -> Result<R, FlatfileError>,
+    {
+        loop {
+            if self.active.is_none() {
+                let new_state = init(symbol, window_idx)?;
+                self.active = Some(new_state);
+                continue;
+            }
+
+            let should_replace = {
+                let active = self
+                    .active
+                    .as_mut()
+                    .expect("active state set before reach replace logic");
+                if active.symbol == symbol {
+                    match window_idx.cmp(&active.window_idx) {
+                        Ordering::Equal => {
+                            let bucket = active.bucket.as_mut();
+                            return f(bucket);
+                        }
+                        Ordering::Less => {
+                            return Err(FlatfileError::OutOfOrderWindow {
+                                current: active.window_idx,
+                                encountered: window_idx,
+                            });
+                        }
+                        Ordering::Greater => true,
+                    }
+                } else {
+                    true
+                }
+            };
+
+            if should_replace {
+                if let Some(old) = self.active.take() {
+                    flush(old)?;
+                }
+                continue;
+            }
+        }
+    }
+
+    fn finish<Flush>(&mut self, mut flush: Flush) -> Result<(), FlatfileError>
+    where
+        Flush: FnMut(SymbolWindow<T>) -> Result<(), FlatfileError>,
+    {
+        if let Some(state) = self.active.take() {
+            flush(state)?;
+        }
+        Ok(())
+    }
+}
+
 fn window_start_ns(
     ledger: &WindowSpaceController,
     window_idx: WindowIndex,
@@ -1882,36 +1982,6 @@ fn window_start_ns(
         .window_meta(window_idx)
         .map(|meta| meta.start_ts)
         .ok_or(FlatfileError::MissingWindowMeta { window_idx })
-}
-
-fn advance_window<T, F>(
-    current_window: &mut Option<WindowIndex>,
-    next_idx: WindowIndex,
-    buckets: &mut HashMap<String, WindowBucket<T>>,
-    mut finalize: F,
-) -> Result<(), FlatfileError>
-where
-    F: FnMut(WindowIndex, HashMap<String, WindowBucket<T>>) -> Result<(), FlatfileError>,
-{
-    match current_window {
-        Some(current) if next_idx == *current => Ok(()),
-        Some(current) if next_idx > *current => {
-            let drained = mem::take(buckets);
-            if !drained.is_empty() {
-                finalize(*current, drained)?;
-            }
-            *current = next_idx;
-            Ok(())
-        }
-        Some(current) => Err(FlatfileError::OutOfOrderWindow {
-            current: *current,
-            encountered: next_idx,
-        }),
-        None => {
-            *current_window = Some(next_idx);
-            Ok(())
-        }
-    }
 }
 
 fn trade_slot_status(row: &TradeWindowRow, kind: TradeSlotKind) -> SlotStatus {

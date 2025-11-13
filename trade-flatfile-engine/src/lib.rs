@@ -9,6 +9,7 @@ pub use download_metrics::{DownloadMetrics, DownloadSnapshot};
 
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     pin::Pin,
     sync::{
         Arc,
@@ -57,12 +58,14 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use trading_calendar::{Market, TradingCalendar};
 use window_bucket::{HasTimestamp, WindowBucket};
+use window_space::error::WindowSpaceError;
 use window_space::ledger::{EnrichmentWindowRow, TradeWindowRow};
 use window_space::payload::EnrichmentSlotKind;
 use window_space::{
     WindowIndex, WindowSpaceController,
     mapping::{QuoteBatchPayload, TradeBatchPayload},
     payload::{PayloadMeta, PayloadType, SlotKind, SlotStatus, TradeSlotKind},
+    window::WindowSpace,
 };
 
 const OPTION_TRADE_SCHEMA_VERSION: u8 = 1;
@@ -92,6 +95,7 @@ struct OptionTradeInner {
     state: Mutex<EngineRuntimeState>,
     batch_seq: AtomicU32,
     calendar: TradingCalendar,
+    day_index: Arc<DayWindowIndex>,
 }
 
 struct OptionQuoteInner {
@@ -101,6 +105,7 @@ struct OptionQuoteInner {
     state: Mutex<EngineRuntimeState>,
     batch_seq: AtomicU32,
     calendar: TradingCalendar,
+    day_index: Arc<DayWindowIndex>,
 }
 
 struct UnderlyingTradeInner {
@@ -110,6 +115,7 @@ struct UnderlyingTradeInner {
     state: Mutex<EngineRuntimeState>,
     batch_seq: AtomicU32,
     calendar: TradingCalendar,
+    day_index: Arc<DayWindowIndex>,
 }
 
 struct UnderlyingQuoteInner {
@@ -119,10 +125,13 @@ struct UnderlyingQuoteInner {
     state: Mutex<EngineRuntimeState>,
     batch_seq: AtomicU32,
     calendar: TradingCalendar,
+    day_index: Arc<DayWindowIndex>,
 }
 
 impl OptionTradeInner {
     fn new(config: FlatfileRuntimeConfig, ledger: Arc<WindowSpaceController>) -> Self {
+        let window_space = ledger.window_space();
+        let day_index = Arc::new(DayWindowIndex::new(window_space.as_ref()));
         Self {
             client: make_s3_client(&config),
             ledger,
@@ -130,6 +139,7 @@ impl OptionTradeInner {
             batch_seq: AtomicU32::new(0),
             calendar: TradingCalendar::new(Market::NYSE).expect("init calendar"),
             config,
+            day_index,
         }
     }
 
@@ -140,6 +150,18 @@ impl OptionTradeInner {
         for date in dates {
             if cancel.is_cancelled() {
                 break;
+            }
+            if !day_requires_ingest(
+                self.ledger.as_ref(),
+                self.day_index.as_ref(),
+                date,
+                TradeSlotKind::OptionTrade,
+            ) {
+                info!(
+                    "[{}] skipping option trade day {} (already ingested)",
+                    self.config.label, date
+                );
+                continue;
             }
             if let Err(err) = self.process_options_day(date, cancel.clone()).await {
                 error!("option trade day {} failed: {err}", date);
@@ -204,6 +226,9 @@ impl OptionTradeInner {
                 continue;
             }
             if let Some((symbol, trade)) = parse_option_trade_row(&record) {
+                if !self.config.allows_underlying(&trade.underlying) {
+                    continue;
+                }
                 let ts = trade.timestamp_ns();
                 let window_idx = match self.window_idx_for_timestamp(ts) {
                     Some(idx) => idx,
@@ -374,6 +399,8 @@ impl OptionTradeInner {
 
 impl OptionQuoteInner {
     fn new(config: FlatfileRuntimeConfig, ledger: Arc<WindowSpaceController>) -> Self {
+        let window_space = ledger.window_space();
+        let day_index = Arc::new(DayWindowIndex::new(window_space.as_ref()));
         Self {
             client: make_s3_client(&config),
             ledger,
@@ -381,6 +408,7 @@ impl OptionQuoteInner {
             batch_seq: AtomicU32::new(0),
             calendar: TradingCalendar::new(Market::NYSE).expect("init calendar"),
             config,
+            day_index,
         }
     }
 
@@ -391,6 +419,18 @@ impl OptionQuoteInner {
         for date in dates {
             if cancel.is_cancelled() {
                 break;
+            }
+            if !day_requires_ingest(
+                self.ledger.as_ref(),
+                self.day_index.as_ref(),
+                date,
+                TradeSlotKind::OptionQuote,
+            ) {
+                info!(
+                    "[{}] skipping option quote day {} (already ingested)",
+                    self.config.label, date
+                );
+                continue;
             }
             if let Err(err) = self.process_option_quotes_day(date, cancel.clone()).await {
                 error!("option quote day {} failed: {err}", date);
@@ -454,7 +494,13 @@ impl OptionQuoteInner {
             if record.len() < 12 {
                 continue;
             }
-            if let Some((symbol, quote)) = parse_quote_row(&record, QuoteSource::Option) {
+            if let Some((symbol, quote, underlying)) = parse_quote_row(&record, QuoteSource::Option)
+            {
+                if let Some(base) = underlying.as_deref() {
+                    if !self.config.allows_underlying(base) {
+                        continue;
+                    }
+                }
                 let ts = quote.timestamp_ns();
                 let window_idx = match self.window_idx_for_timestamp(ts) {
                     Some(idx) => idx,
@@ -622,6 +668,8 @@ impl OptionQuoteInner {
 
 impl UnderlyingTradeInner {
     fn new(config: FlatfileRuntimeConfig, ledger: Arc<WindowSpaceController>) -> Self {
+        let window_space = ledger.window_space();
+        let day_index = Arc::new(DayWindowIndex::new(window_space.as_ref()));
         Self {
             client: make_s3_client(&config),
             ledger,
@@ -629,6 +677,7 @@ impl UnderlyingTradeInner {
             batch_seq: AtomicU32::new(0),
             calendar: TradingCalendar::new(Market::NYSE).expect("init calendar"),
             config,
+            day_index,
         }
     }
 
@@ -639,6 +688,18 @@ impl UnderlyingTradeInner {
         for date in dates {
             if cancel.is_cancelled() {
                 break;
+            }
+            if !day_requires_ingest(
+                self.ledger.as_ref(),
+                self.day_index.as_ref(),
+                date,
+                TradeSlotKind::UnderlyingTrade,
+            ) {
+                info!(
+                    "[{}] skipping underlying trade day {} (already ingested)",
+                    self.config.label, date
+                );
+                continue;
             }
             if let Err(err) = self.process_equity_trades_day(date, cancel.clone()).await {
                 error!("underlying trades day {} failed: {err}", date);
@@ -875,6 +936,8 @@ impl UnderlyingTradeInner {
 
 impl UnderlyingQuoteInner {
     fn new(config: FlatfileRuntimeConfig, ledger: Arc<WindowSpaceController>) -> Self {
+        let window_space = ledger.window_space();
+        let day_index = Arc::new(DayWindowIndex::new(window_space.as_ref()));
         Self {
             client: make_s3_client(&config),
             ledger,
@@ -882,6 +945,7 @@ impl UnderlyingQuoteInner {
             batch_seq: AtomicU32::new(0),
             calendar: TradingCalendar::new(Market::NYSE).expect("init calendar"),
             config,
+            day_index,
         }
     }
 
@@ -892,6 +956,18 @@ impl UnderlyingQuoteInner {
         for date in dates {
             if cancel.is_cancelled() {
                 break;
+            }
+            if !day_requires_ingest(
+                self.ledger.as_ref(),
+                self.day_index.as_ref(),
+                date,
+                TradeSlotKind::UnderlyingQuote,
+            ) {
+                info!(
+                    "[{}] skipping underlying quote day {} (already ingested)",
+                    self.config.label, date
+                );
+                continue;
             }
             if let Err(err) = self.process_equity_quotes_day(date, cancel.clone()).await {
                 error!("underlying quotes day {} failed: {err}", date);
@@ -960,7 +1036,7 @@ impl UnderlyingQuoteInner {
             if record.len() < 12 {
                 continue;
             }
-            if let Some((symbol, quote)) = parse_quote_row(&record, QuoteSource::Underlying) {
+            if let Some((symbol, quote, _)) = parse_quote_row(&record, QuoteSource::Underlying) {
                 let ts = quote.timestamp_ns();
                 let window_idx = match self.window_idx_for_timestamp(ts) {
                     Some(idx) => idx,
@@ -1358,8 +1434,8 @@ enum QuoteSource {
 
 fn parse_quote_row(
     record: &csv_async::StringRecord,
-    _source: QuoteSource,
-) -> Option<(String, QuoteRecord)> {
+    source: QuoteSource,
+) -> Option<(String, QuoteRecord, Option<String>)> {
     let instrument_id = record.get(0)?.to_string();
     let ask_exchange = record.get(1)?.parse().unwrap_or(0);
     let ask_price = record.get(2)?.parse().unwrap_or(0.0);
@@ -1419,7 +1495,14 @@ fn parse_quote_row(
         quality: Quality::Prelim,
         watermark_ts_ns: quote_ts_ns,
     };
-    Some((instrument_id, quote))
+    let underlying = match source {
+        QuoteSource::Option => {
+            let (_, _, _, base) = parse_opra_contract(&instrument_id, Some(quote_ts_ns));
+            if base.is_empty() { None } else { Some(base) }
+        }
+        QuoteSource::Underlying => None,
+    };
+    Some((instrument_id, quote, underlying))
 }
 
 fn parse_conditions_field(field: &str) -> Vec<i32> {
@@ -1838,7 +1921,10 @@ mod tests {
         let mut rows = Vec::new();
         while let Some(record) = records.next().await {
             let record = record.expect("record");
-            if let Some((_symbol, quote)) = parse_quote_row(&record, QuoteSource::Option) {
+            if let Some((_symbol, quote, underlying)) =
+                parse_quote_row(&record, QuoteSource::Option)
+            {
+                assert!(underlying.is_some());
                 rows.push(quote);
             }
         }
@@ -1860,7 +1946,7 @@ mod tests {
         let mut rows = Vec::new();
         while let Some(record) = records.next().await {
             let record = record.expect("record");
-            if let Some((_symbol, quote)) = parse_quote_row(&record, QuoteSource::Underlying) {
+            if let Some((_symbol, quote, _)) = parse_quote_row(&record, QuoteSource::Underlying) {
                 rows.push(quote);
             }
         }
@@ -1984,6 +2070,102 @@ impl<T> SymbolTracker<T> {
         }
         Ok(())
     }
+}
+
+struct DayWindowIndex {
+    ranges: HashMap<NaiveDate, (WindowIndex, WindowIndex)>,
+}
+
+impl DayWindowIndex {
+    fn new(window_space: &WindowSpace) -> Self {
+        let mut ranges = HashMap::new();
+        for meta in window_space.iter() {
+            if let Some(dt) = DateTime::<Utc>::from_timestamp(meta.start_ts, 0) {
+                let date = dt.date_naive();
+                ranges
+                    .entry(date)
+                    .and_modify(|range: &mut (WindowIndex, WindowIndex)| {
+                        range.0 = range.0.min(meta.window_idx);
+                        range.1 = range.1.max(meta.window_idx);
+                    })
+                    .or_insert((meta.window_idx, meta.window_idx));
+            }
+        }
+        Self { ranges }
+    }
+
+    fn range_for(&self, date: &NaiveDate) -> Option<(WindowIndex, WindowIndex)> {
+        self.ranges.get(date).copied()
+    }
+}
+
+fn day_requires_ingest(
+    ledger: &WindowSpaceController,
+    day_index: &DayWindowIndex,
+    date: NaiveDate,
+    slot: TradeSlotKind,
+) -> bool {
+    let Some((start_idx, end_idx)) = day_index.range_for(&date) else {
+        return true;
+    };
+    match slot_needs_ingest(ledger, slot, start_idx, end_idx) {
+        Ok(needs) => needs,
+        Err(err) => {
+            warn!(
+                "failed to evaluate coverage for {}: {}; scheduling ingestion",
+                date, err
+            );
+            true
+        }
+    }
+}
+
+fn slot_needs_ingest(
+    ledger: &WindowSpaceController,
+    slot: TradeSlotKind,
+    start_idx: WindowIndex,
+    end_idx: WindowIndex,
+) -> Result<bool, WindowSpaceError> {
+    let symbol_ids = ledger.trade_symbol_ids();
+    if symbol_ids.is_empty() {
+        return Ok(true);
+    }
+    let trade_space = ledger.trade_window_space();
+    for symbol_id in symbol_ids {
+        let missing = trade_space
+            .with_symbol_rows(symbol_id, |rows| {
+                has_incomplete_slot(rows, slot, start_idx, end_idx)
+            })
+            .map_err(WindowSpaceError::from)?;
+        if missing {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn has_incomplete_slot(
+    rows: &[TradeWindowRow],
+    slot: TradeSlotKind,
+    start_idx: WindowIndex,
+    end_idx: WindowIndex,
+) -> bool {
+    if rows.is_empty() {
+        return true;
+    }
+    let start = start_idx.min(end_idx) as usize;
+    let end = end_idx.max(start_idx) as usize;
+    if start >= rows.len() {
+        return true;
+    }
+    let upper = end.min(rows.len() - 1);
+    for idx in start..=upper {
+        let status = trade_slot_status(&rows[idx], slot);
+        if matches!(status, SlotStatus::Empty | SlotStatus::Pending) {
+            return true;
+        }
+    }
+    false
 }
 
 fn window_start_ns(

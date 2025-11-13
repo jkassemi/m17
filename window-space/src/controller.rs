@@ -103,6 +103,15 @@ impl WindowSpaceController {
         Arc::clone(&self.enrichment_window_space)
     }
 
+    pub fn window_space(&self) -> Arc<WindowSpace> {
+        Arc::clone(&self.window_space)
+    }
+
+    pub fn trade_symbol_ids(&self) -> Vec<SymbolId> {
+        let map = self.symbol_map.read();
+        map.iter().map(|(id, _)| id).collect()
+    }
+
     #[deprecated(
         since = "0.1.0",
         note = "trade_ledger() has been renamed to trade_window_space(); update call sites to window_space::WindowSpaceController::trade_window_space"

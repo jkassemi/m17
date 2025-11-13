@@ -37,4 +37,12 @@ impl FlatfileRuntimeConfig {
             true
         }
     }
+
+    pub fn allows_underlying(&self, underlying: &str) -> bool {
+        if let Some(filter) = &self.symbol_universe {
+            filter.contains(underlying)
+        } else {
+            true
+        }
+    }
 }

@@ -1,10 +1,4 @@
-use std::{
-    collections::HashSet,
-    env, net::SocketAddr,
-    path::PathBuf,
-    str::FromStr,
-    sync::Arc,
-};
+use std::{collections::HashSet, env, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
 use core_types::config::DateRange;
 use thiserror::Error;

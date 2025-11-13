@@ -1,5 +1,5 @@
 // Copyright (c) James Kassemi, SC, US. All rights reserved.
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveTime, Utc};
 use config::{Config, ConfigError};
 use serde::{Deserialize, Serialize};
 
@@ -268,7 +268,7 @@ fn default_hysteresis() -> f64 {
     0.05
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlatfileConfig {
     #[serde(default)]
     pub date_ranges: Vec<DateRange>,
@@ -278,6 +278,26 @@ pub struct FlatfileConfig {
     pub massive_flatfiles_endpoint: String,
     pub massive_flatfiles_region: String,
     pub massive_flatfiles_bucket: String,
+    #[serde(default = "default_flatfile_next_day_ready_time")]
+    pub next_day_ready_time: NaiveTime,
+    #[serde(default = "default_flatfile_non_trading_ready_time")]
+    pub non_trading_ready_time: NaiveTime,
+}
+
+impl Default for FlatfileConfig {
+    fn default() -> Self {
+        Self {
+            date_ranges: Vec::new(),
+            massive_key: String::new(),
+            massive_access_key_id: String::new(),
+            massive_secret_access_key: String::new(),
+            massive_flatfiles_endpoint: String::new(),
+            massive_flatfiles_region: String::new(),
+            massive_flatfiles_bucket: String::new(),
+            next_day_ready_time: default_flatfile_next_day_ready_time(),
+            non_trading_ready_time: default_flatfile_non_trading_ready_time(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +322,14 @@ impl DateRange {
             Ok(None)
         }
     }
+}
+
+fn default_flatfile_next_day_ready_time() -> NaiveTime {
+    NaiveTime::from_hms_opt(11, 0, 0).expect("valid next-day ready time")
+}
+
+fn default_flatfile_non_trading_ready_time() -> NaiveTime {
+    NaiveTime::from_hms_opt(12, 0, 0).expect("valid non-trading ready time")
 }
 
 impl AppConfig {

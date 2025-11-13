@@ -16,9 +16,9 @@ use prometheus::{Encoder, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
 use tokio::{net::TcpListener, sync::oneshot};
 use trade_flatfile_engine::{DownloadMetrics, DownloadSnapshot};
 use window_space::{
+    WindowSpaceController,
     payload::SlotKind,
     slot_metrics::{SlotCountsSnapshot, SlotMetrics, SlotMetricsSnapshot},
-    WindowSpaceController,
 };
 
 pub struct MetricsServer {
@@ -126,13 +126,8 @@ async fn serve_connection(
         let download_metrics = Arc::clone(&download_metrics);
         let controller = Arc::clone(&controller);
         async move {
-            let response = handle_request(
-                req,
-                exporter,
-                slot_metrics,
-                download_metrics,
-                controller,
-            );
+            let response =
+                handle_request(req, exporter, slot_metrics, download_metrics, controller);
             Ok::<_, hyper::Error>(response)
         }
     });

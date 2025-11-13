@@ -17,4 +17,16 @@ pub enum FlatfileError {
     Parquet(#[from] parquet::errors::ParquetError),
     #[error("window metadata missing for window_idx {window_idx}")]
     MissingWindowMeta { window_idx: WindowIndex },
+    #[error("out-of-order window: encountered {encountered} after closing {current}")]
+    OutOfOrderWindow {
+        current: WindowIndex,
+        encountered: WindowIndex,
+    },
+    #[error("timestamp regression for {symbol} in window {window_idx}: {ts} < {last_ts}")]
+    TimestampRegression {
+        symbol: String,
+        window_idx: WindowIndex,
+        last_ts: i64,
+        ts: i64,
+    },
 }

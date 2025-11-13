@@ -1,4 +1,8 @@
-use std::{fs::File, io::Read, path::Path};
+use std::{
+    fs::{self, File},
+    io::Read,
+    path::Path,
+};
 
 use arrow::record_batch::RecordBatch;
 use chrono::Datelike;
@@ -17,15 +21,27 @@ pub fn write_record_batch(
     relative_path: &str,
     batch: &RecordBatch,
 ) -> Result<ArtifactInfo, FlatfileError> {
-    let path = cfg.state_dir.join(relative_path);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let final_path = cfg.state_dir.join(relative_path);
+    if let Some(parent) = final_path.parent() {
+        fs::create_dir_all(parent)?;
     }
-    let file = File::create(&path)?;
+    let tmp_relative = format!("{relative_path}.tmp");
+    let tmp_path = cfg.state_dir.join(&tmp_relative);
+    if let Some(parent) = tmp_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if tmp_path.exists() {
+        fs::remove_file(&tmp_path)?;
+    }
+    let file = File::create(&tmp_path)?;
     let mut writer = ArrowWriter::try_new(file, batch.schema(), None)?;
     writer.write(batch)?;
     writer.close()?;
-    let checksum = compute_checksum(&path)?;
+    if final_path.exists() {
+        fs::remove_file(&final_path)?;
+    }
+    fs::rename(&tmp_path, &final_path)?;
+    let checksum = compute_checksum(&final_path)?;
     Ok(ArtifactInfo {
         relative_path: relative_path.to_string(),
         checksum,
@@ -73,4 +89,19 @@ pub fn artifact_path(
         safe_symbol,
         ext
     )
+}
+
+pub fn cleanup_partial_artifacts(
+    cfg: &FlatfileRuntimeConfig,
+    relative_path: &str,
+) -> Result<(), FlatfileError> {
+    let final_path = cfg.state_dir.join(relative_path);
+    if final_path.exists() {
+        fs::remove_file(&final_path)?;
+    }
+    let tmp_path = cfg.state_dir.join(format!("{relative_path}.tmp"));
+    if tmp_path.exists() {
+        fs::remove_file(tmp_path)?;
+    }
+    Ok(())
 }

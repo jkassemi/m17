@@ -18,6 +18,14 @@ impl<T> WindowBucket<T> {
         }
     }
 
+    pub fn last_timestamp(&self) -> Option<i64> {
+        if self.records.is_empty() {
+            None
+        } else {
+            Some(self.last_ts)
+        }
+    }
+
     pub fn observe(&mut self, record: T)
     where
         T: HasTimestamp,

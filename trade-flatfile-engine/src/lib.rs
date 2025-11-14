@@ -10,12 +10,10 @@ pub use download_metrics::{DownloadMetrics, DownloadSnapshot};
 use std::{
     cmp::Ordering,
     collections::HashMap,
-    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering as AtomicOrdering},
     },
-    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -55,8 +53,10 @@ use futures::StreamExt;
 use log::{error, info, warn};
 use nbbo_cache::NbboStore;
 use parking_lot::Mutex;
+use tempfile::{NamedTempFile, TempPath};
 use tokio::{
-    io::{AsyncRead, BufReader, ReadBuf},
+    fs::File as TokioFile,
+    io::{AsyncRead, AsyncWriteExt, BufReader, BufWriter},
     runtime::Runtime,
     task::JoinHandle,
     time::sleep,
@@ -1548,6 +1548,8 @@ async fn fetch_stream(
     key: &str,
     slot: TradeSlotKind,
 ) -> Result<(Box<dyn AsyncRead + Unpin + Send>, DownloadToken), FlatfileError> {
+    let temp_file = NamedTempFile::new()?;
+    let mut writer = BufWriter::new(TokioFile::from_std(temp_file.reopen()?));
     let resp = client
         .get_object()
         .bucket(config.bucket.clone())
@@ -1557,67 +1559,59 @@ async fn fetch_stream(
         .map_err(|err| FlatfileError::Sdk(err.to_string()))?;
     let total_bytes = resp.content_length().map(|val| val as u64);
     config.download_metrics.reset(slot, total_bytes);
-    let body: ByteStream = resp.body;
-    let reader = body.into_async_read();
-    let counting_reader = CountingReader::new(reader, Arc::clone(&config.download_metrics), slot);
-    let buf = BufReader::new(counting_reader);
+    let mut body: ByteStream = resp.body;
+    while let Some(bytes) = body.next().await {
+        let bytes = bytes.map_err(|err| FlatfileError::Sdk(err.to_string()))?;
+        writer.write_all(&bytes).await?;
+        config
+            .download_metrics
+            .add_streamed(slot, bytes.len() as u64);
+    }
+    writer.flush().await?;
+    drop(writer);
+    let temp_path = temp_file.into_temp_path();
+    let file = TokioFile::open(temp_path.as_ref()).await?;
+    let buf = BufReader::new(file);
     let decoder = GzipDecoder::new(buf);
-    let token = DownloadToken::new(Arc::clone(&config.download_metrics), slot);
+    let token =
+        DownloadToken::with_temp_path(Arc::clone(&config.download_metrics), slot, temp_path);
     Ok((Box::new(decoder), token))
-}
-
-struct CountingReader<R> {
-    inner: R,
-    metrics: Arc<DownloadMetrics>,
-    slot: TradeSlotKind,
-}
-
-impl<R> CountingReader<R> {
-    fn new(inner: R, metrics: Arc<DownloadMetrics>, slot: TradeSlotKind) -> Self {
-        Self {
-            inner,
-            metrics,
-            slot,
-        }
-    }
-}
-
-impl<R> AsyncRead for CountingReader<R>
-where
-    R: AsyncRead + Unpin,
-{
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let before = buf.filled().len();
-        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &poll {
-            let after = buf.filled().len();
-            let read = after.saturating_sub(before);
-            if read > 0 {
-                self.metrics.add_streamed(self.slot, read as u64);
-            }
-        }
-        poll
-    }
 }
 
 struct DownloadToken {
     metrics: Arc<DownloadMetrics>,
     slot: TradeSlotKind,
+    temp_path: Option<TempPath>,
 }
 
 impl DownloadToken {
     fn new(metrics: Arc<DownloadMetrics>, slot: TradeSlotKind) -> Self {
-        Self { metrics, slot }
+        Self {
+            metrics,
+            slot,
+            temp_path: None,
+        }
+    }
+
+    fn with_temp_path(
+        metrics: Arc<DownloadMetrics>,
+        slot: TradeSlotKind,
+        temp_path: TempPath,
+    ) -> Self {
+        Self {
+            metrics,
+            slot,
+            temp_path: Some(temp_path),
+        }
     }
 }
 
 impl Drop for DownloadToken {
     fn drop(&mut self) {
         self.metrics.complete(self.slot);
+        if let Some(path) = self.temp_path.take() {
+            let _ = path.close();
+        }
     }
 }
 

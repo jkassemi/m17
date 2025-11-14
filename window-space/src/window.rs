@@ -238,9 +238,9 @@ pub struct WindowRangeConfig {
 impl Default for WindowRangeConfig {
     fn default() -> Self {
         Self {
-            anchor_date: date!(2025 - 11 - 12),
+            anchor_date: date!(2025 - 11 - 14),
             months_back: 6,
-            months_forward: 6,
+            months_forward: 3,
             session_open: time!(14:30:00),
             session_windows: WINDOWS_PER_SESSION as WindowIndex,
             window_duration_secs: DEFAULT_WINDOW_DURATION_SECS,

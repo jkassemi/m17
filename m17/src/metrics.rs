@@ -16,6 +16,7 @@ use hyper::{
 use hyper_util::rt::TokioIo;
 use nbbo_engine::{AggressorMetrics, AggressorMetricsSnapshot};
 use prometheus::{Encoder, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
+use quote_backfill_engine::{QuoteBackfillMetrics, QuoteBackfillMetricsSnapshot};
 use tokio::{net::TcpListener, sync::oneshot};
 use trade_flatfile_engine::{DownloadMetrics, DownloadSnapshot};
 use trade_ws_engine::{TradeWsMetrics, TradeWsMetricsSnapshot};
@@ -101,6 +102,7 @@ impl MetricsServer {
         controller: Arc<WindowSpaceController>,
         aggressor_metrics: Arc<nbbo_engine::AggressorMetrics>,
         trade_ws_metrics: Arc<TradeWsMetrics>,
+        quote_backfill_metrics: Arc<QuoteBackfillMetrics>,
         engine_status: Arc<EngineStatusRegistry>,
         addr: SocketAddr,
     ) -> Self {
@@ -117,6 +119,7 @@ impl MetricsServer {
                 controller,
                 aggressor_metrics,
                 trade_ws_metrics,
+                quote_backfill_metrics,
                 engine_status,
                 addr,
                 shutdown_rx,
@@ -144,6 +147,7 @@ async fn run_http(
     controller: Arc<WindowSpaceController>,
     aggressor_metrics: Arc<AggressorMetrics>,
     trade_ws_metrics: Arc<TradeWsMetrics>,
+    quote_backfill_metrics: Arc<QuoteBackfillMetrics>,
     engine_status: Arc<EngineStatusRegistry>,
     addr: SocketAddr,
     mut shutdown: oneshot::Receiver<()>,
@@ -168,6 +172,7 @@ async fn run_http(
                         let controller = Arc::clone(&controller);
                         let aggressor_metrics = Arc::clone(&aggressor_metrics);
                         let trade_ws_metrics = Arc::clone(&trade_ws_metrics);
+                        let quote_backfill_metrics = Arc::clone(&quote_backfill_metrics);
                         let engine_status = Arc::clone(&engine_status);
                         tokio::spawn(async move {
                             if let Err(err) = serve_connection(
@@ -178,6 +183,7 @@ async fn run_http(
                                 controller,
                                 aggressor_metrics,
                                 trade_ws_metrics,
+                                quote_backfill_metrics,
                                 engine_status,
                             )
                             .await
@@ -203,6 +209,7 @@ async fn serve_connection(
     controller: Arc<WindowSpaceController>,
     aggressor_metrics: Arc<AggressorMetrics>,
     trade_ws_metrics: Arc<TradeWsMetrics>,
+    quote_backfill_metrics: Arc<QuoteBackfillMetrics>,
     engine_status: Arc<EngineStatusRegistry>,
 ) -> Result<(), hyper::Error> {
     let io = TokioIo::new(stream);
@@ -213,6 +220,7 @@ async fn serve_connection(
         let controller = Arc::clone(&controller);
         let aggressor_metrics = Arc::clone(&aggressor_metrics);
         let trade_ws_metrics = Arc::clone(&trade_ws_metrics);
+        let quote_backfill_metrics = Arc::clone(&quote_backfill_metrics);
         let engine_status = Arc::clone(&engine_status);
         async move {
             let response = handle_request(
@@ -223,6 +231,7 @@ async fn serve_connection(
                 controller,
                 aggressor_metrics,
                 trade_ws_metrics,
+                quote_backfill_metrics,
                 engine_status,
             );
             Ok::<_, hyper::Error>(response)
@@ -240,6 +249,7 @@ fn handle_request(
     controller: Arc<WindowSpaceController>,
     aggressor_metrics: Arc<AggressorMetrics>,
     trade_ws_metrics: Arc<TradeWsMetrics>,
+    quote_backfill_metrics: Arc<QuoteBackfillMetrics>,
     engine_status: Arc<EngineStatusRegistry>,
 ) -> Response<Full<Bytes>> {
     if req.uri().path() != "/metrics" {
@@ -255,6 +265,7 @@ fn handle_request(
     let classification = aggressor_metrics.snapshot();
     let set_counts = controller.set_counter_snapshot();
     let trade_ws = trade_ws_metrics.snapshot();
+    let quote_backfill = quote_backfill_metrics.snapshot();
     let engines = engine_status.snapshot();
     let body = exporter
         .render(
@@ -265,6 +276,7 @@ fn handle_request(
             set_counts,
             classification,
             trade_ws,
+            quote_backfill,
             &engines,
         )
         .unwrap_or_else(|_| b"metrics_unavailable".to_vec());
@@ -297,6 +309,20 @@ struct MetricsExporter {
     trade_ws_skipped: IntGauge,
     trade_ws_subscriptions: IntGauge,
     trade_ws_refresh_age: IntGauge,
+    quote_backfill_rest_requests: IntGauge,
+    quote_backfill_rest_success: IntGauge,
+    quote_backfill_rest_client_errors: IntGauge,
+    quote_backfill_rest_server_errors: IntGauge,
+    quote_backfill_rest_network_errors: IntGauge,
+    quote_backfill_rest_inflight: IntGauge,
+    quote_backfill_rest_latency_ms_avg: IntGauge,
+    quote_backfill_rest_latency_ms_max: IntGauge,
+    quote_backfill_windows_examined: IntGauge,
+    quote_backfill_windows_filled: IntGauge,
+    quote_backfill_windows_skipped: IntGauge,
+    quote_backfill_windows_failed: IntGauge,
+    quote_backfill_quotes_written: IntGauge,
+    quote_backfill_backlog: IntGauge,
     engine_runtime: IntGaugeVec,
 }
 
@@ -487,6 +513,118 @@ impl MetricsExporter {
         registry
             .register(Box::new(trade_ws_refresh_age.clone()))
             .expect("register trade ws refresh age");
+        let quote_backfill_rest_requests = IntGauge::with_opts(Opts::new(
+            "quote_backfill_rest_requests_total",
+            "Total REST requests issued by the quote backfill engine",
+        ))
+        .expect("quote backfill rest requests");
+        registry
+            .register(Box::new(quote_backfill_rest_requests.clone()))
+            .expect("register quote backfill rest requests");
+        let quote_backfill_rest_success = IntGauge::with_opts(Opts::new(
+            "quote_backfill_rest_success_total",
+            "Successful REST responses",
+        ))
+        .expect("quote backfill rest success");
+        registry
+            .register(Box::new(quote_backfill_rest_success.clone()))
+            .expect("register quote backfill rest success");
+        let quote_backfill_rest_client_errors = IntGauge::with_opts(Opts::new(
+            "quote_backfill_rest_client_errors_total",
+            "Client-side REST failures (4xx)",
+        ))
+        .expect("quote backfill client errors");
+        registry
+            .register(Box::new(quote_backfill_rest_client_errors.clone()))
+            .expect("register quote backfill client errors");
+        let quote_backfill_rest_server_errors = IntGauge::with_opts(Opts::new(
+            "quote_backfill_rest_server_errors_total",
+            "Server-side REST failures (5xx)",
+        ))
+        .expect("quote backfill server errors");
+        registry
+            .register(Box::new(quote_backfill_rest_server_errors.clone()))
+            .expect("register quote backfill server errors");
+        let quote_backfill_rest_network_errors = IntGauge::with_opts(Opts::new(
+            "quote_backfill_rest_network_errors_total",
+            "Errors before a REST response completed (network/json)",
+        ))
+        .expect("quote backfill network errors");
+        registry
+            .register(Box::new(quote_backfill_rest_network_errors.clone()))
+            .expect("register quote backfill network errors");
+        let quote_backfill_rest_inflight = IntGauge::with_opts(Opts::new(
+            "quote_backfill_rest_inflight",
+            "Currently in-flight REST requests",
+        ))
+        .expect("quote backfill inflight");
+        registry
+            .register(Box::new(quote_backfill_rest_inflight.clone()))
+            .expect("register quote backfill inflight");
+        let quote_backfill_rest_latency_ms_avg = IntGauge::with_opts(Opts::new(
+            "quote_backfill_rest_latency_ms_avg",
+            "Average REST latency (ms)",
+        ))
+        .expect("quote backfill latency avg");
+        registry
+            .register(Box::new(quote_backfill_rest_latency_ms_avg.clone()))
+            .expect("register quote backfill latency avg");
+        let quote_backfill_rest_latency_ms_max = IntGauge::with_opts(Opts::new(
+            "quote_backfill_rest_latency_ms_max",
+            "Maximum observed REST latency (ms)",
+        ))
+        .expect("quote backfill latency max");
+        registry
+            .register(Box::new(quote_backfill_rest_latency_ms_max.clone()))
+            .expect("register quote backfill latency max");
+        let quote_backfill_windows_examined = IntGauge::with_opts(Opts::new(
+            "quote_backfill_windows_examined_total",
+            "Windows the backfill engine attempted this session",
+        ))
+        .expect("quote backfill windows examined");
+        registry
+            .register(Box::new(quote_backfill_windows_examined.clone()))
+            .expect("register quote backfill windows examined");
+        let quote_backfill_windows_filled = IntGauge::with_opts(Opts::new(
+            "quote_backfill_windows_filled_total",
+            "Windows successfully backfilled",
+        ))
+        .expect("quote backfill windows filled");
+        registry
+            .register(Box::new(quote_backfill_windows_filled.clone()))
+            .expect("register quote backfill windows filled");
+        let quote_backfill_windows_skipped = IntGauge::with_opts(Opts::new(
+            "quote_backfill_windows_skipped_total",
+            "Windows with no REST quotes available",
+        ))
+        .expect("quote backfill windows skipped");
+        registry
+            .register(Box::new(quote_backfill_windows_skipped.clone()))
+            .expect("register quote backfill windows skipped");
+        let quote_backfill_windows_failed = IntGauge::with_opts(Opts::new(
+            "quote_backfill_windows_failed_total",
+            "Windows that failed backfill due to errors",
+        ))
+        .expect("quote backfill windows failed");
+        registry
+            .register(Box::new(quote_backfill_windows_failed.clone()))
+            .expect("register quote backfill windows failed");
+        let quote_backfill_quotes_written = IntGauge::with_opts(Opts::new(
+            "quote_backfill_quotes_written_total",
+            "Quotes written via REST backfill",
+        ))
+        .expect("quote backfill quotes written");
+        registry
+            .register(Box::new(quote_backfill_quotes_written.clone()))
+            .expect("register quote backfill quotes written");
+        let quote_backfill_backlog = IntGauge::with_opts(Opts::new(
+            "quote_backfill_backlog_windows",
+            "Backlog windows in the latest poll cycle",
+        ))
+        .expect("quote backfill backlog");
+        registry
+            .register(Box::new(quote_backfill_backlog.clone()))
+            .expect("register quote backfill backlog");
         let engine_runtime = IntGaugeVec::new(
             Opts::new(
                 "engine_runtime_seconds",
@@ -520,6 +658,20 @@ impl MetricsExporter {
             trade_ws_skipped,
             trade_ws_subscriptions,
             trade_ws_refresh_age,
+            quote_backfill_rest_requests,
+            quote_backfill_rest_success,
+            quote_backfill_rest_client_errors,
+            quote_backfill_rest_server_errors,
+            quote_backfill_rest_network_errors,
+            quote_backfill_rest_inflight,
+            quote_backfill_rest_latency_ms_avg,
+            quote_backfill_rest_latency_ms_max,
+            quote_backfill_windows_examined,
+            quote_backfill_windows_filled,
+            quote_backfill_windows_skipped,
+            quote_backfill_windows_failed,
+            quote_backfill_quotes_written,
+            quote_backfill_backlog,
             engine_runtime,
         }
     }
@@ -533,6 +685,7 @@ impl MetricsExporter {
         set_counts: SetCounterSnapshot,
         classifications: AggressorMetricsSnapshot,
         trade_ws: TradeWsMetricsSnapshot,
+        quote_backfill: QuoteBackfillMetricsSnapshot,
         engine_status: &[EngineStatusSample],
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         self.window_gauge
@@ -550,6 +703,7 @@ impl MetricsExporter {
         self.record_set_counts(set_counts);
         self.record_classifications(classifications);
         self.record_trade_ws(trade_ws);
+        self.record_quote_backfill(quote_backfill);
         self.record_engine_status(engine_status);
         let metric_families = self.registry.gather();
         let mut buffer = Vec::new();
@@ -659,6 +813,37 @@ impl MetricsExporter {
             .map(|secs| secs as i64)
             .unwrap_or(-1);
         self.trade_ws_refresh_age.set(age);
+    }
+
+    fn record_quote_backfill(&self, snapshot: QuoteBackfillMetricsSnapshot) {
+        self.quote_backfill_rest_requests
+            .set(snapshot.rest_requests as i64);
+        self.quote_backfill_rest_success
+            .set(snapshot.rest_success as i64);
+        self.quote_backfill_rest_client_errors
+            .set(snapshot.rest_client_error as i64);
+        self.quote_backfill_rest_server_errors
+            .set(snapshot.rest_server_error as i64);
+        self.quote_backfill_rest_network_errors
+            .set(snapshot.rest_network_error as i64);
+        self.quote_backfill_rest_inflight
+            .set(snapshot.rest_inflight);
+        self.quote_backfill_rest_latency_ms_avg
+            .set(snapshot.rest_latency_ms_avg.round() as i64);
+        self.quote_backfill_rest_latency_ms_max
+            .set(snapshot.rest_latency_ms_max.round() as i64);
+        self.quote_backfill_windows_examined
+            .set(snapshot.windows_examined as i64);
+        self.quote_backfill_windows_filled
+            .set(snapshot.windows_filled as i64);
+        self.quote_backfill_windows_skipped
+            .set(snapshot.windows_skipped as i64);
+        self.quote_backfill_windows_failed
+            .set(snapshot.windows_failed as i64);
+        self.quote_backfill_quotes_written
+            .set(snapshot.quotes_written as i64);
+        self.quote_backfill_backlog
+            .set(snapshot.backlog_windows as i64);
     }
 
     fn record_engine_status(&self, statuses: &[EngineStatusSample]) {

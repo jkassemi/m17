@@ -30,6 +30,7 @@ use metrics::{EngineStatusRegistry, MetricsServer};
 use nbbo_engine::{
     AggressorEngineConfig, AggressorMetrics, OptionAggressorEngine, UnderlyingAggressorEngine,
 };
+use quote_backfill_engine::{QuoteBackfillConfig, QuoteBackfillEngine, QuoteBackfillMetrics};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use trade_flatfile_engine::{
@@ -51,6 +52,7 @@ const DEFAULT_CLASSIFIER_LATENESS_MS: u32 = 1_000;
 const ENGINE_TREASURY: &str = "treasury_engine";
 const ENGINE_TRADE_WS: &str = "trade_ws_engine";
 const ENGINE_OPTION_QUOTE: &str = "option_quote_flatfile";
+const ENGINE_OPTION_QUOTE_BACKFILL: &str = "option_quote_rest_backfill";
 const ENGINE_UNDERLYING_TRADE: &str = "underlying_trade_flatfile";
 const ENGINE_UNDERLYING_QUOTE: &str = "underlying_quote_flatfile";
 const ENGINE_OPTION_AGGRESSOR: &str = "option_aggressor_engine";
@@ -62,6 +64,7 @@ const ENGINE_LABELS: &[&str] = &[
     ENGINE_TREASURY,
     ENGINE_TRADE_WS,
     ENGINE_OPTION_QUOTE,
+    ENGINE_OPTION_QUOTE_BACKFILL,
     ENGINE_UNDERLYING_TRADE,
     ENGINE_UNDERLYING_QUOTE,
     ENGINE_OPTION_AGGRESSOR,
@@ -100,6 +103,7 @@ fn run() -> Result<(), AppError> {
     let download_metrics = Arc::new(DownloadMetrics::new());
     let aggressor_metrics = Arc::new(AggressorMetrics::new());
     let trade_ws_metrics = Arc::new(TradeWsMetrics::new());
+    let quote_backfill_metrics = Arc::new(QuoteBackfillMetrics::new());
     let engine_status = Arc::new(EngineStatusRegistry::default());
     for label in ENGINE_LABELS {
         engine_status.mark_stopped(label);
@@ -208,6 +212,17 @@ fn run() -> Result<(), AppError> {
         controller.clone(),
         Arc::clone(&trade_ws_metrics),
     );
+    let quote_backfill_cfg = QuoteBackfillConfig::new(
+        config.env_label(),
+        config.ledger.state_dir().to_path_buf(),
+        config.rest_base_url.clone(),
+        config.secrets.massive_api_key.clone(),
+    );
+    let quote_backfill_engine = QuoteBackfillEngine::new(
+        quote_backfill_cfg,
+        controller.clone(),
+        Arc::clone(&quote_backfill_metrics),
+    );
 
     println!(
         "m17 orchestrator booted in {:?} mode; window space state at {:?}",
@@ -245,6 +260,11 @@ fn run() -> Result<(), AppError> {
     start_engine_if_stopped(&treasury_engine, ENGINE_TREASURY, engine_status.as_ref())?;
     start_engine_if_stopped(&trade_ws_engine, ENGINE_TRADE_WS, engine_status.as_ref())?;
     start_engine_if_stopped(
+        &quote_backfill_engine,
+        ENGINE_OPTION_QUOTE_BACKFILL,
+        engine_status.as_ref(),
+    )?;
+    start_engine_if_stopped(
         &*option_quote_engine,
         ENGINE_OPTION_QUOTE,
         engine_status.as_ref(),
@@ -273,6 +293,7 @@ fn run() -> Result<(), AppError> {
     start_engine_if_stopped(&greeks_engine, ENGINE_GREEKS, engine_status.as_ref())?;
     log_engine_health("treasury", &treasury_engine);
     log_engine_health("options-ws-trade", &trade_ws_engine);
+    log_engine_health("option-quote-backfill", &quote_backfill_engine);
     log_engine_health("option-quote-flatfile", &*option_quote_engine);
     log_engine_health("underlying-trade-flatfile", &*underlying_trade_engine);
     log_engine_health("underlying-quote-flatfile", &*underlying_quote_engine);
@@ -294,6 +315,7 @@ fn run() -> Result<(), AppError> {
         Arc::clone(&controller),
         aggressor_metrics,
         trade_ws_metrics,
+        quote_backfill_metrics,
         Arc::clone(&engine_status),
         config.metrics_addr,
     );
@@ -324,6 +346,11 @@ fn run() -> Result<(), AppError> {
     stop_engine_if_running(
         &*option_quote_engine,
         ENGINE_OPTION_QUOTE,
+        engine_status.as_ref(),
+    )?;
+    stop_engine_if_running(
+        &quote_backfill_engine,
+        ENGINE_OPTION_QUOTE_BACKFILL,
         engine_status.as_ref(),
     )?;
     stop_engine_if_running(&treasury_engine, ENGINE_TREASURY, engine_status.as_ref())?;

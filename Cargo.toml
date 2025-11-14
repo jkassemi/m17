@@ -12,6 +12,7 @@ members = [
   "metrics",
   "nbbo-cache",
   "options-universe-ingestion-service",
+  "quote-backfill-engine",
   "realtime-ws-ingestion-service",
   "orchestrator",
   "replayer",

@@ -1,0 +1,22 @@
+[package]
+name = "quote-backfill-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow = "57.0.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+core-types = { path = "../core-types" }
+crc32fast = "1"
+engine-api = { path = "../engine-api" }
+log = "0.4"
+parking_lot = "0.12"
+parquet = { version = "57.0", features = ["arrow"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+time = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-util = "0.7"
+url = "2"
+window-space = { path = "../window-space" }

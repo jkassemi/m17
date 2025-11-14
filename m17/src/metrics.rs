@@ -288,6 +288,11 @@ struct MetricsExporter {
     classification_total: IntGaugeVec,
     trade_ws_events: IntGauge,
     trade_ws_quote_events: IntGauge,
+    trade_ws_option_trade_events: IntGauge,
+    trade_ws_option_quote_events: IntGauge,
+    trade_ws_underlying_trade_events: IntGauge,
+    trade_ws_underlying_quote_events: IntGauge,
+    trade_ws_cancel_events: IntGauge,
     trade_ws_errors: IntGauge,
     trade_ws_skipped: IntGauge,
     trade_ws_subscriptions: IntGauge,
@@ -410,6 +415,46 @@ impl MetricsExporter {
         registry
             .register(Box::new(trade_ws_quote_events.clone()))
             .expect("register trade ws quote events");
+        let trade_ws_option_trade_events = IntGauge::with_opts(Opts::new(
+            "trade_ws_option_trade_events_total",
+            "Total option trade websocket events observed",
+        ))
+        .expect("trade ws option trade events");
+        registry
+            .register(Box::new(trade_ws_option_trade_events.clone()))
+            .expect("register trade ws option trade events");
+        let trade_ws_option_quote_events = IntGauge::with_opts(Opts::new(
+            "trade_ws_option_quote_events_total",
+            "Total option quote websocket events observed",
+        ))
+        .expect("trade ws option quote events");
+        registry
+            .register(Box::new(trade_ws_option_quote_events.clone()))
+            .expect("register trade ws option quote events");
+        let trade_ws_underlying_trade_events = IntGauge::with_opts(Opts::new(
+            "trade_ws_underlying_trade_events_total",
+            "Total underlying trade websocket events observed",
+        ))
+        .expect("trade ws underlying trade events");
+        registry
+            .register(Box::new(trade_ws_underlying_trade_events.clone()))
+            .expect("register trade ws underlying trade events");
+        let trade_ws_underlying_quote_events = IntGauge::with_opts(Opts::new(
+            "trade_ws_underlying_quote_events_total",
+            "Total underlying quote websocket events observed",
+        ))
+        .expect("trade ws underlying quote events");
+        registry
+            .register(Box::new(trade_ws_underlying_quote_events.clone()))
+            .expect("register trade ws underlying quote events");
+        let trade_ws_cancel_events = IntGauge::with_opts(Opts::new(
+            "trade_ws_cancellations_total",
+            "Total websocket cancellations observed",
+        ))
+        .expect("trade ws cancel events");
+        registry
+            .register(Box::new(trade_ws_cancel_events.clone()))
+            .expect("register trade ws cancel events");
         let trade_ws_errors = IntGauge::with_opts(Opts::new(
             "trade_ws_errors_total",
             "Total websocket ingestion errors observed",
@@ -466,6 +511,11 @@ impl MetricsExporter {
             classification_total,
             trade_ws_events,
             trade_ws_quote_events,
+            trade_ws_option_trade_events,
+            trade_ws_option_quote_events,
+            trade_ws_underlying_trade_events,
+            trade_ws_underlying_quote_events,
+            trade_ws_cancel_events,
             trade_ws_errors,
             trade_ws_skipped,
             trade_ws_subscriptions,
@@ -590,6 +640,16 @@ impl MetricsExporter {
     fn record_trade_ws(&self, snapshot: TradeWsMetricsSnapshot) {
         self.trade_ws_events.set(snapshot.trade_events as i64);
         self.trade_ws_quote_events.set(snapshot.quote_events as i64);
+        self.trade_ws_option_trade_events
+            .set(snapshot.option_trade_events as i64);
+        self.trade_ws_option_quote_events
+            .set(snapshot.option_quote_events as i64);
+        self.trade_ws_underlying_trade_events
+            .set(snapshot.underlying_trade_events as i64);
+        self.trade_ws_underlying_quote_events
+            .set(snapshot.underlying_quote_events as i64);
+        self.trade_ws_cancel_events
+            .set(snapshot.cancel_events as i64);
         self.trade_ws_errors.set(snapshot.error_events as i64);
         self.trade_ws_skipped.set(snapshot.skipped_events as i64);
         self.trade_ws_subscriptions

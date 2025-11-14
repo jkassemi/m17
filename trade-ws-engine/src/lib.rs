@@ -25,6 +25,7 @@ use arrow::{
 };
 use chrono::{DateTime, Datelike, Utc};
 use core_types::{
+    opra::parse_opra_contract,
     raw::{OptionTradeRecord, QuoteRecord, UnderlyingTradeRecord},
     schema::{nbbo_schema, option_trade_record_schema, underlying_trade_record_schema},
     types::{EquityTrade, Nbbo, OptionTrade},
@@ -55,6 +56,10 @@ use window_space::{
 };
 use ws_source::worker::{ResourceKind, SubscriptionSource, WsMessage, WsWorker};
 
+// Massive enforces a soft cap on option NBBO subscriptions per connection.
+// Empirically, 499 contracts keeps quotes flowing without triggering policy
+// disconnects while still covering the most-active symbols.
+pub const DEFAULT_CONTRACTS_PER_UNDERLYING: usize = 499;
 const DEFAULT_FLUSH_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_WINDOW_GRACE_MS: u64 = 2_000;
 const OPTION_TRADE_SCHEMA_VERSION: u8 = 1;
@@ -161,11 +166,15 @@ impl TradeWsInner {
             });
         }
         let runtime = Runtime::new().map_err(|err| EngineError::Failure { source: err.into() })?;
-        let topics = runtime
-            .block_on(resolve_subscription_topics(&self.config, &self.underlyings))
-            .map_err(|err| EngineError::Failure {
-                source: Box::new(err),
-            })?;
+        let topics = if self.config.subscribe_all_options {
+            vec!["*".to_string()]
+        } else {
+            runtime
+                .block_on(resolve_subscription_topics(&self.config, &self.underlyings))
+                .map_err(|err| EngineError::Failure {
+                    source: Box::new(err),
+                })?
+        };
         if topics.is_empty() {
             return Err(EngineError::Failure {
                 source: Box::new(TradeWsError::NoContracts),
@@ -179,27 +188,63 @@ impl TradeWsInner {
         let batch_seq = Arc::clone(&self.batch_seq);
         let health = Arc::clone(&self.health);
         let (topic_tx, topic_rx) = watch::channel(topics.clone());
-        let mut refresh_rx = topic_tx.subscribe();
-        let refresh_cfg = self.config.clone();
-        let refresh_underlyings = self.underlyings.clone();
-        let refresh_cancel = cancel.clone();
-        let refresh_metrics = Arc::clone(&self.metrics);
-        runtime.spawn(async move {
-            refresh_contracts_loop(
-                refresh_cfg,
-                refresh_underlyings,
-                topic_tx,
-                &mut refresh_rx,
-                refresh_cancel,
-                refresh_metrics,
+        if !self.config.subscribe_all_options {
+            let mut refresh_rx = topic_tx.subscribe();
+            let refresh_cfg = self.config.clone();
+            let refresh_underlyings = self.underlyings.clone();
+            let refresh_cancel = cancel.clone();
+            let refresh_metrics = Arc::clone(&self.metrics);
+            runtime.spawn(async move {
+                refresh_contracts_loop(
+                    refresh_cfg,
+                    refresh_underlyings,
+                    topic_tx,
+                    &mut refresh_rx,
+                    refresh_cancel,
+                    refresh_metrics,
+                )
+                .await;
+            });
+        }
+        let options_topics = topic_rx;
+        let (option_trade_tx, option_trade_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (option_quote_tx, option_quote_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let option_stream_cfg = self.config.clone();
+        let option_stream_cancel = cancel.clone();
+        let option_stream_metrics = Arc::clone(&self.metrics);
+        let option_stream_handle = runtime.spawn(async move {
+            stream_options_feed(
+                option_stream_cfg,
+                options_topics,
+                option_trade_tx,
+                option_quote_tx,
+                option_stream_cancel,
+                option_stream_metrics,
             )
             .await;
         });
         let cancel_clone = cancel.clone();
         let metrics = Arc::clone(&self.metrics);
         let option_handle = runtime.spawn(async move {
-            let mut ingestor = WsIngestor::new(cfg, runner, batch_seq, health, topic_rx, metrics);
-            ingestor.run(cancel_clone).await;
+            let mut ingestor = WsIngestor::new(cfg, runner, batch_seq, health, metrics);
+            ingestor.run(option_trade_rx, cancel_clone).await;
+        });
+        let option_quote_controller = Arc::clone(&self.controller);
+        let option_quote_batch_seq = Arc::clone(&self.batch_seq);
+        let option_quote_metrics = Arc::clone(&self.metrics);
+        let option_quote_health = Arc::clone(&self.health);
+        let option_quote_ingestor = OptionQuoteIngestor::new(
+            self.config.clone(),
+            option_quote_controller,
+            option_quote_batch_seq,
+            option_quote_metrics,
+            option_quote_health,
+        );
+        let option_quote_ingest_cancel = cancel.clone();
+        let option_quote_ingest_handle = runtime.spawn(async move {
+            option_quote_ingestor
+                .run(option_quote_rx, option_quote_ingest_cancel)
+                .await;
         });
         let (trade_tx, trade_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (quote_tx, quote_rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -242,7 +287,14 @@ impl TradeWsInner {
             quote_ingestor.run(quote_rx, cancel_clone).await;
         });
 
-        let handles = vec![option_handle, stocks_handle, trade_handle, quote_handle];
+        let handles = vec![
+            option_handle,
+            option_stream_handle,
+            option_quote_ingest_handle,
+            stocks_handle,
+            trade_handle,
+            quote_handle,
+        ];
         *guard = EngineRuntimeState::Running(RuntimeBundle {
             runtime,
             handles,
@@ -297,7 +349,6 @@ struct WsIngestor {
     controller: Arc<WindowSpaceController>,
     batch_seq: Arc<AtomicU32>,
     health: Arc<Mutex<EngineHealth>>,
-    topics_rx: watch::Receiver<Vec<String>>,
     metrics: Arc<TradeWsMetrics>,
 }
 
@@ -307,7 +358,6 @@ impl WsIngestor {
         controller: Arc<WindowSpaceController>,
         batch_seq: Arc<AtomicU32>,
         health: Arc<Mutex<EngineHealth>>,
-        topics_rx: watch::Receiver<Vec<String>>,
         metrics: Arc<TradeWsMetrics>,
     ) -> Self {
         Self {
@@ -315,22 +365,11 @@ impl WsIngestor {
             controller,
             batch_seq,
             health,
-            topics_rx,
             metrics,
         }
     }
 
-    async fn run(&mut self, cancel: CancellationToken) {
-        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let ws_task = {
-            let cfg = self.config.clone();
-            let cancel = cancel.clone();
-            let topics = self.topics_rx.clone();
-            let metrics = Arc::clone(&self.metrics);
-            tokio::spawn(async move {
-                stream_options_trades(cfg, topics, tx, cancel, metrics).await;
-            })
-        };
+    async fn run(&mut self, mut rx: mpsc::Receiver<OptionTrade>, cancel: CancellationToken) {
         let mut buckets: HashMap<WindowKey, OptionWindowEntry> = HashMap::new();
         let mut ticker = interval(self.config.flush_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -359,7 +398,6 @@ impl WsIngestor {
             self.metrics.inc_errors();
             error!("trade-ws shutdown flush error: {err}");
         }
-        ws_task.abort();
         self.set_health(HealthStatus::Stopped, Some("ingestor stopped".to_string()));
     }
 
@@ -670,16 +708,90 @@ impl UnderlyingQuoteIngestor {
     }
 }
 
-async fn stream_options_trades(
+struct OptionQuoteIngestor {
+    config: TradeWsConfig,
+    controller: Arc<WindowSpaceController>,
+    batch_seq: Arc<AtomicU32>,
+    metrics: Arc<TradeWsMetrics>,
+    health: Arc<Mutex<EngineHealth>>,
+}
+
+impl OptionQuoteIngestor {
+    fn new(
+        config: TradeWsConfig,
+        controller: Arc<WindowSpaceController>,
+        batch_seq: Arc<AtomicU32>,
+        metrics: Arc<TradeWsMetrics>,
+        health: Arc<Mutex<EngineHealth>>,
+    ) -> Self {
+        Self {
+            config,
+            controller,
+            batch_seq,
+            metrics,
+            health,
+        }
+    }
+
+    async fn run(self, mut rx: mpsc::Receiver<Nbbo>, cancel: CancellationToken) {
+        let Self {
+            config,
+            controller,
+            batch_seq,
+            metrics,
+            health,
+        } = self;
+        let mut buckets: HashMap<WindowKey, OptionQuoteWindowEntry> = HashMap::new();
+        let mut ticker = interval(config.flush_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                Some(nbbo) = rx.recv() => {
+                    if let Err(err) = handle_option_quote(
+                        controller.as_ref(),
+                        nbbo,
+                        &mut buckets,
+                    ) {
+                        metrics.inc_errors();
+                        update_engine_health(&health, HealthStatus::Degraded, Some(err.to_string()));
+                        error!("trade-ws option quote ingestion error: {err}");
+                    }
+                }
+                _ = ticker.tick() => {
+                    if let Err(err) = flush_option_quote_buckets(
+                        controller.as_ref(),
+                        &config,
+                        &batch_seq,
+                        &mut buckets,
+                    ) {
+                        metrics.inc_errors();
+                        update_engine_health(&health, HealthStatus::Degraded, Some(err.to_string()));
+                        error!("trade-ws option quote flush error: {err}");
+                    }
+                }
+            }
+        }
+        if let Err(err) =
+            flush_all_option_quotes(controller.as_ref(), &config, &batch_seq, &mut buckets)
+        {
+            metrics.inc_errors();
+            error!("trade-ws option quote shutdown flush error: {err}");
+        }
+    }
+}
+
+async fn stream_options_feed(
     config: TradeWsConfig,
     topics: watch::Receiver<Vec<String>>,
-    tx: mpsc::Sender<OptionTrade>,
+    trade_tx: mpsc::Sender<OptionTrade>,
+    quote_tx: mpsc::Sender<Nbbo>,
     cancel: CancellationToken,
     metrics: Arc<TradeWsMetrics>,
 ) {
     let worker = WsWorker::new(
         &config.options_ws_url,
-        ResourceKind::OptionsTrades,
+        ResourceKind::OptionsTradesAndQuotes,
         Some(config.api_key.clone()),
         SubscriptionSource::Dynamic(topics),
     );
@@ -687,20 +799,27 @@ async fn stream_options_trades(
         Ok(mut stream) => {
             while let Some(msg) = stream.next().await {
                 if cancel.is_cancelled() {
+                    metrics.inc_cancellations();
                     break;
                 }
                 match msg {
                     WsMessage::OptionTrade(trade) => {
-                        metrics.inc_trade_events(1);
-                        if tx.send(trade).await.is_err() {
+                        metrics.inc_option_trade_events(1);
+                        if trade_tx.send(trade).await.is_err() {
+                            metrics.inc_errors();
                             break;
                         }
                     }
-                    WsMessage::Nbbo(_) => {
-                        metrics.inc_quote_events(1);
+                    WsMessage::Nbbo(nbbo) => {
+                        metrics.inc_option_quote_events(1);
+                        if quote_tx.send(nbbo).await.is_err() {
+                            metrics.inc_errors();
+                            break;
+                        }
                     }
-                    WsMessage::EquityTrade(_) => {
+                    WsMessage::EquityTrade(trade) => {
                         metrics.inc_trade_events(1);
+                        drop(trade);
                     }
                 }
             }
@@ -739,18 +858,21 @@ async fn stream_stocks_feed(
         Ok(mut stream) => {
             while let Some(msg) = stream.next().await {
                 if cancel.is_cancelled() {
+                    metrics.inc_cancellations();
                     break;
                 }
                 match msg {
                     WsMessage::EquityTrade(trade) => {
-                        metrics.inc_trade_events(1);
+                        metrics.inc_underlying_trade_events(1);
                         if trade_tx.send(trade).await.is_err() {
+                            metrics.inc_errors();
                             break;
                         }
                     }
                     WsMessage::Nbbo(nbbo) => {
-                        metrics.inc_quote_events(1);
+                        metrics.inc_underlying_quote_events(1);
                         if quote_tx.send(nbbo).await.is_err() {
+                            metrics.inc_errors();
                             break;
                         }
                     }
@@ -778,6 +900,7 @@ pub struct TradeWsConfig {
     pub window_grace: Duration,
     pub contract_refresh_interval: Duration,
     pub symbol_filter: Option<HashSet<String>>,
+    pub subscribe_all_options: bool,
 }
 
 impl TradeWsConfig {
@@ -806,11 +929,12 @@ impl Default for TradeWsConfig {
             stocks_ws_url: "wss://socket.massive.com/stocks".to_string(),
             api_key: String::new(),
             rest_base_url: "https://api.massive.com".to_string(),
-            contracts_per_underlying: 1000,
+            contracts_per_underlying: DEFAULT_CONTRACTS_PER_UNDERLYING,
             flush_interval: Duration::from_millis(DEFAULT_FLUSH_INTERVAL_MS),
             window_grace: Duration::from_millis(DEFAULT_WINDOW_GRACE_MS),
             contract_refresh_interval: Duration::from_secs(300),
             symbol_filter: None,
+            subscribe_all_options: false,
         }
     }
 }
@@ -847,6 +971,7 @@ impl<T> WindowEntry<T> {
 }
 
 type OptionWindowEntry = WindowEntry<OptionTradeRecord>;
+type OptionQuoteWindowEntry = WindowEntry<QuoteRecord>;
 type UnderlyingTradeWindowEntry = WindowEntry<UnderlyingTradeRecord>;
 type UnderlyingQuoteWindowEntry = WindowEntry<QuoteRecord>;
 
@@ -1275,6 +1400,15 @@ fn underlying_quote_artifact_path(
     )
 }
 
+fn option_quote_artifact_path(
+    cfg: &TradeWsConfig,
+    symbol: &str,
+    window_idx: WindowIndex,
+    window_start_ts: i64,
+) -> Result<String, TradeWsError> {
+    artifact_path_with_category(cfg, symbol, window_idx, window_start_ts, "options/quotes")
+}
+
 fn artifact_path_with_category(
     cfg: &TradeWsConfig,
     symbol: &str,
@@ -1361,7 +1495,21 @@ fn canonical_symbol(input: &str) -> String {
     if let Some(stripped) = input.strip_prefix("T:") {
         return stripped.to_string();
     }
+    if let Some(stripped) = input.strip_prefix("O:") {
+        return stripped.to_string();
+    }
     input.to_string()
+}
+
+fn option_quote_symbol(quote: &Nbbo) -> String {
+    if quote.instrument_id.starts_with("O:") {
+        let (_, _, _, underlying) =
+            parse_opra_contract(&quote.instrument_id, Some(quote.quote_ts_ns));
+        if !underlying.is_empty() {
+            return underlying;
+        }
+    }
+    canonical_symbol(&quote.instrument_id)
 }
 
 fn build_equity_topics(prefix: &str, symbols: &[String]) -> Vec<String> {
@@ -1808,6 +1956,138 @@ fn persist_underlying_quote_bucket(
     let payload_id = stores.quotes.append(payload)?;
     let meta = PayloadMeta::new(PayloadType::Quote, payload_id, 1, artifact.checksum);
     controller.set_underlying_quote_ref(&key.symbol, key.window_idx, meta, None)?;
+    Ok(())
+}
+
+fn handle_option_quote(
+    controller: &WindowSpaceController,
+    quote: Nbbo,
+    buckets: &mut HashMap<WindowKey, OptionQuoteWindowEntry>,
+) -> Result<(), TradeWsError> {
+    let symbol = option_quote_symbol(&quote);
+    if symbol.is_empty() {
+        return Ok(());
+    }
+    let window_idx = window_idx_for_timestamp(controller, quote.quote_ts_ns).ok_or_else(|| {
+        TradeWsError::WindowOutOfRange {
+            ts_ns: quote.quote_ts_ns,
+        }
+    })?;
+    let key = WindowKey { symbol, window_idx };
+    let mut record = Some(quote_record_from_nbbo(quote));
+    match buckets.entry(key.clone()) {
+        Entry::Occupied(mut occ) => {
+            let entry = occ.get_mut();
+            if !entry.claimed {
+                match ensure_trade_slot(controller, &key, TradeSlotKind::OptionQuote)? {
+                    SlotDisposition::Skip => {
+                        occ.remove();
+                        return Ok(());
+                    }
+                    SlotDisposition::Claimed => {
+                        entry.claimed = true;
+                    }
+                }
+            }
+            if let Some(rec) = record.take() {
+                entry.bucket.observe(rec);
+            }
+            Ok(())
+        }
+        Entry::Vacant(vacant) => {
+            let meta =
+                controller
+                    .window_meta(key.window_idx)
+                    .ok_or(TradeWsError::MissingWindowMeta {
+                        window_idx: key.window_idx,
+                    })?;
+            match ensure_trade_slot(controller, &key, TradeSlotKind::OptionQuote)? {
+                SlotDisposition::Skip => Ok(()),
+                SlotDisposition::Claimed => {
+                    let entry = vacant.insert(WindowEntry::new(meta));
+                    entry.claimed = true;
+                    if let Some(rec) = record.take() {
+                        entry.bucket.observe(rec);
+                    }
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+fn flush_option_quote_buckets(
+    controller: &WindowSpaceController,
+    config: &TradeWsConfig,
+    batch_seq: &Arc<AtomicU32>,
+    buckets: &mut HashMap<WindowKey, OptionQuoteWindowEntry>,
+) -> Result<(), TradeWsError> {
+    let now_ns = current_time_ns();
+    let grace_ns = config.window_grace_ns();
+    let ready: Vec<WindowKey> = buckets
+        .iter()
+        .filter_map(|(key, entry)| {
+            if entry.ready_to_flush(now_ns, grace_ns) {
+                Some(key.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for key in ready {
+        if let Some(entry) = buckets.remove(&key) {
+            if entry.bucket.records.is_empty() {
+                continue;
+            }
+            persist_option_quote_bucket(controller, batch_seq, config, &key, entry)?;
+        }
+    }
+    Ok(())
+}
+
+fn flush_all_option_quotes(
+    controller: &WindowSpaceController,
+    config: &TradeWsConfig,
+    batch_seq: &Arc<AtomicU32>,
+    buckets: &mut HashMap<WindowKey, OptionQuoteWindowEntry>,
+) -> Result<(), TradeWsError> {
+    let keys: Vec<WindowKey> = buckets.keys().cloned().collect();
+    for key in keys {
+        if let Some(entry) = buckets.remove(&key) {
+            if entry.bucket.records.is_empty() {
+                continue;
+            }
+            persist_option_quote_bucket(controller, batch_seq, config, &key, entry)?;
+        }
+    }
+    Ok(())
+}
+
+fn persist_option_quote_bucket(
+    controller: &WindowSpaceController,
+    batch_seq: &Arc<AtomicU32>,
+    config: &TradeWsConfig,
+    key: &WindowKey,
+    entry: OptionQuoteWindowEntry,
+) -> Result<(), TradeWsError> {
+    let batch = quote_batch(&entry.bucket.records)?;
+    let relative =
+        option_quote_artifact_path(config, &key.symbol, key.window_idx, entry.window_start_ts)?;
+    let artifact = write_record_batch(config.state_dir(), &relative, &batch)?;
+    let payload = QuoteBatchPayload {
+        schema_version: QUOTE_SCHEMA_VERSION,
+        window_ts: entry.window_start_ts,
+        batch_id: batch_seq.fetch_add(1, AtomicOrdering::Relaxed) + 1,
+        first_quote_ts: entry.bucket.first_ts,
+        last_quote_ts: entry.bucket.last_ts,
+        nbbo_sample_count: entry.bucket.records.len() as u32,
+        artifact_uri: artifact.relative_path.clone(),
+        checksum: artifact.checksum,
+    };
+    let mut stores = controller.payload_stores();
+    let payload_id = stores.quotes.append(payload)?;
+    let meta = PayloadMeta::new(PayloadType::Quote, payload_id, 1, artifact.checksum);
+    controller.set_option_quote_ref(&key.symbol, key.window_idx, meta, None)?;
     Ok(())
 }
 

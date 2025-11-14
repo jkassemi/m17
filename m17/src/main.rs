@@ -1,5 +1,6 @@
 mod aggregation;
 mod config;
+mod greeks;
 mod metrics;
 
 use std::{
@@ -17,10 +18,14 @@ use std::{
 use aggregation::AggregationService;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use config::{AppConfig, ConfigError, Environment};
-use core_types::{config::DateRange, types::ClassParams};
+use core_types::{
+    config::{DateRange, GreeksConfig},
+    types::ClassParams,
+};
 use engine_api::{Engine, EngineError};
 use gc_engine::{GcEngine, GcEngineConfig};
-use log::{LevelFilter, Log, Metadata, Record};
+use greeks::GreeksMaterializationEngine;
+use log::{LevelFilter, Log, Metadata, Record, info};
 use metrics::{EngineStatusRegistry, MetricsServer};
 use nbbo_engine::{
     AggressorEngineConfig, AggressorMetrics, OptionAggressorEngine, UnderlyingAggressorEngine,
@@ -31,7 +36,9 @@ use trade_flatfile_engine::{
     DownloadMetrics, FlatfileRuntimeConfig, OptionQuoteFlatfileEngine,
     UnderlyingQuoteFlatfileEngine, UnderlyingTradeFlatfileEngine,
 };
-use trade_ws_engine::{TradeWsConfig, TradeWsEngine, TradeWsMetrics};
+use trade_ws_engine::{
+    DEFAULT_CONTRACTS_PER_UNDERLYING, TradeWsConfig, TradeWsEngine, TradeWsMetrics,
+};
 use trading_calendar::{Market, TradingCalendar};
 use treasury_engine::{TreasuryEngine, TreasuryEngineConfig};
 use window_space::{
@@ -49,6 +56,7 @@ const ENGINE_UNDERLYING_QUOTE: &str = "underlying_quote_flatfile";
 const ENGINE_OPTION_AGGRESSOR: &str = "option_aggressor_engine";
 const ENGINE_UNDERLYING_AGGRESSOR: &str = "underlying_aggressor_engine";
 const ENGINE_GC: &str = "gc_engine";
+const ENGINE_GREEKS: &str = "greeks_engine";
 
 const ENGINE_LABELS: &[&str] = &[
     ENGINE_TREASURY,
@@ -59,6 +67,7 @@ const ENGINE_LABELS: &[&str] = &[
     ENGINE_OPTION_AGGRESSOR,
     ENGINE_UNDERLYING_AGGRESSOR,
     ENGINE_GC,
+    ENGINE_GREEKS,
 ];
 
 fn main() {
@@ -145,6 +154,14 @@ fn run() -> Result<(), AppError> {
         },
         controller.clone(),
     );
+    let greeks_cfg = GreeksConfig::default();
+    let greeks_engine = GreeksMaterializationEngine::new(
+        Arc::clone(&controller),
+        config.ws_target_symbol.to_string(),
+        config.env_label().to_string(),
+        greeks_cfg.clone(),
+        greeks_cfg.flatfile_underlying_staleness_us,
+    );
     let prime_symbols = config
         .symbol_universe
         .as_ref()
@@ -157,6 +174,17 @@ fn run() -> Result<(), AppError> {
     )
     .with_prime_symbols(prime_symbols);
     let treasury_engine = TreasuryEngine::new(treasury_cfg, controller.clone());
+    // Allow brute-force testing by overriding via env without rebuilding.
+    // Default stays at 499 contracts/underlying (see comment in
+    // trade-ws-engine/src/lib.rs) to stay under Massive's quote cap.
+    let contracts_per_underlying = env::var("M17_CONTRACTS_PER_UNDERLYING")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CONTRACTS_PER_UNDERLYING);
+    info!(
+        "trade-ws: using {} contracts per underlying",
+        contracts_per_underlying
+    );
     let trade_ws_cfg = TradeWsConfig {
         label: config.env_label().to_string(),
         state_dir: config.ledger.state_dir().to_path_buf(),
@@ -164,7 +192,7 @@ fn run() -> Result<(), AppError> {
         stocks_ws_url: config.stocks_ws_url.clone(),
         api_key: config.secrets.massive_api_key.clone(),
         rest_base_url: config.rest_base_url.clone(),
-        contracts_per_underlying: 1_000,
+        contracts_per_underlying,
         flush_interval: Duration::from_millis(1_000),
         window_grace: Duration::from_millis(2_000),
         contract_refresh_interval: Duration::from_secs(300),
@@ -173,6 +201,7 @@ fn run() -> Result<(), AppError> {
             set.insert(config.ws_target_symbol.to_string());
             Some(set)
         },
+        subscribe_all_options: false,
     };
     let trade_ws_engine = TradeWsEngine::new(
         trade_ws_cfg,
@@ -241,6 +270,7 @@ fn run() -> Result<(), AppError> {
         engine_status.as_ref(),
     )?;
     start_engine_if_stopped(&gc_engine, ENGINE_GC, engine_status.as_ref())?;
+    start_engine_if_stopped(&greeks_engine, ENGINE_GREEKS, engine_status.as_ref())?;
     log_engine_health("treasury", &treasury_engine);
     log_engine_health("options-ws-trade", &trade_ws_engine);
     log_engine_health("option-quote-flatfile", &*option_quote_engine);
@@ -280,6 +310,7 @@ fn run() -> Result<(), AppError> {
         engine_status.as_ref(),
     )?;
     stop_engine_if_running(&gc_engine, ENGINE_GC, engine_status.as_ref())?;
+    stop_engine_if_running(&greeks_engine, ENGINE_GREEKS, engine_status.as_ref())?;
     stop_engine_if_running(
         &*underlying_quote_engine,
         ENGINE_UNDERLYING_QUOTE,

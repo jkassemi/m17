@@ -47,6 +47,7 @@ pub enum ResourceKind {
     EquityTradesAndQuotes,
     OptionsQuotes,
     OptionsTrades,
+    OptionsTradesAndQuotes,
 }
 
 #[derive(Clone)]
@@ -246,6 +247,11 @@ fn format_symbols(resource: ResourceKind, symbols: &[String]) -> Vec<String> {
     match resource {
         ResourceKind::OptionsTrades => prefix_symbols("T.", symbols),
         ResourceKind::OptionsQuotes => prefix_symbols("Q.", symbols),
+        ResourceKind::OptionsTradesAndQuotes => {
+            let mut combined = prefix_symbols("T.", symbols);
+            combined.extend(prefix_symbols("Q.", symbols));
+            combined
+        }
         ResourceKind::EquityTradesAndQuotes => symbols.to_vec(),
         _ => symbols.to_vec(),
     }
@@ -278,6 +284,15 @@ async fn send_subscriptions(
     action: &str,
 ) -> Result<(), WsError> {
     if symbols.is_empty() {
+        return Ok(());
+    }
+    let has_wildcard = symbols.iter().any(|sym| sym.contains('*'));
+    if has_wildcard {
+        for sym in symbols {
+            let msg = serde_json::json!({ "action": action, "params": sym }).to_string();
+            send_text(writer, msg).await?;
+            sleep(Duration::from_millis(20)).await;
+        }
         return Ok(());
     }
     const SUB_BATCH: usize = 200;
@@ -356,6 +371,17 @@ fn decode_value(value: &Value, resource: ResourceKind) -> Option<WsMessage> {
                 .and_then(raw_option_trade_to_row)
                 .map(WsMessage::OptionTrade)
         }
+        ResourceKind::OptionsTradesAndQuotes => match ev {
+            "Q" => serde_json::from_value::<RawQuote>(value.clone())
+                .ok()
+                .and_then(raw_quote_to_nbbo)
+                .map(WsMessage::Nbbo),
+            "T" => serde_json::from_value::<RawOptionTrade>(value.clone())
+                .ok()
+                .and_then(raw_option_trade_to_row)
+                .map(WsMessage::OptionTrade),
+            _ => None,
+        },
         _ => None,
     }
 }

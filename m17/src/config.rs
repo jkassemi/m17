@@ -10,7 +10,9 @@ use window_space::{
     config::{DEFAULT_MAX_SYMBOLS, WindowSpaceConfig},
 };
 
-const DEV_SYMBOLS: &[&str] = &["AAPL", "F", "TSLA", "NVDA", "GME", "SPY"];
+// Keep the dev build constrained to a single underlying so we never oversubscribe
+// Massive's websocket policies while iterating locally.
+const DEV_SYMBOLS: &[&str] = &["SPY"];
 
 /// Deployment target for the binary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -735,7 +735,17 @@ impl OptionQuoteInner {
                     SlotKind::Trade(TradeSlotKind::OptionAggressor),
                     SlotKind::Trade(TradeSlotKind::OptionQuote),
                 ] {
-                    ensure_slot_pending(&self.ledger, &key, slot)?;
+                    let status = ensure_slot_pending(&self.ledger, &key, slot)?;
+                    if slot == SlotKind::Trade(TradeSlotKind::OptionQuote)
+                        && status == SlotStatus::Filled
+                    {
+                        self.ledger
+                            .clear_slot(&key.symbol, key.window_idx, slot)
+                            .map_err(FlatfileError::from)?;
+                        self.ledger
+                            .mark_pending(&key.symbol, key.window_idx, slot)
+                            .map_err(FlatfileError::from)?;
+                    }
                 }
             }
         }
@@ -2861,7 +2871,17 @@ fn day_requires_ingest(
         return true;
     };
     match slot_needs_ingest(ledger, slot, start_idx, end_idx) {
-        Ok(needs) => needs,
+        Ok(needs) => {
+            if needs {
+                true
+            } else if slot == TradeSlotKind::OptionQuote
+                && day_contains_ws_option_quotes(ledger, start_idx, end_idx)
+            {
+                true
+            } else {
+                false
+            }
+        }
         Err(err) => {
             warn!(
                 "failed to evaluate coverage for {}: {}; scheduling ingestion",
@@ -2896,6 +2916,45 @@ fn slot_needs_ingest(
     Ok(false)
 }
 
+fn day_contains_ws_option_quotes(
+    ledger: &WindowSpaceController,
+    start_idx: WindowIndex,
+    end_idx: WindowIndex,
+) -> bool {
+    let symbols = ledger.symbols();
+    if symbols.is_empty() {
+        return false;
+    }
+    let trade_space = ledger.trade_window_space();
+    let mut payload_ids = Vec::new();
+    for (symbol_id, _) in symbols {
+        let result = trade_space.with_symbol_rows(symbol_id, |rows| {
+            collect_option_quote_payloads(rows, start_idx, end_idx)
+        });
+        match result {
+            Ok(mut ids) => payload_ids.append(&mut ids),
+            Err(err) => {
+                warn!(
+                    "failed to inspect option quote coverage for symbol {}: {}; scheduling ingestion",
+                    symbol_id, err
+                );
+                return true;
+            }
+        }
+    }
+    if payload_ids.is_empty() {
+        return false;
+    }
+    let stores = ledger.payload_stores();
+    payload_ids.into_iter().any(|payload_id| {
+        stores
+            .quotes
+            .get(payload_id)
+            .map(|payload| payload.artifact_uri.starts_with("trade-ws/"))
+            .unwrap_or(false)
+    })
+}
+
 fn has_incomplete_slot(
     rows: &[TradeWindowRow],
     slot: TradeSlotKind,
@@ -2918,6 +2977,30 @@ fn has_incomplete_slot(
         }
     }
     false
+}
+
+fn collect_option_quote_payloads(
+    rows: &[TradeWindowRow],
+    start_idx: WindowIndex,
+    end_idx: WindowIndex,
+) -> Vec<u32> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut ids = Vec::new();
+    let start = start_idx.min(end_idx) as usize;
+    let end = end_idx.max(start_idx) as usize;
+    if start >= rows.len() {
+        return ids;
+    }
+    let upper = end.min(rows.len() - 1);
+    for idx in start..=upper {
+        let slot = &rows[idx].option_quote_ref;
+        if slot.status == SlotStatus::Filled && slot.payload_id != 0 {
+            ids.push(slot.payload_id);
+        }
+    }
+    ids
 }
 
 fn window_start_ns(

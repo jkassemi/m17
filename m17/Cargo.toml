@@ -11,6 +11,8 @@ nbbo-engine = { path = "../nbbo-engine" }
 gc-engine = { path = "../gc-engine" }
 treasury-engine = { path = "../treasury-engine" }
 trade-ws-engine = { path = "../trade-ws-engine" }
+greeks-engine = { path = "../greeks-engine" }
+nbbo-cache = { path = "../nbbo-cache" }
 aggregations = { path = "../aggregations" }
 thiserror = "1"
 time = { version = "0.3", default-features = false, features = ["alloc", "formatting", "parsing"] }

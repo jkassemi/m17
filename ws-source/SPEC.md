@@ -16,7 +16,7 @@ The ws-source module handles WebSocket ingestion for real-time data from Massive
 ## Detailed API Contracts
 ### Structs and Enums
 - `pub struct WsWorker { url: Url, shard_id: usize, resource_type: ResourceType }`
-  - `resource_type`: Enum { OptionsQuotes, OptionsTrades, EquityQuotes, EquityTrades }
+  - `resource_type`: Enum { OptionsQuotes, OptionsTrades, OptionsTradesAndQuotes, EquityQuotes, EquityTrades, EquityTradesAndQuotes }
 - `pub struct SubscriptionScheduler { top_n: usize, exploration_fraction: f64, rebalance_interval_s: u64, hysteresis: f64, priorities: HashMap<String, f64> }`
   - Methods:
     - `fn new(config: &SchedulerConfig) -> Self`

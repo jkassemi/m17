@@ -103,6 +103,14 @@ for path in sorted(base.iterdir()):
 PY
 ```
 
+### 2025-11-14 diagnostics lessons
+
+- Windowspace rows are minute-long windows; trade writers only advance one row per minute per symbol, so seeing ~7 setter calls after a 7-minute capture is normal while websocket counters climb much faster.
+- RF slots backfill historical minutes immediately, which is why `windowspace_set_calls{slot="rf_rate"}` can be in the thousands even when other slots are just starting from “now”.
+- Option trades and quotes intentionally collapse into their underlying’s column/Arrow file, so the windowspace symbol count can stay at one (e.g., SPY) even while hundreds of contracts are subscribed.
+- Greeks must emit rows before aggregation can ever fill; if the `greeks` enrichment slot is 100 % empty in diagnostics, fix that engine first and aggregation will follow.
+- The textual “Trade slot diagnostics” / RF summary in `windowspace_diag` can currently lag the Prometheus gauges; rely on the gauge block for real counts until the formatter is updated.
+
 ## Notes
 
 Why I question the mid:

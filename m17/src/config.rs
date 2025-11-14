@@ -102,7 +102,7 @@ impl FlatfileSettings {
             endpoint: "https://files.massive.com",
             region: "custom",
             date_ranges: vec![DateRange {
-                start_ts: "2025-11-03T00:00:00Z".to_string(),
+                start_ts: "2025-11-10T00:00:00Z".to_string(),
                 end_ts: None,
             }],
             batch_size: 2000,
@@ -133,16 +133,14 @@ fn session_windows(env: Environment) -> WindowSpace {
     let base = WindowRangeConfig::default();
     match env {
         Environment::Dev => {
-            let start = date!(2025 - 11 - 01);
-            let end = date!(2025 - 11 - 30);
-            let windows_per_session = (base.session_windows / 10).max(1);
-            let ten_min_window_secs: u32 = 10 * 60;
+            let start = date!(2025 - 11 - 10);
+            let end = date!(2025 - 11 - 20);
             WindowSpace::from_bounds(
                 start,
                 end,
                 base.session_open,
-                windows_per_session,
-                ten_min_window_secs,
+                base.session_windows,
+                base.window_duration_secs,
                 base.schema_version,
             )
         }

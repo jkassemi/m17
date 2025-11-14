@@ -313,6 +313,24 @@ impl WindowSpaceController {
         })
     }
 
+    pub fn mark_retire_slot(
+        &self,
+        symbol: &str,
+        window_idx: WindowIndex,
+        slot: SlotKind,
+    ) -> Result<Slot> {
+        let symbol_id = self.resolve_symbol(symbol)?;
+        let slot_meta = match slot {
+            SlotKind::Trade(kind) => self
+                .trade_window_space
+                .mark_retire(symbol_id, window_idx, kind)?,
+            SlotKind::Enrichment(kind) => self
+                .enrichment_window_space
+                .mark_retire(symbol_id, window_idx, kind)?,
+        };
+        Ok(slot_meta)
+    }
+
     pub fn clear_slot(
         &self,
         symbol: &str,
@@ -345,42 +363,6 @@ impl WindowSpaceController {
             SlotKind::Enrichment(kind) => self
                 .enrichment_window_space
                 .mark_retired(symbol_id, window_idx, kind)?,
-        };
-        Ok(slot_meta)
-    }
-
-    pub fn mark_prune(
-        &self,
-        symbol: &str,
-        window_idx: WindowIndex,
-        slot: SlotKind,
-    ) -> Result<Slot> {
-        let symbol_id = self.resolve_symbol(symbol)?;
-        let slot_meta = match slot {
-            SlotKind::Trade(kind) => self
-                .trade_window_space
-                .mark_prune(symbol_id, window_idx, kind)?,
-            SlotKind::Enrichment(kind) => self
-                .enrichment_window_space
-                .mark_prune(symbol_id, window_idx, kind)?,
-        };
-        Ok(slot_meta)
-    }
-
-    pub fn mark_pruned(
-        &self,
-        symbol: &str,
-        window_idx: WindowIndex,
-        slot: SlotKind,
-    ) -> Result<Slot> {
-        let symbol_id = self.resolve_symbol(symbol)?;
-        let slot_meta = match slot {
-            SlotKind::Trade(kind) => self
-                .trade_window_space
-                .mark_pruned(symbol_id, window_idx, kind)?,
-            SlotKind::Enrichment(kind) => self
-                .enrichment_window_space
-                .mark_pruned(symbol_id, window_idx, kind)?,
         };
         Ok(slot_meta)
     }
@@ -529,9 +511,8 @@ pub struct SlotStatusCounts {
     pub pending: usize,
     pub filled: usize,
     pub cleared: usize,
+    pub retire: usize,
     pub retired: usize,
-    pub prune: usize,
-    pub pruned: usize,
 }
 
 impl SlotStatusCounts {
@@ -541,20 +522,13 @@ impl SlotStatusCounts {
             SlotStatus::Pending => self.pending += 1,
             SlotStatus::Filled => self.filled += 1,
             SlotStatus::Cleared => self.cleared += 1,
+            SlotStatus::Retire => self.retire += 1,
             SlotStatus::Retired => self.retired += 1,
-            SlotStatus::Prune => self.prune += 1,
-            SlotStatus::Pruned => self.pruned += 1,
         }
     }
 
     pub fn total(&self) -> usize {
-        self.empty
-            + self.pending
-            + self.filled
-            + self.cleared
-            + self.retired
-            + self.prune
-            + self.pruned
+        self.empty + self.pending + self.filled + self.cleared + self.retire + self.retired
     }
 
     pub fn is_zero(&self) -> bool {
@@ -566,14 +540,8 @@ impl fmt::Display for SlotStatusCounts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "empty={}, pending={}, filled={}, cleared={}, retired={}, prune={}, pruned={}",
-            self.empty,
-            self.pending,
-            self.filled,
-            self.cleared,
-            self.retired,
-            self.prune,
-            self.pruned
+            "empty={}, pending={}, filled={}, cleared={}, retire={}, retired={}",
+            self.empty, self.pending, self.filled, self.cleared, self.retire, self.retired
         )
     }
 }

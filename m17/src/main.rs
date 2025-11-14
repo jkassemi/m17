@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use config::{AppConfig, ConfigError, Environment};
 use core_types::{config::DateRange, types::ClassParams};
 use engine_api::{Engine, EngineError};
+use gc_engine::{GcEngine, GcEngineConfig};
 use log::{LevelFilter, Log, Metadata, Record};
 use metrics::MetricsServer;
 use nbbo_engine::{
@@ -98,6 +99,13 @@ fn run() -> Result<(), AppError> {
         default_class_params(),
         Arc::clone(&aggressor_metrics),
     );
+    let gc_engine = GcEngine::new(
+        GcEngineConfig {
+            label: config.env_label().to_string(),
+            ..Default::default()
+        },
+        controller.clone(),
+    );
 
     println!(
         "m17 orchestrator booted in {:?} mode; window space state at {:?}",
@@ -138,12 +146,14 @@ fn run() -> Result<(), AppError> {
     underlying_quote_engine.start()?;
     option_aggressor_engine.start()?;
     underlying_aggressor_engine.start()?;
+    gc_engine.start()?;
     log_engine_health("option-trade-flatfile", &option_trade_engine);
     log_engine_health("option-quote-flatfile", &option_quote_engine);
     log_engine_health("underlying-trade-flatfile", &underlying_trade_engine);
     log_engine_health("underlying-quote-flatfile", &underlying_quote_engine);
     log_engine_health("option-aggressor", &option_aggressor_engine);
     log_engine_health("underlying-aggressor", &underlying_aggressor_engine);
+    log_engine_health("gc-engine", &gc_engine);
     println!("Flatfile engines are running; press Ctrl+C to shut down.");
     let metrics_server = MetricsServer::start(
         controller.slot_metrics(),
@@ -156,6 +166,7 @@ fn run() -> Result<(), AppError> {
     println!("Shutdown signal received; stopping flatfile engines...");
     underlying_aggressor_engine.stop()?;
     option_aggressor_engine.stop()?;
+    gc_engine.stop()?;
     underlying_quote_engine.stop()?;
     underlying_trade_engine.stop()?;
     option_quote_engine.stop()?;

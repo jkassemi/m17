@@ -307,6 +307,9 @@ impl MetricsExporter {
                 .with_label_values(&[kind_label, slot_label, "cleared"])
                 .set(slot.counts.cleared as i64);
             self.slot_gauge
+                .with_label_values(&[kind_label, slot_label, "retire"])
+                .set(slot.counts.retire as i64);
+            self.slot_gauge
                 .with_label_values(&[kind_label, slot_label, "retired"])
                 .set(slot.counts.retired as i64);
         }

@@ -1,0 +1,10 @@
+[package]
+name = "gc-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+engine-api = { path = "../engine-api" }
+window-space = { path = "../window-space" }
+log = "0.4"
+thiserror = "1"

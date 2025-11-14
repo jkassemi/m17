@@ -42,7 +42,7 @@ Note: The 10K cap is more than appropriate given the scope of this project. We'l
 
   Slot {
       payload_type: u8,   // enum identifying which mapping file owns the payload
-      status: SlotStatus, // u8: Empty | Pending | Filled | Cleared | Prune | Pruned
+      status: SlotStatus, // u8: Empty | Pending | Filled | Cleared | Retire | Retired
       payload_id: u32,    // index into that mapping file (0 = empty)
       version: u32,
       checksum: u32,
@@ -55,8 +55,8 @@ Note: The 10K cap is more than appropriate given the scope of this project. We'l
 - Enrichment ledger rows carry seven slots: `greeks_ref`, `aggs_1m`, `aggs_5m`, `aggs_10m`, `aggs_30m`, `aggs_1h`, `aggs_4h`.
 - Empty slot means `status == Empty` and `payload_id == 0`; clearing a ref resets the struct to zeroed bytes and bumps `last_updated_ns`.
 - Slots contain only lightweight metadata (type/id/version/checksum). Payload content lives in type-specific mapping files explained below.
-- `Prune` slot means artifact can be safely removed.
-- `Pruned` slot means artifact was safely removed by GC service.
+- `Retire` slot means artifact can be safely removed.
+- `Retired` slot means artifact was safely removed by GC service.
 
 ### Payload Indirection & Mapping Tables
 
@@ -149,7 +149,7 @@ Each engine owns a focused scope, exposes a shared `Engine` trait (`start(ctx)`,
 ### `nbbo-engine`
 
 - Inputs: `TradeWindowSpace` view (trade+quote refs) plus write access to `option_aggressor_ref` slots.
-- Behavior: scan windows where both trade and quote refs are `Filled`, compute aggressor/NBBO payloads, append `AggressorPayload`, and store references. Retries when dependencies clear. After writing quotes, set quote refs to `Prune`.
+- Behavior: scan windows where both trade and quote refs are `Filled`, compute aggressor/NBBO payloads, append `AggressorPayload`, and store references. Retries when dependencies clear. After writing quotes, set quote refs to `Retire`.
 - Outputs: aggressor payload IDs, slot updates, dependency lag metrics.
 
 ### `greeks-engine`
@@ -360,7 +360,7 @@ _Future_: split NBBO/aggressor writers into `OptionAggressorEngine` and `Underly
 
 #### gc-engine
 
-- [ ] Build worker that scans all slots for `Prune` windows, and executes a routine in `nbbo-engine` to remove the underlying artifact. Updates `Prune` windows to `Pruned` when complete.
+- [ ] Build worker that scans all slots for `Retire` windows, and executes a routine in `nbbo-engine` to remove the underlying artifact. Updates `Retire` windows to `Retired` when complete.
 
 ### Priority Region Integration
 
@@ -370,7 +370,7 @@ _Future_: split NBBO/aggressor writers into `OptionAggressorEngine` and `Underly
 
 ### Cleanup & Optimization
 
-- [ ] Build GC - remove refs in Prune, update to Pruned.
+- [ ] Build GC - remove refs in Retire, update to Retired.
 - [ ] Tune snapshot cadence, consider sharding, implement head eviction when stable.
 - [ ] Build repair tooling (bulk `clear_*` plus range refill helpers) for ops ergonomics.
 

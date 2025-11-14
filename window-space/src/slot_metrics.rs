@@ -152,9 +152,8 @@ pub struct SlotStateSnapshot {
     pub pending: u64,
     pub filled: u64,
     pub cleared: u64,
+    pub retire: u64,
     pub retired: u64,
-    pub prune: u64,
-    pub pruned: u64,
 }
 
 impl SlotStateSnapshot {
@@ -164,9 +163,8 @@ impl SlotStateSnapshot {
             SlotStatus::Pending => self.pending += delta,
             SlotStatus::Filled => self.filled += delta,
             SlotStatus::Cleared => self.cleared += delta,
+            SlotStatus::Retire => self.retire += delta,
             SlotStatus::Retired => self.retired += delta,
-            SlotStatus::Prune => self.prune += delta,
-            SlotStatus::Pruned => self.pruned += delta,
         }
     }
 }
@@ -176,9 +174,8 @@ struct SlotStateCounter {
     pending: AtomicU64,
     filled: AtomicU64,
     cleared: AtomicU64,
+    retire: AtomicU64,
     retired: AtomicU64,
-    prune: AtomicU64,
-    pruned: AtomicU64,
 }
 
 impl SlotStateCounter {
@@ -188,9 +185,8 @@ impl SlotStateCounter {
             pending: AtomicU64::new(0),
             filled: AtomicU64::new(0),
             cleared: AtomicU64::new(0),
+            retire: AtomicU64::new(0),
             retired: AtomicU64::new(0),
-            prune: AtomicU64::new(0),
-            pruned: AtomicU64::new(0),
         }
     }
 
@@ -208,14 +204,11 @@ impl SlotStateCounter {
             SlotStatus::Cleared => {
                 self.cleared.fetch_add(delta, Ordering::Relaxed);
             }
+            SlotStatus::Retire => {
+                self.retire.fetch_add(delta, Ordering::Relaxed);
+            }
             SlotStatus::Retired => {
                 self.retired.fetch_add(delta, Ordering::Relaxed);
-            }
-            SlotStatus::Prune => {
-                self.prune.fetch_add(delta, Ordering::Relaxed);
-            }
-            SlotStatus::Pruned => {
-                self.pruned.fetch_add(delta, Ordering::Relaxed);
             }
         }
     }
@@ -234,14 +227,11 @@ impl SlotStateCounter {
             SlotStatus::Cleared => {
                 self.cleared.fetch_sub(delta, Ordering::Relaxed);
             }
+            SlotStatus::Retire => {
+                self.retire.fetch_sub(delta, Ordering::Relaxed);
+            }
             SlotStatus::Retired => {
                 self.retired.fetch_sub(delta, Ordering::Relaxed);
-            }
-            SlotStatus::Prune => {
-                self.prune.fetch_sub(delta, Ordering::Relaxed);
-            }
-            SlotStatus::Pruned => {
-                self.pruned.fetch_sub(delta, Ordering::Relaxed);
             }
         }
     }
@@ -252,9 +242,8 @@ impl SlotStateCounter {
             pending: self.pending.load(Ordering::Relaxed),
             filled: self.filled.load(Ordering::Relaxed),
             cleared: self.cleared.load(Ordering::Relaxed),
+            retire: self.retire.load(Ordering::Relaxed),
             retired: self.retired.load(Ordering::Relaxed),
-            prune: self.prune.load(Ordering::Relaxed),
-            pruned: self.pruned.load(Ordering::Relaxed),
         }
     }
 
@@ -263,8 +252,7 @@ impl SlotStateCounter {
         self.pending.store(snapshot.pending, Ordering::Relaxed);
         self.filled.store(snapshot.filled, Ordering::Relaxed);
         self.cleared.store(snapshot.cleared, Ordering::Relaxed);
+        self.retire.store(snapshot.retire, Ordering::Relaxed);
         self.retired.store(snapshot.retired, Ordering::Relaxed);
-        self.prune.store(snapshot.prune, Ordering::Relaxed);
-        self.pruned.store(snapshot.pruned, Ordering::Relaxed);
     }
 }

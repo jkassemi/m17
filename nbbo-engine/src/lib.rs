@@ -429,7 +429,7 @@ impl AggressorInner {
                 return Err(err.into());
             }
         } else {
-            self.controller.mark_prune(
+            self.controller.mark_retire_slot(
                 &work.symbol,
                 work.window_idx,
                 SlotKind::Trade(self.kind.quote_slot_kind()),
@@ -556,7 +556,7 @@ impl AggressorInner {
 fn is_filled(slot: &Slot) -> bool {
     matches!(
         slot.status,
-        SlotStatus::Filled | SlotStatus::Retired | SlotStatus::Prune | SlotStatus::Pruned
+        SlotStatus::Filled | SlotStatus::Retire | SlotStatus::Retired
     )
 }
 

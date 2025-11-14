@@ -9,7 +9,7 @@ pub use download_metrics::{DownloadMetrics, DownloadSnapshot};
 
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     pin::Pin,
     sync::{
         Arc,
@@ -234,10 +234,12 @@ impl OptionTradeInner {
     where
         R: AsyncRead + Unpin + Send,
     {
-        let buf = BufReader::new(reader);
-        let mut csv_reader = AsyncReaderBuilder::new().trim(Trim::All).create_reader(buf);
+        let mut csv_reader = AsyncReaderBuilder::new()
+            .trim(Trim::All)
+            .create_reader(reader);
         let mut records = csv_reader.records();
-        let mut tracker = SymbolTracker::new();
+        let mut buckets: HashMap<String, BTreeMap<WindowIndex, SymbolWindow<OptionTradeRecord>>> =
+            HashMap::new();
         let mut processed_rows = 0usize;
         let mut last_progress = Instant::now();
         let interval = Duration::from_millis(self.config.progress_update_ms.max(10));
@@ -256,7 +258,7 @@ impl OptionTradeInner {
                     return Err(err.into());
                 }
             };
-            if record.len() < 8 {
+            if record.len() < 7 {
                 continue;
             }
             if let Some((_contract, trade)) = parse_option_trade_row(&record) {
@@ -273,28 +275,27 @@ impl OptionTradeInner {
                         continue;
                     }
                 };
-                tracker.with_bucket(
-                    symbol.as_str(),
-                    window_idx,
-                    |sym, idx| self.open_option_trade_window(date, sym, idx),
-                    |state| self.finalize_option_trade_state(date, state),
-                    |bucket_opt| {
-                        if let Some(bucket) = bucket_opt {
-                            if let Some(last_ts) = bucket.last_timestamp() {
-                                if ts < last_ts {
-                                    return Err(FlatfileError::TimestampRegression {
-                                        symbol: symbol.clone(),
-                                        window_idx,
-                                        last_ts,
-                                        ts,
-                                    });
-                                }
-                            }
-                            bucket.observe(trade);
+                let window_map = buckets.entry(symbol.clone()).or_insert_with(BTreeMap::new);
+                let state = match window_map.entry(window_idx) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(vacant) => {
+                        let state = self.open_option_trade_window(date, &symbol, window_idx)?;
+                        vacant.insert(state)
+                    }
+                };
+                if let Some(bucket) = state.bucket.as_mut() {
+                    if let Some(last_ts) = bucket.last_timestamp() {
+                        if ts < last_ts {
+                            return Err(FlatfileError::TimestampRegression {
+                                symbol: symbol.clone(),
+                                window_idx,
+                                last_ts,
+                                ts,
+                            });
                         }
-                        Ok(())
-                    },
-                )?;
+                    }
+                    bucket.observe(trade);
+                }
                 processed_rows += 1;
                 if self.config.progress_logging && last_progress.elapsed() >= interval {
                     info!(
@@ -312,7 +313,11 @@ impl OptionTradeInner {
             );
             return Ok(());
         }
-        tracker.finish(|state| self.finalize_option_trade_state(date, state))?;
+        for (_symbol, window_map) in buckets {
+            for (_, state) in window_map {
+                self.finalize_option_trade_state(date, state)?;
+            }
+        }
         Ok(())
     }
 
@@ -535,8 +540,9 @@ impl OptionQuoteInner {
     where
         R: AsyncRead + Unpin + Send,
     {
-        let buf = BufReader::new(reader);
-        let mut csv_reader = AsyncReaderBuilder::new().trim(Trim::All).create_reader(buf);
+        let mut csv_reader = AsyncReaderBuilder::new()
+            .trim(Trim::All)
+            .create_reader(reader);
         let mut records = csv_reader.records();
         let mut tracker = SymbolTracker::new();
         let mut processed_rows = 0usize;
@@ -569,13 +575,14 @@ impl OptionQuoteInner {
                 if !self.config.allows_underlying(&base) {
                     continue;
                 }
+                let symbol = base;
                 let ts = quote.timestamp_ns();
                 let window_idx = match self.window_idx_for_timestamp(ts) {
                     Some(idx) => idx,
                     None => continue,
                 };
                 tracker.with_bucket(
-                    &base,
+                    symbol.as_str(),
                     window_idx,
                     |sym, idx| self.open_option_quote_window(date, sym, idx),
                     |state| self.finalize_option_quote_state(date, state),
@@ -841,8 +848,9 @@ impl UnderlyingTradeInner {
     where
         R: AsyncRead + Unpin + Send,
     {
-        let buf = BufReader::new(reader);
-        let mut csv_reader = AsyncReaderBuilder::new().trim(Trim::All).create_reader(buf);
+        let mut csv_reader = AsyncReaderBuilder::new()
+            .trim(Trim::All)
+            .create_reader(reader);
         let mut records = csv_reader.records();
         let mut tracker = SymbolTracker::new();
         let mut processed_rows = 0usize;
@@ -1142,8 +1150,9 @@ impl UnderlyingQuoteInner {
     where
         R: AsyncRead + Unpin + Send,
     {
-        let buf = BufReader::new(reader);
-        let mut csv_reader = AsyncReaderBuilder::new().trim(Trim::All).create_reader(buf);
+        let mut csv_reader = AsyncReaderBuilder::new()
+            .trim(Trim::All)
+            .create_reader(reader);
         let mut records = csv_reader.records();
         let mut tracker = SymbolTracker::new();
         let mut processed_rows = 0usize;
@@ -1530,19 +1539,21 @@ impl Drop for DownloadToken {
 }
 
 fn parse_option_trade_row(record: &csv_async::StringRecord) -> Option<(String, OptionTradeRecord)> {
+    if record.len() < 7 {
+        return None;
+    }
     let contract = record.get(0)?.to_string();
+    let trade_ts_ns = record.get(5)?.parse().unwrap_or(0);
     let (contract_direction, strike_price, expiry_ts_ns, underlying) =
-        parse_opra_contract(&contract, record.get(6).and_then(|s| s.parse::<i64>().ok()));
+        parse_opra_contract(&contract, Some(trade_ts_ns));
     let conditions = parse_conditions_field(record.get(1).unwrap_or_default());
     let exchange = record.get(3)?.parse().unwrap_or(0);
-    let participant_ts_ns = record.get(4).and_then(|s| s.parse::<i64>().ok());
-    let price = record.get(5)?.parse().unwrap_or(0.0);
-    let trade_ts_ns = record.get(6)?.parse().unwrap_or(0);
-    let size = record.get(7)?.parse().unwrap_or(0);
+    let price = record.get(4)?.parse().unwrap_or(0.0);
+    let size = record.get(6)?.parse().unwrap_or(0);
     let trade_uid = option_trade_uid(
         &contract,
         trade_ts_ns,
-        participant_ts_ns,
+        None,
         price,
         size,
         exchange,
@@ -1555,7 +1566,7 @@ fn parse_option_trade_row(record: &csv_async::StringRecord) -> Option<(String, O
         strike_price,
         underlying,
         trade_ts_ns,
-        participant_ts_ns,
+        participant_ts_ns: None,
         price,
         size,
         conditions,
@@ -2052,6 +2063,7 @@ impl HasTimestamp for QuoteRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_types::config::DateRange;
     use futures::StreamExt;
     use tokio::fs::File;
 
@@ -2079,12 +2091,87 @@ mod tests {
         }
         assert!(!rows.is_empty(), "option trades fixture parsed rows");
         let first = &rows[0];
-        assert_eq!(first.contract, "O:SPY230327P00390000");
-        assert_eq!(first.price, 11.82);
+        assert_eq!(first.contract, "O:SPY251112C00675000");
+        assert_eq!(first.price, 9.87);
         assert_eq!(first.size, 1);
         assert_eq!(first.exchange, 312);
-        assert_eq!(first.contract_direction, 'P');
+        assert_eq!(first.contract_direction, 'C');
         assert_eq!(first.underlying, "SPY");
+        assert!(first.participant_ts_ns.is_none());
+    }
+
+    #[tokio::test]
+    async fn option_trades_fill_underlying_slot() {
+        use chrono::{NaiveDate, NaiveTime};
+        use std::{collections::HashSet, sync::Arc};
+        use tempfile::tempdir;
+        use time::macros::{date, time};
+        use window_space::{WindowSpace, WindowSpaceConfig};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("ledger");
+        let window_space = WindowSpace::from_bounds(
+            date!(2025 - 11 - 10),
+            date!(2025 - 11 - 20),
+            time!(14:30:00),
+            390,
+            60,
+            1,
+        );
+        let mut ws_config = WindowSpaceConfig::new(state_dir.clone(), window_space);
+        ws_config.max_symbols = 8;
+        let (controller, _) = WindowSpaceController::bootstrap(ws_config).unwrap();
+        let controller = Arc::new(controller);
+
+        let cfg = FlatfileRuntimeConfig {
+            label: "test",
+            state_dir: state_dir.clone(),
+            bucket: "dummy".to_string(),
+            endpoint: "http://localhost".to_string(),
+            region: "test".to_string(),
+            access_key_id: "key".to_string(),
+            secret_access_key: "secret".to_string(),
+            date_ranges: vec![DateRange {
+                start_ts: "2025-11-12T00:00:00Z".into(),
+                end_ts: None,
+            }],
+            batch_size: 1000,
+            progress_update_ms: 50,
+            progress_logging: false,
+            download_metrics: Arc::new(DownloadMetrics::new()),
+            symbol_universe: Some(Arc::new(HashSet::from(["SPY".to_string()]))),
+            next_day_ready_time: NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+            non_trading_ready_time: NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+            window_end: NaiveDate::from_ymd_opt(2025, 11, 13).unwrap(),
+        };
+        let inner = OptionTradeInner::new(cfg, Arc::clone(&controller));
+        let reader =
+            open_fixture("../flatfile-source/fixtures/options_trades_example.csv.gz").await;
+        inner
+            .consume_option_trades(
+                NaiveDate::from_ymd_opt(2025, 11, 12).unwrap(),
+                reader,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let trades_map =
+            std::fs::read_to_string(state_dir.join("trades.map")).expect("read trades map");
+        assert!(
+            trades_map.contains("options/trades"),
+            "expected options artifacts to be recorded"
+        );
+
+        let snapshot = controller.slot_status_snapshot().unwrap();
+        let trade_counts = snapshot
+            .trade
+            .get(&TradeSlotKind::OptionTrade)
+            .expect("option trade counts");
+        assert!(
+            trade_counts.filled > 0,
+            "expected option trade slot to fill"
+        );
     }
 
     #[tokio::test]
@@ -2411,7 +2498,9 @@ fn ensure_slot_pending(
             enrichment_slot_status(&row, kind)
         }
     };
-    ledger.mark_pending(&key.symbol, key.window_idx, slot)?;
+    if status != SlotStatus::Filled {
+        ledger.mark_pending(&key.symbol, key.window_idx, slot)?;
+    }
     Ok(status)
 }
 

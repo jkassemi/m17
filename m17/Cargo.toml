@@ -9,6 +9,7 @@ window-space = { path = "../window-space" }
 trade-flatfile-engine = { path = "../trade-flatfile-engine" }
 nbbo-engine = { path = "../nbbo-engine" }
 gc-engine = { path = "../gc-engine" }
+treasury-engine = { path = "../treasury-engine" }
 thiserror = "1"
 time = { version = "0.3", default-features = false, features = ["alloc", "formatting", "parsing"] }
 core-types = { path = "../core-types" }

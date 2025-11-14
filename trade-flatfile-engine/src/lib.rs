@@ -1570,7 +1570,7 @@ async fn fetch_stream(
     writer.flush().await?;
     drop(writer);
     let temp_path = temp_file.into_temp_path();
-    let file = TokioFile::open(temp_path.as_ref()).await?;
+    let file = TokioFile::open(&temp_path).await?;
     let buf = BufReader::new(file);
     let decoder = GzipDecoder::new(buf);
     let token =

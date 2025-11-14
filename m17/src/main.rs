@@ -24,9 +24,8 @@ use trade_flatfile_engine::{
     DownloadMetrics, FlatfileRuntimeConfig, OptionQuoteFlatfileEngine,
     UnderlyingQuoteFlatfileEngine, UnderlyingTradeFlatfileEngine,
 };
-use window_space::{
-    WindowSpace, WindowSpaceController, WindowSpaceError, WindowSpaceStorageReport,
-};
+use treasury_engine::{TreasuryEngine, TreasuryEngineConfig};
+use window_space::{WindowSpace, WindowSpaceController, WindowSpaceError, WindowSpaceStorageReport};
 
 const DEFAULT_CLASSIFIER_EPSILON: f64 = 1e-4;
 const DEFAULT_CLASSIFIER_LATENESS_MS: u32 = 1_000;
@@ -104,6 +103,18 @@ fn run() -> Result<(), AppError> {
         },
         controller.clone(),
     );
+    let prime_symbols = config
+        .symbol_universe
+        .as_ref()
+        .map(|set| set.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let treasury_cfg = TreasuryEngineConfig::new(
+        config.env_label(),
+        config.rest_base_url,
+        config.secrets.massive_api_key.clone(),
+    )
+    .with_prime_symbols(prime_symbols);
+    let treasury_engine = TreasuryEngine::new(treasury_cfg, controller.clone());
 
     println!(
         "m17 orchestrator booted in {:?} mode; window space state at {:?}",
@@ -138,12 +149,14 @@ fn run() -> Result<(), AppError> {
         describe_flatfile_ranges(&config.flatfile.date_ranges)
     );
 
+    treasury_engine.start()?;
     option_quote_engine.start()?;
     underlying_trade_engine.start()?;
     underlying_quote_engine.start()?;
     option_aggressor_engine.start()?;
     underlying_aggressor_engine.start()?;
     gc_engine.start()?;
+    log_engine_health("treasury", &treasury_engine);
     log_engine_health("option-quote-flatfile", &option_quote_engine);
     log_engine_health("underlying-trade-flatfile", &underlying_trade_engine);
     log_engine_health("underlying-quote-flatfile", &underlying_quote_engine);
@@ -159,13 +172,14 @@ fn run() -> Result<(), AppError> {
         config.metrics_addr,
     );
     wait_for_shutdown_signal()?;
-    println!("Shutdown signal received; stopping flatfile engines...");
+    println!("Shutdown signal received; stopping engines...");
     underlying_aggressor_engine.stop()?;
     option_aggressor_engine.stop()?;
     gc_engine.stop()?;
     underlying_quote_engine.stop()?;
     underlying_trade_engine.stop()?;
     option_quote_engine.stop()?;
+    treasury_engine.stop()?;
     metrics_server.shutdown();
 
     // Keep controller alive for the lifetime of engines.

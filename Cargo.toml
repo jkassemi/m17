@@ -22,4 +22,5 @@ members = [
   "greeks-engine",
   "greeks-enrichment-service",
   "window-space", "m17", "engine-api", "trade-flatfile-engine", "nbbo-engine", "gc-engine",
+  "treasury-engine",
 ]

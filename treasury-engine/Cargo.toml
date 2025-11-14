@@ -1,0 +1,21 @@
+[package]
+name = "treasury-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+engine-api = { path = "../engine-api" }
+window-space = { path = "../window-space" }
+log = "0.4"
+chrono = { version = "0.4", features = ["clock"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+thiserror = "1"
+crc32fast = "1"
+parking_lot = "0.12"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3.10"

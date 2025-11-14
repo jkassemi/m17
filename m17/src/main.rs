@@ -1,3 +1,4 @@
+mod aggregation;
 mod config;
 mod metrics;
 
@@ -5,17 +6,22 @@ use std::{
     collections::HashSet,
     env, process,
     str::FromStr,
-    sync::{Arc, Once, mpsc},
+    sync::{
+        Arc, Once,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 
-use chrono::{DateTime, Utc};
+use aggregation::AggregationService;
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use config::{AppConfig, ConfigError, Environment};
 use core_types::{config::DateRange, types::ClassParams};
 use engine_api::{Engine, EngineError};
 use gc_engine::{GcEngine, GcEngineConfig};
 use log::{LevelFilter, Log, Metadata, Record};
-use metrics::MetricsServer;
+use metrics::{EngineStatusRegistry, MetricsServer};
 use nbbo_engine::{
     AggressorEngineConfig, AggressorMetrics, OptionAggressorEngine, UnderlyingAggressorEngine,
 };
@@ -25,7 +31,8 @@ use trade_flatfile_engine::{
     DownloadMetrics, FlatfileRuntimeConfig, OptionQuoteFlatfileEngine,
     UnderlyingQuoteFlatfileEngine, UnderlyingTradeFlatfileEngine,
 };
-use trade_ws_engine::{TradeWsConfig, TradeWsEngine};
+use trade_ws_engine::{TradeWsConfig, TradeWsEngine, TradeWsMetrics};
+use trading_calendar::{Market, TradingCalendar};
 use treasury_engine::{TreasuryEngine, TreasuryEngineConfig};
 use window_space::{
     WindowSpace, WindowSpaceController, WindowSpaceError, WindowSpaceStorageReport,
@@ -33,6 +40,26 @@ use window_space::{
 
 const DEFAULT_CLASSIFIER_EPSILON: f64 = 1e-4;
 const DEFAULT_CLASSIFIER_LATENESS_MS: u32 = 1_000;
+
+const ENGINE_TREASURY: &str = "treasury_engine";
+const ENGINE_TRADE_WS: &str = "trade_ws_engine";
+const ENGINE_OPTION_QUOTE: &str = "option_quote_flatfile";
+const ENGINE_UNDERLYING_TRADE: &str = "underlying_trade_flatfile";
+const ENGINE_UNDERLYING_QUOTE: &str = "underlying_quote_flatfile";
+const ENGINE_OPTION_AGGRESSOR: &str = "option_aggressor_engine";
+const ENGINE_UNDERLYING_AGGRESSOR: &str = "underlying_aggressor_engine";
+const ENGINE_GC: &str = "gc_engine";
+
+const ENGINE_LABELS: &[&str] = &[
+    ENGINE_TREASURY,
+    ENGINE_TRADE_WS,
+    ENGINE_OPTION_QUOTE,
+    ENGINE_UNDERLYING_TRADE,
+    ENGINE_UNDERLYING_QUOTE,
+    ENGINE_OPTION_AGGRESSOR,
+    ENGINE_UNDERLYING_AGGRESSOR,
+    ENGINE_GC,
+];
 
 fn main() {
     init_logger();
@@ -63,6 +90,11 @@ fn run() -> Result<(), AppError> {
         .unwrap_or_else(|| Utc::now().date_naive());
     let download_metrics = Arc::new(DownloadMetrics::new());
     let aggressor_metrics = Arc::new(AggressorMetrics::new());
+    let trade_ws_metrics = Arc::new(TradeWsMetrics::new());
+    let engine_status = Arc::new(EngineStatusRegistry::default());
+    for label in ENGINE_LABELS {
+        engine_status.mark_stopped(label);
+    }
     let flatfile_cfg = FlatfileRuntimeConfig {
         label: config.env_label(),
         state_dir: config.ledger.state_dir().to_path_buf(),
@@ -81,12 +113,18 @@ fn run() -> Result<(), AppError> {
         non_trading_ready_time: config.flatfile.non_trading_ready_time,
         window_end,
     };
-    let option_quote_engine =
-        OptionQuoteFlatfileEngine::new(flatfile_cfg.clone(), controller.clone());
-    let underlying_trade_engine =
-        UnderlyingTradeFlatfileEngine::new(flatfile_cfg.clone(), controller.clone());
-    let underlying_quote_engine =
-        UnderlyingQuoteFlatfileEngine::new(flatfile_cfg.clone(), controller.clone());
+    let option_quote_engine = Arc::new(OptionQuoteFlatfileEngine::new(
+        flatfile_cfg.clone(),
+        controller.clone(),
+    ));
+    let underlying_trade_engine = Arc::new(UnderlyingTradeFlatfileEngine::new(
+        flatfile_cfg.clone(),
+        controller.clone(),
+    ));
+    let underlying_quote_engine = Arc::new(UnderlyingQuoteFlatfileEngine::new(
+        flatfile_cfg.clone(),
+        controller.clone(),
+    ));
     let aggressor_cfg = AggressorEngineConfig::for_label(config.env_label());
     let option_aggressor_engine = OptionAggressorEngine::new(
         aggressor_cfg.clone(),
@@ -114,7 +152,7 @@ fn run() -> Result<(), AppError> {
         .unwrap_or_default();
     let treasury_cfg = TreasuryEngineConfig::new(
         config.env_label(),
-        config.rest_base_url,
+        config.rest_base_url.clone(),
         config.secrets.massive_api_key.clone(),
     )
     .with_prime_symbols(prime_symbols);
@@ -122,9 +160,10 @@ fn run() -> Result<(), AppError> {
     let trade_ws_cfg = TradeWsConfig {
         label: config.env_label().to_string(),
         state_dir: config.ledger.state_dir().to_path_buf(),
-        options_ws_url: config.options_ws_url.to_string(),
+        options_ws_url: config.options_ws_url.clone(),
+        stocks_ws_url: config.stocks_ws_url.clone(),
         api_key: config.secrets.massive_api_key.clone(),
-        rest_base_url: config.rest_base_url.to_string(),
+        rest_base_url: config.rest_base_url.clone(),
         contracts_per_underlying: 1_000,
         flush_interval: Duration::from_millis(1_000),
         window_grace: Duration::from_millis(2_000),
@@ -135,7 +174,11 @@ fn run() -> Result<(), AppError> {
             Some(set)
         },
     };
-    let trade_ws_engine = TradeWsEngine::new(trade_ws_cfg, controller.clone());
+    let trade_ws_engine = TradeWsEngine::new(
+        trade_ws_cfg,
+        controller.clone(),
+        Arc::clone(&trade_ws_metrics),
+    );
 
     println!(
         "m17 orchestrator booted in {:?} mode; window space state at {:?}",
@@ -170,40 +213,91 @@ fn run() -> Result<(), AppError> {
         describe_flatfile_ranges(&config.flatfile.date_ranges)
     );
 
-    treasury_engine.start()?;
-    trade_ws_engine.start()?;
-    option_quote_engine.start()?;
-    underlying_trade_engine.start()?;
-    underlying_quote_engine.start()?;
-    option_aggressor_engine.start()?;
-    underlying_aggressor_engine.start()?;
-    gc_engine.start()?;
+    start_engine_if_stopped(&treasury_engine, ENGINE_TREASURY, engine_status.as_ref())?;
+    start_engine_if_stopped(&trade_ws_engine, ENGINE_TRADE_WS, engine_status.as_ref())?;
+    start_engine_if_stopped(
+        &*option_quote_engine,
+        ENGINE_OPTION_QUOTE,
+        engine_status.as_ref(),
+    )?;
+    start_engine_if_stopped(
+        &*underlying_trade_engine,
+        ENGINE_UNDERLYING_TRADE,
+        engine_status.as_ref(),
+    )?;
+    start_engine_if_stopped(
+        &*underlying_quote_engine,
+        ENGINE_UNDERLYING_QUOTE,
+        engine_status.as_ref(),
+    )?;
+    start_engine_if_stopped(
+        &option_aggressor_engine,
+        ENGINE_OPTION_AGGRESSOR,
+        engine_status.as_ref(),
+    )?;
+    start_engine_if_stopped(
+        &underlying_aggressor_engine,
+        ENGINE_UNDERLYING_AGGRESSOR,
+        engine_status.as_ref(),
+    )?;
+    start_engine_if_stopped(&gc_engine, ENGINE_GC, engine_status.as_ref())?;
     log_engine_health("treasury", &treasury_engine);
     log_engine_health("options-ws-trade", &trade_ws_engine);
-    log_engine_health("option-quote-flatfile", &option_quote_engine);
-    log_engine_health("underlying-trade-flatfile", &underlying_trade_engine);
-    log_engine_health("underlying-quote-flatfile", &underlying_quote_engine);
+    log_engine_health("option-quote-flatfile", &*option_quote_engine);
+    log_engine_health("underlying-trade-flatfile", &*underlying_trade_engine);
+    log_engine_health("underlying-quote-flatfile", &*underlying_quote_engine);
     log_engine_health("option-aggressor", &option_aggressor_engine);
     log_engine_health("underlying-aggressor", &underlying_aggressor_engine);
     log_engine_health("gc-engine", &gc_engine);
     println!("Flatfile engines are running; press Ctrl+C to shut down.");
+    let _flatfile_guard = spawn_flatfile_schedule_guard(
+        Arc::clone(&option_quote_engine),
+        Arc::clone(&underlying_trade_engine),
+        Arc::clone(&underlying_quote_engine),
+        Arc::clone(&engine_status),
+    );
+    let aggregation_service =
+        AggregationService::start(Arc::clone(&controller), config.ws_target_symbol);
     let metrics_server = MetricsServer::start(
         controller.slot_metrics(),
         download_metrics,
         Arc::clone(&controller),
         aggressor_metrics,
+        trade_ws_metrics,
+        Arc::clone(&engine_status),
         config.metrics_addr,
     );
     wait_for_shutdown_signal()?;
     println!("Shutdown signal received; stopping engines...");
-    underlying_aggressor_engine.stop()?;
-    option_aggressor_engine.stop()?;
-    gc_engine.stop()?;
-    underlying_quote_engine.stop()?;
-    underlying_trade_engine.stop()?;
-    option_quote_engine.stop()?;
-    treasury_engine.stop()?;
-    trade_ws_engine.stop()?;
+    stop_engine_if_running(
+        &underlying_aggressor_engine,
+        ENGINE_UNDERLYING_AGGRESSOR,
+        engine_status.as_ref(),
+    )?;
+    stop_engine_if_running(
+        &option_aggressor_engine,
+        ENGINE_OPTION_AGGRESSOR,
+        engine_status.as_ref(),
+    )?;
+    stop_engine_if_running(&gc_engine, ENGINE_GC, engine_status.as_ref())?;
+    stop_engine_if_running(
+        &*underlying_quote_engine,
+        ENGINE_UNDERLYING_QUOTE,
+        engine_status.as_ref(),
+    )?;
+    stop_engine_if_running(
+        &*underlying_trade_engine,
+        ENGINE_UNDERLYING_TRADE,
+        engine_status.as_ref(),
+    )?;
+    stop_engine_if_running(
+        &*option_quote_engine,
+        ENGINE_OPTION_QUOTE,
+        engine_status.as_ref(),
+    )?;
+    stop_engine_if_running(&treasury_engine, ENGINE_TREASURY, engine_status.as_ref())?;
+    stop_engine_if_running(&trade_ws_engine, ENGINE_TRADE_WS, engine_status.as_ref())?;
+    aggregation_service.shutdown();
     metrics_server.shutdown();
 
     // Keep controller alive for the lifetime of engines.
@@ -331,9 +425,17 @@ fn default_class_params() -> ClassParams {
 
 fn wait_for_shutdown_signal() -> Result<(), AppError> {
     let (tx, rx) = mpsc::channel();
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let handler_tx = tx.clone();
+    let handler_flag = Arc::clone(&shutdown_requested);
     ctrlc::set_handler(move || {
-        let _ = tx.send(());
+        if handler_flag.swap(true, Ordering::SeqCst) {
+            eprintln!("Second interrupt received; forcing shutdown");
+            process::exit(130);
+        }
+        let _ = handler_tx.send(());
     })?;
+    drop(tx);
     rx.recv()?;
     Ok(())
 }
@@ -341,6 +443,165 @@ fn wait_for_shutdown_signal() -> Result<(), AppError> {
 fn log_engine_health(label: &str, engine: &dyn Engine) {
     let health = engine.health();
     println!("{label} status: {:?} ({:?})", health.status, health.detail);
+}
+
+fn spawn_flatfile_schedule_guard(
+    option_engine: Arc<OptionQuoteFlatfileEngine>,
+    underlying_trade_engine: Arc<UnderlyingTradeFlatfileEngine>,
+    underlying_quote_engine: Arc<UnderlyingQuoteFlatfileEngine>,
+    engine_status: Arc<EngineStatusRegistry>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let calendar =
+            TradingCalendar::new(Market::NYSE).expect("init calendar for flatfile guard");
+        let tracker = engine_status.as_ref();
+        loop {
+            let now = Utc::now();
+            let Some((should_run, next_transition)) = desired_flatfile_state(&calendar, now) else {
+                log::warn!("flatfile guard missing schedule; sleeping 5 minutes");
+                std::thread::sleep(Duration::from_secs(300));
+                continue;
+            };
+            if should_run {
+                if let Err(err) =
+                    start_engine_if_stopped(&*option_engine, ENGINE_OPTION_QUOTE, tracker)
+                {
+                    log::error!("option quote flatfile start failed: {err}");
+                }
+                if let Err(err) = start_engine_if_stopped(
+                    &*underlying_trade_engine,
+                    ENGINE_UNDERLYING_TRADE,
+                    tracker,
+                ) {
+                    log::error!("underlying trade flatfile start failed: {err}");
+                }
+                if let Err(err) = start_engine_if_stopped(
+                    &*underlying_quote_engine,
+                    ENGINE_UNDERLYING_QUOTE,
+                    tracker,
+                ) {
+                    log::error!("underlying quote flatfile start failed: {err}");
+                }
+            } else {
+                if let Err(err) =
+                    stop_engine_if_running(&*option_engine, ENGINE_OPTION_QUOTE, tracker)
+                {
+                    log::error!("option quote flatfile stop failed: {err}");
+                }
+                if let Err(err) = stop_engine_if_running(
+                    &*underlying_trade_engine,
+                    ENGINE_UNDERLYING_TRADE,
+                    tracker,
+                ) {
+                    log::error!("underlying trade flatfile stop failed: {err}");
+                }
+                if let Err(err) = stop_engine_if_running(
+                    &*underlying_quote_engine,
+                    ENGINE_UNDERLYING_QUOTE,
+                    tracker,
+                ) {
+                    log::error!("underlying quote flatfile stop failed: {err}");
+                }
+            }
+            let wait = next_transition
+                .signed_duration_since(Utc::now())
+                .to_std()
+                .unwrap_or_else(|_| Duration::from_secs(5));
+            let capped = wait.min(Duration::from_secs(300));
+            std::thread::sleep(capped);
+        }
+    })
+}
+
+fn desired_flatfile_state(
+    calendar: &TradingCalendar,
+    now: DateTime<Utc>,
+) -> Option<(bool, DateTime<Utc>)> {
+    let tz = calendar.timezone();
+    let local_now = now.with_timezone(&tz);
+    let today = local_now.date_naive();
+    if let Some((cutoff, close)) = market_window(calendar, today) {
+        if now < cutoff {
+            return Some((true, cutoff));
+        }
+        if now < close {
+            return Some((false, close));
+        }
+        let next_day = calendar.next_trading_day(today);
+        return next_cutoff_after(calendar, next_day).map(|cutoff| (true, cutoff));
+    }
+    let start_day = if calendar.is_trading_day(today).unwrap_or(false) {
+        calendar.next_trading_day(today)
+    } else {
+        today
+    };
+    next_cutoff_after(calendar, start_day).map(|cutoff| (true, cutoff))
+}
+
+fn stop_engine_if_running(
+    engine: &dyn Engine,
+    label: &'static str,
+    status: &EngineStatusRegistry,
+) -> Result<(), EngineError> {
+    match engine.stop() {
+        Ok(()) => {
+            status.mark_stopped(label);
+            Ok(())
+        }
+        Err(EngineError::NotRunning) => {
+            status.mark_stopped(label);
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn start_engine_if_stopped(
+    engine: &dyn Engine,
+    label: &'static str,
+    status: &EngineStatusRegistry,
+) -> Result<(), EngineError> {
+    match engine.start() {
+        Ok(()) => {
+            status.mark_started(label);
+            Ok(())
+        }
+        Err(EngineError::AlreadyRunning) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn market_window(
+    calendar: &TradingCalendar,
+    date: NaiveDate,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    if !calendar.is_trading_day(date).unwrap_or(false) {
+        return None;
+    }
+    let hours = calendar.trading_hours(date);
+    let cutoff_time = hours.regular.start - ChronoDuration::minutes(15);
+    let tz = calendar.timezone();
+    let cutoff_local = date.and_time(cutoff_time);
+    let close_local = date.and_time(hours.market_close());
+    let cutoff_utc = tz
+        .from_local_datetime(&cutoff_local)
+        .earliest()?
+        .with_timezone(&Utc);
+    let close_utc = tz
+        .from_local_datetime(&close_local)
+        .earliest()?
+        .with_timezone(&Utc);
+    Some((cutoff_utc, close_utc))
+}
+
+fn next_cutoff_after(calendar: &TradingCalendar, mut date: NaiveDate) -> Option<DateTime<Utc>> {
+    for _ in 0..(5 * 365) {
+        if let Some((cutoff, _)) = market_window(calendar, date) {
+            return Some(cutoff);
+        }
+        date = calendar.next_trading_day(date);
+    }
+    None
 }
 
 static LOGGER: SimpleLogger = SimpleLogger;

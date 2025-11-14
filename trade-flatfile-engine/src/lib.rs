@@ -1548,7 +1548,9 @@ async fn fetch_stream(
     key: &str,
     slot: TradeSlotKind,
 ) -> Result<(Box<dyn AsyncRead + Unpin + Send>, DownloadToken), FlatfileError> {
-    let temp_file = NamedTempFile::new()?;
+    let temp_root = config.state_dir.join("temporary");
+    std::fs::create_dir_all(&temp_root)?;
+    let temp_file = NamedTempFile::new_in(&temp_root)?;
     let mut writer = BufWriter::new(TokioFile::from_std(temp_file.reopen()?));
     let resp = client
         .get_object()
@@ -1608,17 +1610,22 @@ impl Drop for DownloadToken {
 }
 
 fn parse_option_trade_row(record: &csv_async::StringRecord) -> Option<(String, OptionTradeRecord)> {
-    if record.len() < 7 {
+    let columns = option_trade_columns(record)?;
+    let contract = record.get(0)?.to_string();
+    let sip_ts_ns = parse_timestamp(record.get(columns.sip_idx)).unwrap_or(0);
+    if sip_ts_ns == 0 {
         return None;
     }
-    let contract = record.get(0)?.to_string();
-    let trade_ts_ns = record.get(5)?.parse().unwrap_or(0);
+    let participant_ts_ns = columns
+        .participant_idx
+        .and_then(|idx| parse_timestamp(record.get(idx)));
+    let trade_ts_ns = participant_ts_ns.unwrap_or(sip_ts_ns);
     let (contract_direction, strike_price, expiry_ts_ns, underlying) =
         parse_opra_contract(&contract, Some(trade_ts_ns));
     let conditions = parse_conditions_field(record.get(1).unwrap_or_default());
     let exchange = record.get(3)?.parse().unwrap_or(0);
-    let price = record.get(4)?.parse().unwrap_or(0.0);
-    let size = record.get(6)?.parse().unwrap_or(0);
+    let price = record.get(columns.price_idx)?.parse().unwrap_or(0.0);
+    let size = record.get(columns.size_idx)?.parse().unwrap_or(0);
     let trade_uid = option_trade_uid(
         &contract,
         trade_ts_ns,
@@ -1635,7 +1642,7 @@ fn parse_option_trade_row(record: &csv_async::StringRecord) -> Option<(String, O
         strike_price,
         underlying,
         trade_ts_ns,
-        participant_ts_ns: None,
+        participant_ts_ns,
         price,
         size,
         conditions,
@@ -1646,6 +1653,43 @@ fn parse_option_trade_row(record: &csv_async::StringRecord) -> Option<(String, O
         watermark_ts_ns: trade_ts_ns,
     };
     Some((contract, trade))
+}
+
+fn parse_timestamp(field: Option<&str>) -> Option<i64> {
+    field.and_then(|value| {
+        if value.is_empty() {
+            None
+        } else {
+            value.parse::<i64>().ok()
+        }
+    })
+}
+
+struct OptionTradeColumns {
+    price_idx: usize,
+    sip_idx: usize,
+    size_idx: usize,
+    participant_idx: Option<usize>,
+}
+
+fn option_trade_columns(record: &csv_async::StringRecord) -> Option<OptionTradeColumns> {
+    if record.len() >= 8 {
+        Some(OptionTradeColumns {
+            price_idx: 5,
+            sip_idx: 6,
+            size_idx: 7,
+            participant_idx: Some(4),
+        })
+    } else if record.len() >= 7 {
+        Some(OptionTradeColumns {
+            price_idx: 4,
+            sip_idx: 5,
+            size_idx: 6,
+            participant_idx: None,
+        })
+    } else {
+        None
+    }
 }
 
 fn parse_underlying_trade_row(
@@ -1732,6 +1776,13 @@ fn option_trade_from_record(record: &OptionTradeRecord) -> OptionTrade {
         nbbo_ts_ns: None,
         nbbo_age_us: None,
         nbbo_state: None,
+        underlying_nbbo_bid: None,
+        underlying_nbbo_ask: None,
+        underlying_nbbo_bid_sz: None,
+        underlying_nbbo_ask_sz: None,
+        underlying_nbbo_ts_ns: None,
+        underlying_nbbo_age_us: None,
+        underlying_nbbo_state: None,
         tick_size_used: None,
         delta: None,
         gamma: None,
@@ -2319,7 +2370,6 @@ impl HasTimestamp for QuoteRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::config::DateRange;
     use futures::StreamExt;
     use tokio::fs::File;
 
@@ -2354,6 +2404,169 @@ mod tests {
         assert_eq!(first.contract_direction, 'C');
         assert_eq!(first.underlying, "SPY");
         assert!(first.participant_ts_ns.is_none());
+    }
+
+    #[test]
+    fn option_trade_parser_prefers_participant_timestamp() {
+        let record = StringRecord::from(vec![
+            "O:SPY230327P00390000",
+            "232",
+            "",
+            "312",
+            "1678715620948000000",
+            "11.82",
+            "1",
+            "1678715621948000000",
+        ]);
+        let (_, trade) = parse_option_trade_row(&record).expect("parse trade");
+        assert_eq!(trade.trade_ts_ns, 1_678_715_620_948_000_000);
+        assert_eq!(trade.participant_ts_ns, Some(1_678_715_620_948_000_000));
+    }
+
+    #[test]
+    fn option_trade_parser_falls_back_to_sip_timestamp() {
+        let record = StringRecord::from(vec![
+            "O:SPY230327P00390000",
+            "232",
+            "",
+            "312",
+            "11.82",
+            "1678715620948000000",
+            "1",
+        ]);
+        let (_, trade) = parse_option_trade_row(&record).expect("parse trade");
+        assert_eq!(trade.trade_ts_ns, 1_678_715_620_948_000_000);
+        assert!(trade.participant_ts_ns.is_none());
+        assert_eq!(trade.size, 1);
+        assert_eq!(trade.price, 11.82);
+    }
+
+    #[tokio::test]
+    async fn option_trades_fill_windowspace() {
+        use std::collections::BTreeMap;
+        use tempfile::tempdir;
+        use window_space::{
+            WindowSpaceConfig,
+            payload::{PayloadMeta, PayloadType, SlotStatus, TradeSlotKind},
+            window::{DEFAULT_WINDOW_DURATION_SECS, WINDOWS_PER_SESSION, WindowSpaceBuilder},
+        };
+
+        let reader =
+            open_fixture("../flatfile-source/fixtures/options_trades_example.csv.gz").await;
+        let mut csv = AsyncReaderBuilder::new()
+            .trim(Trim::All)
+            .create_reader(reader);
+        let mut records = csv.records();
+        let mut trades = Vec::new();
+        while let Some(record) = records.next().await {
+            let record = record.expect("record");
+            if let Some((_symbol, trade)) = parse_option_trade_row(&record) {
+                trades.push(trade);
+            }
+        }
+        assert!(!trades.is_empty(), "parsed trades for windowspace test");
+        let start_sec = trades
+            .iter()
+            .map(|t| t.trade_ts_ns / 1_000_000_000)
+            .min()
+            .unwrap();
+        let mut builder = WindowSpaceBuilder::new();
+        builder.add_session(
+            start_sec,
+            WINDOWS_PER_SESSION as window_space::WindowIndex,
+            DEFAULT_WINDOW_DURATION_SECS,
+            1,
+        );
+        let window_space = builder.build();
+        let tmp = tempdir().expect("tempdir");
+        let mut cfg = WindowSpaceConfig::new(tmp.path().to_path_buf(), window_space);
+        cfg.max_symbols = 16;
+        let (controller, _) = WindowSpaceController::bootstrap(cfg).expect("bootstrap");
+
+        let mut grouped: BTreeMap<
+            String,
+            BTreeMap<window_space::WindowIndex, Vec<OptionTradeRecord>>,
+        > = BTreeMap::new();
+        for trade in trades.into_iter() {
+            let secs = trade.trade_ts_ns / 1_000_000_000;
+            let Some(window_idx) = controller.window_idx_for_timestamp(secs) else {
+                continue;
+            };
+            grouped
+                .entry(trade.underlying.clone())
+                .or_default()
+                .entry(window_idx)
+                .or_default()
+                .push(trade);
+        }
+        assert!(
+            !grouped.is_empty(),
+            "expected grouped trades for windowspace harness"
+        );
+
+        let mut filled = Vec::new();
+        let mut batch_id = 1u32;
+        for (symbol, windows) in &grouped {
+            if symbol.is_empty() {
+                continue;
+            }
+            controller.resolve_symbol(symbol).expect("resolve symbol");
+            for (window_idx, trades) in windows {
+                let first_ts = trades.first().unwrap().trade_ts_ns;
+                let last_ts = trades.last().unwrap().trade_ts_ns;
+                let payload = TradeBatchPayload {
+                    schema_version: OPTION_TRADE_SCHEMA_VERSION,
+                    window_ts: controller
+                        .window_meta(*window_idx)
+                        .map(|meta| meta.start_ts)
+                        .unwrap_or_default(),
+                    batch_id,
+                    first_trade_ts: first_ts,
+                    last_trade_ts: last_ts,
+                    record_count: trades.len() as u32,
+                    artifact_uri: format!("fixture://option/{symbol}/{window_idx}"),
+                    checksum: 0,
+                };
+                batch_id += 1;
+                let payload_id = {
+                    let mut stores = controller.payload_stores();
+                    stores.trades.append(payload).expect("append payload")
+                };
+                let meta = PayloadMeta::new(PayloadType::Trade, payload_id, 1, 0);
+                controller
+                    .set_option_trade_ref(symbol, *window_idx, meta, None)
+                    .expect("set option trade slot");
+                filled.push((symbol.clone(), *window_idx));
+            }
+        }
+        assert!(!filled.is_empty(), "expected filled slots");
+
+        for (symbol, window_idx) in filled {
+            let row = controller
+                .get_trade_row(&symbol, window_idx)
+                .expect("trade row");
+            assert_eq!(
+                row.option_trade_ref.status,
+                SlotStatus::Filled,
+                "slot should be filled for {symbol}:{window_idx}"
+            );
+            assert_eq!(
+                row.option_trade_ref.payload_type,
+                PayloadType::Trade,
+                "payload type should be trade"
+            );
+        }
+
+        let snapshot = controller.slot_status_snapshot().expect("snapshot");
+        let filled_count = snapshot
+            .trade
+            .get(&TradeSlotKind::OptionTrade)
+            .map(|counts| counts.filled)
+            .unwrap_or(0);
+        assert!(
+            filled_count > 0,
+            "windowspace snapshot should show filled slots"
+        );
     }
 
     #[tokio::test]
@@ -2732,6 +2945,7 @@ fn trade_slot_status(row: &TradeWindowRow, kind: TradeSlotKind) -> SlotStatus {
 fn enrichment_slot_status(row: &EnrichmentWindowRow, kind: EnrichmentSlotKind) -> SlotStatus {
     match kind {
         EnrichmentSlotKind::Greeks => row.greeks.status,
+        EnrichmentSlotKind::Aggregation => row.aggregation.status,
     }
 }
 

@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, fmt, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    path::PathBuf,
+    sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -22,6 +29,7 @@ pub struct WindowSpaceController {
     payload_stores: Mutex<PayloadStores>,
     window_space: Arc<WindowSpace>,
     slot_metrics: Arc<SlotMetrics>,
+    set_counters: SetCounters,
 }
 
 impl WindowSpaceController {
@@ -90,6 +98,7 @@ impl WindowSpaceController {
                 payload_stores: Mutex::new(payload_stores),
                 window_space,
                 slot_metrics,
+                set_counters: SetCounters::default(),
             },
             report,
         ))
@@ -161,13 +170,15 @@ impl WindowSpaceController {
         expected_version: Option<u32>,
     ) -> Result<Slot> {
         let symbol_id = self.resolve_symbol(symbol)?;
-        Ok(self.trade_window_space.write_slot(
+        let slot = self.trade_window_space.write_slot(
             symbol_id,
             window_idx,
             TradeSlotKind::RfRate,
             meta,
             expected_version,
-        )?)
+        )?;
+        self.set_counters.rf_rate.fetch_add(1, Ordering::Relaxed);
+        Ok(slot)
     }
 
     pub fn set_option_trade_ref(
@@ -178,13 +189,17 @@ impl WindowSpaceController {
         expected_version: Option<u32>,
     ) -> Result<Slot> {
         let symbol_id = self.resolve_symbol(symbol)?;
-        Ok(self.trade_window_space.write_slot(
+        let slot = self.trade_window_space.write_slot(
             symbol_id,
             window_idx,
             TradeSlotKind::OptionTrade,
             meta,
             expected_version,
-        )?)
+        )?;
+        self.set_counters
+            .option_trade
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(slot)
     }
 
     pub fn set_option_quote_ref(
@@ -195,13 +210,17 @@ impl WindowSpaceController {
         expected_version: Option<u32>,
     ) -> Result<Slot> {
         let symbol_id = self.resolve_symbol(symbol)?;
-        Ok(self.trade_window_space.write_slot(
+        let slot = self.trade_window_space.write_slot(
             symbol_id,
             window_idx,
             TradeSlotKind::OptionQuote,
             meta,
             expected_version,
-        )?)
+        )?;
+        self.set_counters
+            .option_quote
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(slot)
     }
 
     pub fn set_underlying_trade_ref(
@@ -212,13 +231,17 @@ impl WindowSpaceController {
         expected_version: Option<u32>,
     ) -> Result<Slot> {
         let symbol_id = self.resolve_symbol(symbol)?;
-        Ok(self.trade_window_space.write_slot(
+        let slot = self.trade_window_space.write_slot(
             symbol_id,
             window_idx,
             TradeSlotKind::UnderlyingTrade,
             meta,
             expected_version,
-        )?)
+        )?;
+        self.set_counters
+            .underlying_trade
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(slot)
     }
 
     pub fn set_underlying_quote_ref(
@@ -229,13 +252,17 @@ impl WindowSpaceController {
         expected_version: Option<u32>,
     ) -> Result<Slot> {
         let symbol_id = self.resolve_symbol(symbol)?;
-        Ok(self.trade_window_space.write_slot(
+        let slot = self.trade_window_space.write_slot(
             symbol_id,
             window_idx,
             TradeSlotKind::UnderlyingQuote,
             meta,
             expected_version,
-        )?)
+        )?;
+        self.set_counters
+            .underlying_quote
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(slot)
     }
 
     pub fn set_option_aggressor_ref(
@@ -246,13 +273,17 @@ impl WindowSpaceController {
         expected_version: Option<u32>,
     ) -> Result<Slot> {
         let symbol_id = self.resolve_symbol(symbol)?;
-        Ok(self.trade_window_space.write_slot(
+        let slot = self.trade_window_space.write_slot(
             symbol_id,
             window_idx,
             TradeSlotKind::OptionAggressor,
             meta,
             expected_version,
-        )?)
+        )?;
+        self.set_counters
+            .option_aggressor
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(slot)
     }
 
     pub fn set_underlying_aggressor_ref(
@@ -263,13 +294,17 @@ impl WindowSpaceController {
         expected_version: Option<u32>,
     ) -> Result<Slot> {
         let symbol_id = self.resolve_symbol(symbol)?;
-        Ok(self.trade_window_space.write_slot(
+        let slot = self.trade_window_space.write_slot(
             symbol_id,
             window_idx,
             TradeSlotKind::UnderlyingAggressor,
             meta,
             expected_version,
-        )?)
+        )?;
+        self.set_counters
+            .underlying_aggressor
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(slot)
     }
 
     pub fn set_greeks_ref(
@@ -280,13 +315,36 @@ impl WindowSpaceController {
         expected_version: Option<u32>,
     ) -> Result<Slot> {
         let symbol_id = self.resolve_symbol(symbol)?;
-        Ok(self.enrichment_window_space.write_slot(
+        let slot = self.enrichment_window_space.write_slot(
             symbol_id,
             window_idx,
             EnrichmentSlotKind::Greeks,
             meta,
             expected_version,
-        )?)
+        )?;
+        self.set_counters.greeks.fetch_add(1, Ordering::Relaxed);
+        Ok(slot)
+    }
+
+    pub fn set_aggregation_ref(
+        &self,
+        symbol: &str,
+        window_idx: WindowIndex,
+        meta: PayloadMeta,
+        expected_version: Option<u32>,
+    ) -> Result<Slot> {
+        let symbol_id = self.resolve_symbol(symbol)?;
+        let slot = self.enrichment_window_space.write_slot(
+            symbol_id,
+            window_idx,
+            EnrichmentSlotKind::Aggregation,
+            meta,
+            expected_version,
+        )?;
+        self.set_counters
+            .aggregation
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(slot)
     }
 
     pub fn mark_pending(
@@ -393,6 +451,18 @@ impl WindowSpaceController {
         self.payload_stores.lock()
     }
 
+    pub fn payload_store_counts(&self) -> PayloadStoreCounts {
+        let stores = self.payload_stores();
+        PayloadStoreCounts {
+            rf_rate: stores.rf_rate.len(),
+            trades: stores.trades.len(),
+            quotes: stores.quotes.len(),
+            aggressor: stores.aggressor.len(),
+            greeks: stores.greeks.len(),
+            aggregations: stores.aggregations.len(),
+        }
+    }
+
     pub fn slot_status_snapshot(&self) -> Result<WindowSpaceSlotStatusSnapshot> {
         let symbol_ids: Vec<SymbolId> = {
             let map = self.symbol_map.read();
@@ -438,6 +508,10 @@ impl WindowSpaceController {
 
     pub fn slot_metrics(&self) -> Arc<SlotMetrics> {
         Arc::clone(&self.slot_metrics)
+    }
+
+    pub fn set_counter_snapshot(&self) -> SetCounterSnapshot {
+        self.set_counters.snapshot()
     }
 
     pub fn symbol_count(&self) -> usize {
@@ -503,6 +577,16 @@ impl From<WindowSpaceFileStats> for StorageSummary {
             creation_duration: value.creation_duration,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PayloadStoreCounts {
+    pub rf_rate: usize,
+    pub trades: usize,
+    pub quotes: usize,
+    pub aggressor: usize,
+    pub greeks: usize,
+    pub aggregations: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -649,6 +733,48 @@ pub struct PendingHandle {
     pub symbol_id: SymbolId,
     pub window_idx: WindowIndex,
     pub slot: SlotKind,
+}
+
+#[derive(Default)]
+struct SetCounters {
+    rf_rate: AtomicU64,
+    option_trade: AtomicU64,
+    option_quote: AtomicU64,
+    underlying_trade: AtomicU64,
+    underlying_quote: AtomicU64,
+    option_aggressor: AtomicU64,
+    underlying_aggressor: AtomicU64,
+    greeks: AtomicU64,
+    aggregation: AtomicU64,
+}
+
+impl SetCounters {
+    fn snapshot(&self) -> SetCounterSnapshot {
+        SetCounterSnapshot {
+            rf_rate: self.rf_rate.load(Ordering::Relaxed),
+            option_trade: self.option_trade.load(Ordering::Relaxed),
+            option_quote: self.option_quote.load(Ordering::Relaxed),
+            underlying_trade: self.underlying_trade.load(Ordering::Relaxed),
+            underlying_quote: self.underlying_quote.load(Ordering::Relaxed),
+            option_aggressor: self.option_aggressor.load(Ordering::Relaxed),
+            underlying_aggressor: self.underlying_aggressor.load(Ordering::Relaxed),
+            greeks: self.greeks.load(Ordering::Relaxed),
+            aggregation: self.aggregation.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetCounterSnapshot {
+    pub rf_rate: u64,
+    pub option_trade: u64,
+    pub option_quote: u64,
+    pub underlying_trade: u64,
+    pub underlying_quote: u64,
+    pub option_aggressor: u64,
+    pub underlying_aggressor: u64,
+    pub greeks: u64,
+    pub aggregation: u64,
 }
 
 #[deprecated(

@@ -188,6 +188,13 @@ fn record_batch_to_trades(batch: &RecordBatch) -> Result<Vec<OptionTrade>, BoxEr
     let source = as_string_array(batch, 24)?;
     let quality = as_string_array(batch, 25)?;
     let watermark_ts_ns = as_i64_array(batch, 26)?;
+    let underlying_nbbo_bid = as_f64_array(batch, 27)?;
+    let underlying_nbbo_ask = as_f64_array(batch, 28)?;
+    let underlying_nbbo_bid_sz = as_u32_array(batch, 29)?;
+    let underlying_nbbo_ask_sz = as_u32_array(batch, 30)?;
+    let underlying_nbbo_ts_ns = as_i64_array(batch, 31)?;
+    let underlying_nbbo_age_us = as_u32_array(batch, 32)?;
+    let underlying_nbbo_state = as_string_array(batch, 33)?;
 
     let mut trades = Vec::with_capacity(len);
     for row in 0..len {
@@ -220,6 +227,13 @@ fn record_batch_to_trades(batch: &RecordBatch) -> Result<Vec<OptionTrade>, BoxEr
             nbbo_ts_ns: take_opt_i64(nbbo_ts_ns, row),
             nbbo_age_us: take_opt_u32(nbbo_age_us, row),
             nbbo_state: parse_nbbo_state(nbbo_state.value(row)),
+            underlying_nbbo_bid: take_opt_f64(underlying_nbbo_bid, row),
+            underlying_nbbo_ask: take_opt_f64(underlying_nbbo_ask, row),
+            underlying_nbbo_bid_sz: take_opt_u32(underlying_nbbo_bid_sz, row),
+            underlying_nbbo_ask_sz: take_opt_u32(underlying_nbbo_ask_sz, row),
+            underlying_nbbo_ts_ns: take_opt_i64(underlying_nbbo_ts_ns, row),
+            underlying_nbbo_age_us: take_opt_u32(underlying_nbbo_age_us, row),
+            underlying_nbbo_state: parse_nbbo_state(underlying_nbbo_state.value(row)),
             tick_size_used: take_opt_f64(tick_size_used, row),
             delta: None,
             gamma: None,

@@ -765,6 +765,13 @@ impl Storage {
         let mut nbbo_ts_ns = Vec::new();
         let mut nbbo_age_us: Vec<Option<u32>> = Vec::new();
         let mut nbbo_state = Vec::new();
+        let mut underlying_nbbo_bid = Vec::new();
+        let mut underlying_nbbo_ask = Vec::new();
+        let mut underlying_nbbo_bid_sz: Vec<Option<u32>> = Vec::new();
+        let mut underlying_nbbo_ask_sz: Vec<Option<u32>> = Vec::new();
+        let mut underlying_nbbo_ts_ns = Vec::new();
+        let mut underlying_nbbo_age_us: Vec<Option<u32>> = Vec::new();
+        let mut underlying_nbbo_state = Vec::new();
         let mut tick_size_used = Vec::new();
         let mut source = Vec::new();
         let mut quality = Vec::new();
@@ -794,6 +801,13 @@ impl Storage {
             nbbo_ts_ns.push(trade.nbbo_ts_ns);
             nbbo_age_us.push(trade.nbbo_age_us);
             nbbo_state.push(format!("{:?}", trade.nbbo_state));
+            underlying_nbbo_bid.push(trade.underlying_nbbo_bid);
+            underlying_nbbo_ask.push(trade.underlying_nbbo_ask);
+            underlying_nbbo_bid_sz.push(trade.underlying_nbbo_bid_sz);
+            underlying_nbbo_ask_sz.push(trade.underlying_nbbo_ask_sz);
+            underlying_nbbo_ts_ns.push(trade.underlying_nbbo_ts_ns);
+            underlying_nbbo_age_us.push(trade.underlying_nbbo_age_us);
+            underlying_nbbo_state.push(format!("{:?}", trade.underlying_nbbo_state));
             tick_size_used.push(trade.tick_size_used);
             source.push(format!("{:?}", meta.source));
             quality.push(format!("{:?}", meta.quality));
@@ -832,6 +846,13 @@ impl Storage {
             Arc::new(Int64Array::from(nbbo_ts_ns)),
             Arc::new(UInt32Array::from(nbbo_age_us)),
             Arc::new(StringArray::from(nbbo_state)),
+            Arc::new(Float64Array::from(underlying_nbbo_bid)),
+            Arc::new(Float64Array::from(underlying_nbbo_ask)),
+            Arc::new(UInt32Array::from(underlying_nbbo_bid_sz)),
+            Arc::new(UInt32Array::from(underlying_nbbo_ask_sz)),
+            Arc::new(Int64Array::from(underlying_nbbo_ts_ns)),
+            Arc::new(UInt32Array::from(underlying_nbbo_age_us)),
+            Arc::new(StringArray::from(underlying_nbbo_state)),
             Arc::new(Float64Array::from(tick_size_used)),
             Arc::new(StringArray::from(source)),
             Arc::new(StringArray::from(quality)),

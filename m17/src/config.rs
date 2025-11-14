@@ -39,9 +39,9 @@ pub struct AppConfig {
     pub env: Environment,
     pub ledger: WindowSpaceConfig,
     pub metrics_addr: SocketAddr,
-    pub rest_base_url: &'static str,
-    pub stocks_ws_url: &'static str,
-    pub options_ws_url: &'static str,
+    pub rest_base_url: String,
+    pub stocks_ws_url: String,
+    pub options_ws_url: String,
     pub ws_target_symbol: &'static str,
     pub secrets: Secrets,
     pub flatfile: FlatfileSettings,
@@ -67,9 +67,12 @@ impl AppConfig {
             env,
             ledger,
             metrics_addr: metrics_addr_for(env),
-            rest_base_url: "https://api.massive.com",
-            stocks_ws_url: "wss://socket.massive.com/stocks",
-            options_ws_url: "wss://socket.massive.com/options",
+            rest_base_url: env_or_default("M17_REST_BASE_URL", "https://api.massive.com"),
+            stocks_ws_url: env_or_default("M17_STOCKS_WS_URL", "wss://socket.massive.com/stocks"),
+            options_ws_url: env_or_default(
+                "M17_OPTIONS_WS_URL",
+                "wss://socket.massive.com/options",
+            ),
             ws_target_symbol: "SPY",
             secrets: Secrets::from_env()?,
             flatfile: FlatfileSettings::for_env(env),
@@ -185,6 +188,10 @@ fn require_env(key: &str) -> Result<String, ConfigError> {
     env::var(key).map_err(|_| ConfigError::MissingEnv {
         key: key.to_string(),
     })
+}
+
+fn env_or_default(key: &str, default: &'static str) -> String {
+    env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
 #[derive(Debug, Error)]

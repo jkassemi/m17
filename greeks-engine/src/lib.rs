@@ -1,6 +1,6 @@
 // Copyright (c) James Kassemi, SC, US. All rights reserved.
 use core_types::config::GreeksConfig;
-use core_types::types::{NbboState, OptionTrade};
+use core_types::types::{Nbbo, NbboState, OptionTrade};
 use futures::{stream, StreamExt};
 use libm::erf;
 use nbbo_cache::NbboStore;
@@ -40,6 +40,29 @@ pub const FLAG_VEGA_TINY: u32 = 0b10_0000_0000;
 pub const FLAG_PRICE_BELOW_INTRINSIC: u32 = 0b100_0000_0000;
 pub const FLAG_RATE_EXTRAP: u32 = 0b1_0000_0000_000;
 pub const FLAG_TAU_CLAMPED: u32 = 0b10_0000_0000_000;
+
+#[derive(Clone)]
+struct QuoteSnapshot {
+    bid: f64,
+    ask: f64,
+    bid_sz: u32,
+    ask_sz: u32,
+    quote_ts_ns: i64,
+    state: NbboState,
+}
+
+impl From<Nbbo> for QuoteSnapshot {
+    fn from(nbbo: Nbbo) -> Self {
+        Self {
+            bid: nbbo.bid,
+            ask: nbbo.ask,
+            bid_sz: nbbo.bid_sz,
+            ask_sz: nbbo.ask_sz,
+            quote_ts_ns: nbbo.quote_ts_ns,
+            state: nbbo.state,
+        }
+    }
+}
 
 fn resolve_pool_permits(configured: usize, detected_cores: usize) -> usize {
     let detected = detected_cores.max(1);
@@ -119,6 +142,24 @@ fn reset_trade_outputs(trade: &mut OptionTrade) {
     trade.theta = None;
 }
 
+fn stored_underlying_quote(trade: &OptionTrade) -> Option<QuoteSnapshot> {
+    let bid = trade.underlying_nbbo_bid?;
+    let ask = trade.underlying_nbbo_ask?;
+    let quote_ts_ns = trade.underlying_nbbo_ts_ns?;
+    let state = trade
+        .underlying_nbbo_state
+        .clone()
+        .unwrap_or(NbboState::Normal);
+    Some(QuoteSnapshot {
+        bid,
+        ask,
+        bid_sz: trade.underlying_nbbo_bid_sz.unwrap_or(0),
+        ask_sz: trade.underlying_nbbo_ask_sz.unwrap_or(0),
+        quote_ts_ns,
+        state,
+    })
+}
+
 async fn enrich_single_trade(
     trade: &mut OptionTrade,
     cfg: &GreeksConfig,
@@ -127,9 +168,14 @@ async fn enrich_single_trade(
     staleness_us: u32,
 ) {
     reset_trade_outputs(trade);
-    let quote = {
-        let store = nbbo.read().await;
-        store.get_best_before(&trade.underlying, trade.trade_ts_ns, u32::MAX)
+    let quote = match stored_underlying_quote(trade) {
+        Some(snapshot) => Some(snapshot),
+        None => {
+            let store = nbbo.read().await;
+            store
+                .get_best_before(&trade.underlying, trade.trade_ts_ns, u32::MAX)
+                .map(QuoteSnapshot::from)
+        }
     };
     let Some(qte) = quote else {
         trade.greeks_flags |= FLAG_NO_UNDERLYING;
@@ -553,6 +599,19 @@ mod tests {
     use super::*;
     use core_types::types::{Nbbo, NbboState, Quality, Source};
     use core_types::uid::{option_trade_uid, quote_uid};
+    use serde::{de::DeserializeOwned, Serialize};
+    use std::{
+        fs::File,
+        io::{self, BufReader, BufWriter},
+        path::Path,
+    };
+    use tempfile::TempDir;
+    use window_space::{
+        mapping::{QuoteBatchPayload, TradeBatchPayload},
+        payload::{PayloadMeta, PayloadType, SlotStatus, TradeSlotKind},
+        window::WindowIndex,
+        WindowSpace, WindowSpaceConfig, WindowSpaceController,
+    };
 
     const ONE_YEAR_NS: i64 = 31_536_000_000_000_000;
     const BASE_TRADE_TS_NS: i64 = 1_000_100_000;
@@ -627,6 +686,13 @@ mod tests {
             nbbo_ts_ns: None,
             nbbo_age_us: None,
             nbbo_state: None,
+            underlying_nbbo_bid: None,
+            underlying_nbbo_ask: None,
+            underlying_nbbo_bid_sz: None,
+            underlying_nbbo_ask_sz: None,
+            underlying_nbbo_ts_ns: None,
+            underlying_nbbo_age_us: None,
+            underlying_nbbo_state: None,
             tick_size_used: None,
             delta: None,
             gamma: None,
@@ -643,6 +709,298 @@ mod tests {
     fn make_curve_state(points: &[(f64, f64)]) -> Arc<RwLock<Option<Arc<TreasuryCurve>>>> {
         let curve = TreasuryCurve::from_pairs(points.to_vec()).expect("valid curve");
         Arc::new(RwLock::new(Some(Arc::new(curve))))
+    }
+
+    fn bootstrap_test_controller() -> (Arc<WindowSpaceController>, TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let window_space = WindowSpace::standard(1_600_000_000);
+        let mut config = WindowSpaceConfig::new(dir.path().to_path_buf(), window_space);
+        config.max_symbols = 8;
+        let (controller, _) = WindowSpaceController::bootstrap(config).expect("bootstrap");
+        (Arc::new(controller), dir)
+    }
+
+    fn persist_payload<T: Serialize + ?Sized>(
+        state_dir: &Path,
+        file_name: &str,
+        value: &T,
+    ) -> io::Result<()> {
+        let path = state_dir.join(file_name);
+        let file = File::create(path)?;
+        serde_json::to_writer(BufWriter::new(file), value).map_err(json_err)
+    }
+
+    fn load_payload<T: DeserializeOwned>(state_dir: &Path, file_name: &str) -> io::Result<Vec<T>> {
+        let path = state_dir.join(file_name);
+        let file = File::open(path)?;
+        serde_json::from_reader(BufReader::new(file)).map_err(json_err)
+    }
+
+    fn stage_option_trade_payload(
+        controller: &WindowSpaceController,
+        symbol: &str,
+        window_idx: WindowIndex,
+        trades: &[OptionTrade],
+        file_name: &str,
+    ) -> io::Result<()> {
+        persist_payload(controller.config().state_dir(), file_name, trades)?;
+        let window_space = controller.window_space();
+        let window_meta = window_space.window(window_idx).expect("window meta");
+        let payload = TradeBatchPayload {
+            schema_version: 1,
+            window_ts: window_meta.start_ts,
+            batch_id: 1,
+            first_trade_ts: trades.first().map(|t| t.trade_ts_ns).unwrap_or_default(),
+            last_trade_ts: trades.last().map(|t| t.trade_ts_ns).unwrap_or_default(),
+            record_count: trades.len() as u32,
+            artifact_uri: file_name.to_string(),
+            checksum: 0,
+        };
+        let payload_id = {
+            let mut stores = controller.payload_stores();
+            stores.trades.append(payload)?
+        };
+        let meta = PayloadMeta::new(PayloadType::Trade, payload_id, 1, 0);
+        controller
+            .set_option_trade_ref(symbol, window_idx, meta, None)
+            .expect("option trade slot");
+        Ok(())
+    }
+
+    fn stage_quote_payload(
+        controller: &WindowSpaceController,
+        symbol: &str,
+        window_idx: WindowIndex,
+        quotes: &[Nbbo],
+        slot: TradeSlotKind,
+        file_name: &str,
+    ) -> io::Result<()> {
+        assert!(matches!(
+            slot,
+            TradeSlotKind::OptionQuote | TradeSlotKind::UnderlyingQuote
+        ));
+        persist_payload(controller.config().state_dir(), file_name, quotes)?;
+        let window_space = controller.window_space();
+        let window_meta = window_space.window(window_idx).expect("window meta");
+        let payload = QuoteBatchPayload {
+            schema_version: 1,
+            window_ts: window_meta.start_ts,
+            batch_id: 1,
+            first_quote_ts: quotes.first().map(|q| q.quote_ts_ns).unwrap_or_default(),
+            last_quote_ts: quotes.last().map(|q| q.quote_ts_ns).unwrap_or_default(),
+            nbbo_sample_count: quotes.len() as u32,
+            artifact_uri: file_name.to_string(),
+            checksum: 0,
+        };
+        let payload_id = {
+            let mut stores = controller.payload_stores();
+            stores.quotes.append(payload)?
+        };
+        let meta = PayloadMeta::new(PayloadType::Quote, payload_id, 1, 0);
+        match slot {
+            TradeSlotKind::OptionQuote => {
+                controller
+                    .set_option_quote_ref(symbol, window_idx, meta, None)
+                    .expect("option quote slot");
+            }
+            TradeSlotKind::UnderlyingQuote => {
+                controller
+                    .set_underlying_quote_ref(symbol, window_idx, meta, None)
+                    .expect("underlying quote slot");
+            }
+            _ => unreachable!("unsupported slot for quote payload"),
+        }
+        Ok(())
+    }
+
+    fn json_err(err: serde_json::Error) -> io::Error {
+        io::Error::new(io::ErrorKind::Other, err)
+    }
+
+    fn nbbo_age_us(trade_ts_ns: i64, quote_ts_ns: i64) -> u32 {
+        let age_ns = trade_ts_ns.saturating_sub(quote_ts_ns);
+        let age_us = (age_ns / 1_000).max(0) as u64;
+        age_us.min(u32::MAX as u64) as u32
+    }
+
+    async fn attach_option_nbbo_snapshot(
+        nbbo: Arc<RwLock<NbboStore>>,
+        trade: &mut OptionTrade,
+        staleness_us: u32,
+    ) {
+        let guard = nbbo.read().await;
+        if let Some(q) = guard.get_best_before(&trade.contract, trade.trade_ts_ns, staleness_us) {
+            let age_us = nbbo_age_us(trade.trade_ts_ns, q.quote_ts_ns);
+            trade.nbbo_bid = Some(q.bid);
+            trade.nbbo_ask = Some(q.ask);
+            trade.nbbo_bid_sz = Some(q.bid_sz);
+            trade.nbbo_ask_sz = Some(q.ask_sz);
+            trade.nbbo_ts_ns = Some(q.quote_ts_ns);
+            trade.nbbo_age_us = Some(age_us);
+            trade.nbbo_state = Some(q.state.clone());
+        } else {
+            trade.nbbo_bid = None;
+            trade.nbbo_ask = None;
+            trade.nbbo_bid_sz = None;
+            trade.nbbo_ask_sz = None;
+            trade.nbbo_ts_ns = None;
+            trade.nbbo_age_us = None;
+            trade.nbbo_state = None;
+        }
+    }
+
+    async fn attach_underlying_nbbo_snapshot(
+        nbbo: Arc<RwLock<NbboStore>>,
+        trade: &mut OptionTrade,
+        staleness_us: u32,
+    ) {
+        let guard = nbbo.read().await;
+        if let Some(q) = guard.get_best_before(&trade.underlying, trade.trade_ts_ns, staleness_us) {
+            let age_us = nbbo_age_us(trade.trade_ts_ns, q.quote_ts_ns);
+            trade.set_underlying_nbbo_snapshot(
+                Some(q.bid),
+                Some(q.ask),
+                Some(q.bid_sz),
+                Some(q.ask_sz),
+                Some(q.quote_ts_ns),
+                Some(age_us),
+                Some(q.state.clone()),
+            );
+        } else {
+            trade.set_underlying_nbbo_snapshot(None, None, None, None, None, None, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn controller_pipeline_matches_quotes_and_computes_greeks() {
+        let (controller, _dir) = bootstrap_test_controller();
+        let state_dir = controller.config().state_dir().to_path_buf();
+        let staleness_us = 250_000;
+        let trade_ts_ns = 1_600_000_000i64 * 1_000_000_000 + 50_000;
+
+        let mut base_trade = sample_trade();
+        base_trade.trade_ts_ns = trade_ts_ns;
+        base_trade.expiry_ts_ns = trade_ts_ns + ONE_YEAR_NS;
+        base_trade.price = 5.0;
+        base_trade.size = 10;
+        base_trade.trade_uid = option_trade_uid(
+            &base_trade.contract,
+            base_trade.trade_ts_ns,
+            None,
+            base_trade.price,
+            base_trade.size,
+            base_trade.exchange,
+            &base_trade.conditions,
+        );
+
+        let symbol = base_trade.underlying.clone();
+        let option_quote = mk_nbbo(&base_trade.contract, trade_ts_ns - 5_000, 4.9, 5.05);
+        let underlying_quote = mk_nbbo(&symbol, trade_ts_ns - 2_000, 400.0, 400.2);
+
+        let window_idx = controller
+            .window_idx_for_timestamp(trade_ts_ns / 1_000_000_000)
+            .expect("window index");
+
+        stage_option_trade_payload(
+            &controller,
+            &symbol,
+            window_idx,
+            &[base_trade.clone()],
+            "option_trades.json",
+        )
+        .expect("stage option trades");
+        stage_quote_payload(
+            &controller,
+            &symbol,
+            window_idx,
+            &[option_quote.clone()],
+            TradeSlotKind::OptionQuote,
+            "option_quotes.json",
+        )
+        .expect("stage option quotes");
+        stage_quote_payload(
+            &controller,
+            &symbol,
+            window_idx,
+            &[underlying_quote.clone()],
+            TradeSlotKind::UnderlyingQuote,
+            "underlying_quotes.json",
+        )
+        .expect("stage underlying quotes");
+
+        let trade_row = controller
+            .get_trade_row(&symbol, window_idx)
+            .expect("trade row");
+        assert_eq!(trade_row.option_trade_ref.status, SlotStatus::Filled);
+        assert_eq!(trade_row.option_quote_ref.status, SlotStatus::Filled);
+        assert_eq!(trade_row.underlying_quote_ref.status, SlotStatus::Filled);
+
+        let (trade_payload, option_quotes_payload, underlying_quotes_payload) = {
+            let stores = controller.payload_stores();
+            (
+                stores
+                    .trades
+                    .get(trade_row.option_trade_ref.payload_id)
+                    .cloned()
+                    .expect("trade payload"),
+                stores
+                    .quotes
+                    .get(trade_row.option_quote_ref.payload_id)
+                    .cloned()
+                    .expect("option quote payload"),
+                stores
+                    .quotes
+                    .get(trade_row.underlying_quote_ref.payload_id)
+                    .cloned()
+                    .expect("underlying quote payload"),
+            )
+        };
+
+        let mut trades: Vec<OptionTrade> =
+            load_payload(state_dir.as_path(), &trade_payload.artifact_uri)
+                .expect("option trades from payload");
+        let option_quotes: Vec<Nbbo> =
+            load_payload(state_dir.as_path(), &option_quotes_payload.artifact_uri)
+                .expect("option quotes from payload");
+        let underlying_quotes: Vec<Nbbo> =
+            load_payload(state_dir.as_path(), &underlying_quotes_payload.artifact_uri)
+                .expect("underlying quotes from payload");
+        assert_eq!(trades.len(), 1);
+
+        let mut trade = trades.remove(0);
+        let nbbo_store = Arc::new(RwLock::new(NbboStore::new()));
+        {
+            let mut guard = nbbo_store.write().await;
+            for q in option_quotes.iter().chain(underlying_quotes.iter()) {
+                guard.put(q);
+            }
+        }
+
+        attach_option_nbbo_snapshot(nbbo_store.clone(), &mut trade, staleness_us).await;
+        assert_eq!(trade.nbbo_bid, Some(option_quote.bid));
+        assert_eq!(trade.nbbo_ask, Some(option_quote.ask));
+
+        attach_underlying_nbbo_snapshot(nbbo_store.clone(), &mut trade, staleness_us).await;
+        assert_eq!(trade.underlying_nbbo_bid, Some(underlying_quote.bid));
+        assert_eq!(trade.underlying_nbbo_ask, Some(underlying_quote.ask));
+
+        let curve_state = make_curve_state(&[(0.5, 0.01), (1.0, 0.02)]);
+        let engine = GreeksEngine::new(base_cfg(), nbbo_store.clone(), staleness_us, curve_state);
+        let mut trades = vec![trade];
+        engine.enrich_batch(&mut trades).await;
+
+        let enriched = &trades[0];
+        assert_eq!(
+            enriched.greeks_flags, 0,
+            "unexpected greeks flags: {}",
+            enriched.greeks_flags
+        );
+        assert!(enriched.delta.is_some());
+        assert!(enriched.gamma.is_some());
+        assert!(enriched.vega.is_some());
+        assert!(enriched.theta.is_some());
+        assert_eq!(enriched.nbbo_bid, Some(underlying_quote.bid));
+        assert_eq!(enriched.nbbo_ask, Some(underlying_quote.ask));
     }
 
     #[tokio::test]

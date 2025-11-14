@@ -341,9 +341,6 @@ impl FlatfileIngestionService {
             if let Some(q) = batch.rows.last() {
                 last_ts = Some(q.quote_ts_ns);
             }
-            if let Some(ts) = last_ts {
-                guard.prune_before(ts.saturating_sub(2_000_000_000));
-            }
         }
         info!("Seeding option NBBO for day: {}", date.format("%Y-%m-%d"));
         let mut opt_nbbo_stream = source.get_option_nbbo(scope.clone()).await;
@@ -355,9 +352,6 @@ impl FlatfileIngestionService {
             }
             if let Some(q) = batch.rows.last() {
                 last_opt_ts = Some(q.quote_ts_ns);
-            }
-            if let Some(ts) = last_opt_ts {
-                guard.prune_before(ts.saturating_sub(2_000_000_000));
             }
         }
         info!("Processing options (OPRA) day: {}", date.format("%Y-%m-%d"));
@@ -437,6 +431,7 @@ impl FlatfileIngestionService {
             row_count += batch.rows.len() as u64;
             metrics.inc_batches(1);
             metrics.inc_rows(batch.rows.len() as u64);
+            hydrate_underlying_nbbo(&nbbo_store, flatfile_staleness_us, &mut batch.rows).await;
             let start = Instant::now();
             greeks_engine.enrich_batch(&mut batch.rows).await;
             classify_option_trades(&classifier, &class_params, &nbbo_store, &mut batch.rows).await;
@@ -484,6 +479,10 @@ impl FlatfileIngestionService {
                 );
             }
         }
+        {
+            let mut guard = nbbo_store.write().await;
+            guard.data.clear();
+        }
     }
 }
 
@@ -499,6 +498,36 @@ async fn classify_option_trades(
     let guard = nbbo_store.read().await;
     for trade in rows.iter_mut() {
         classifier.classify_trade(trade, &*guard, params);
+    }
+}
+
+async fn hydrate_underlying_nbbo(
+    nbbo_store: &Arc<TokioRwLock<NbboStore>>,
+    staleness_us: u32,
+    rows: &mut [OptionTrade],
+) {
+    if rows.is_empty() {
+        return;
+    }
+    let guard = nbbo_store.read().await;
+    for trade in rows.iter_mut() {
+        let quote = guard.get_best_before(&trade.underlying, trade.trade_ts_ns, staleness_us);
+        if let Some(qte) = quote {
+            let age_ns = trade.trade_ts_ns.saturating_sub(qte.quote_ts_ns);
+            let age_us = (age_ns / 1_000).max(0) as u64;
+            let age_clamped = age_us.min(u32::MAX as u64) as u32;
+            trade.set_underlying_nbbo_snapshot(
+                Some(qte.bid),
+                Some(qte.ask),
+                Some(qte.bid_sz),
+                Some(qte.ask_sz),
+                Some(qte.quote_ts_ns),
+                Some(age_clamped),
+                Some(qte.state.clone()),
+            );
+        } else {
+            trade.set_underlying_nbbo_snapshot(None, None, None, None, None, None, None);
+        }
     }
 }
 

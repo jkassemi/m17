@@ -11,6 +11,7 @@ nbbo-engine = { path = "../nbbo-engine" }
 gc-engine = { path = "../gc-engine" }
 treasury-engine = { path = "../treasury-engine" }
 trade-ws-engine = { path = "../trade-ws-engine" }
+aggregations = { path = "../aggregations" }
 thiserror = "1"
 time = { version = "0.3", default-features = false, features = ["alloc", "formatting", "parsing"] }
 core-types = { path = "../core-types" }
@@ -22,3 +23,7 @@ hyper = { version = "1.7", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1.3"
 chrono = { version = "0.4", features = ["clock"] }
+arrow = { version = "57", default-features = false, features = ["ipc"] }
+parquet = { version = "57", features = ["arrow"] }
+crc32fast = "1"
+trading-calendar = "0.2"

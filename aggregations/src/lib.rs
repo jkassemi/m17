@@ -108,6 +108,15 @@ impl AggregationsEngine {
         }
         output
     }
+
+    /// Finalize any in-flight windows without waiting for more events.
+    pub fn drain(&mut self) -> Vec<AggregationRow> {
+        let mut rows = Vec::new();
+        for window in self.windows.iter_mut() {
+            rows.extend(window.drain());
+        }
+        rows
+    }
 }
 
 fn drop_stale_prices(buf: &mut VecDeque<(i64, f64)>, ts_ns: i64, horizon_ns: i64) {
@@ -196,6 +205,15 @@ impl WindowAggregator {
             state.ingest(event, contract_size, last_under_price, price_history);
         }
         rows
+    }
+
+    fn drain(&mut self) -> Vec<AggregationRow> {
+        if let Some(state) = self.state.take() {
+            if let Some(row) = state.finalize() {
+                return vec![row];
+            }
+        }
+        Vec::new()
     }
 }
 

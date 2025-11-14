@@ -133,6 +133,13 @@ pub struct OptionTrade {
     pub nbbo_ts_ns: Option<i64>,
     pub nbbo_age_us: Option<u32>,
     pub nbbo_state: Option<NbboState>,
+    pub underlying_nbbo_bid: Option<f64>,
+    pub underlying_nbbo_ask: Option<f64>,
+    pub underlying_nbbo_bid_sz: Option<u32>,
+    pub underlying_nbbo_ask_sz: Option<u32>,
+    pub underlying_nbbo_ts_ns: Option<i64>,
+    pub underlying_nbbo_age_us: Option<u32>,
+    pub underlying_nbbo_state: Option<NbboState>,
     pub tick_size_used: Option<f64>,
     pub delta: Option<f64>,
     pub gamma: Option<f64>,
@@ -143,6 +150,27 @@ pub struct OptionTrade {
     pub source: Source,
     pub quality: Quality,
     pub watermark_ts_ns: i64,
+}
+
+impl OptionTrade {
+    pub fn set_underlying_nbbo_snapshot(
+        &mut self,
+        bid: Option<f64>,
+        ask: Option<f64>,
+        bid_sz: Option<u32>,
+        ask_sz: Option<u32>,
+        ts_ns: Option<i64>,
+        age_us: Option<u32>,
+        state: Option<NbboState>,
+    ) {
+        self.underlying_nbbo_bid = bid;
+        self.underlying_nbbo_ask = ask;
+        self.underlying_nbbo_bid_sz = bid_sz;
+        self.underlying_nbbo_ask_sz = ask_sz;
+        self.underlying_nbbo_ts_ns = ts_ns;
+        self.underlying_nbbo_age_us = age_us;
+        self.underlying_nbbo_state = state;
+    }
 }
 
 /// Derived Greeks output linked back to the immutable raw trade via `trade_uid`.

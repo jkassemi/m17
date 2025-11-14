@@ -13,6 +13,7 @@ pub enum PayloadType {
     Quote = 3,
     Aggressor = 4,
     Greeks = 5,
+    Aggregation = 6,
 }
 
 /// Logical status of a slot inside a window row.
@@ -185,26 +186,30 @@ impl TradeSlotKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EnrichmentSlotKind {
     Greeks,
+    Aggregation,
 }
 
 impl EnrichmentSlotKind {
-    pub const ALL: [Self; 1] = [EnrichmentSlotKind::Greeks];
+    pub const ALL: [Self; 2] = [EnrichmentSlotKind::Greeks, EnrichmentSlotKind::Aggregation];
 
     pub fn index(&self) -> usize {
         match self {
             EnrichmentSlotKind::Greeks => 0,
+            EnrichmentSlotKind::Aggregation => 1,
         }
     }
 
     pub fn payload_type(&self) -> PayloadType {
         match self {
             EnrichmentSlotKind::Greeks => PayloadType::Greeks,
+            EnrichmentSlotKind::Aggregation => PayloadType::Aggregation,
         }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
             EnrichmentSlotKind::Greeks => "greeks",
+            EnrichmentSlotKind::Aggregation => "aggregation",
         }
     }
 }

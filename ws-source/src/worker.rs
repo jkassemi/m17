@@ -44,6 +44,7 @@ pub type WsStream = Pin<Box<dyn Stream<Item = WsMessage> + Send>>;
 pub enum ResourceKind {
     EquityQuotes,
     EquityTrades,
+    EquityTradesAndQuotes,
     OptionsQuotes,
     OptionsTrades,
 }
@@ -245,6 +246,7 @@ fn format_symbols(resource: ResourceKind, symbols: &[String]) -> Vec<String> {
     match resource {
         ResourceKind::OptionsTrades => prefix_symbols("T.", symbols),
         ResourceKind::OptionsQuotes => prefix_symbols("Q.", symbols),
+        ResourceKind::EquityTradesAndQuotes => symbols.to_vec(),
         _ => symbols.to_vec(),
     }
 }
@@ -337,6 +339,17 @@ fn decode_value(value: &Value, resource: ResourceKind) -> Option<WsMessage> {
                 .and_then(raw_equity_trade_to_row)
                 .map(WsMessage::EquityTrade)
         }
+        ResourceKind::EquityTradesAndQuotes => match ev {
+            "Q" => serde_json::from_value::<RawQuote>(value.clone())
+                .ok()
+                .and_then(raw_quote_to_nbbo)
+                .map(WsMessage::Nbbo),
+            "T" => serde_json::from_value::<RawEquityTrade>(value.clone())
+                .ok()
+                .and_then(raw_equity_trade_to_row)
+                .map(WsMessage::EquityTrade),
+            _ => None,
+        },
         ResourceKind::OptionsTrades if ev == "T" => {
             serde_json::from_value::<RawOptionTrade>(value.clone())
                 .ok()
@@ -434,6 +447,13 @@ fn raw_option_trade_to_row(raw: RawOptionTrade) -> Option<OptionTrade> {
         nbbo_ts_ns: None,
         nbbo_age_us: None,
         nbbo_state: None,
+        underlying_nbbo_bid: None,
+        underlying_nbbo_ask: None,
+        underlying_nbbo_bid_sz: None,
+        underlying_nbbo_ask_sz: None,
+        underlying_nbbo_ts_ns: None,
+        underlying_nbbo_age_us: None,
+        underlying_nbbo_state: None,
         tick_size_used: None,
         delta: None,
         gamma: None,

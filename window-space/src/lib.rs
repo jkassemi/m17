@@ -26,8 +26,8 @@ pub use config::WindowSpaceConfig;
 #[allow(deprecated)]
 pub use controller::{LedgerController, LedgerSlotStatusSnapshot, LedgerStorageReport};
 pub use controller::{
-    PendingHandle, SlotStatusCounts, StorageSummary, WindowSpaceController,
-    WindowSpaceSlotStatusSnapshot, WindowSpaceStorageReport,
+    PayloadStoreCounts, PendingHandle, SetCounterSnapshot, SlotStatusCounts, StorageSummary,
+    WindowSpaceController, WindowSpaceSlotStatusSnapshot, WindowSpaceStorageReport,
 };
 #[allow(deprecated)]
 pub use error::LedgerError;

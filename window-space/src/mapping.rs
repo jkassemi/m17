@@ -67,6 +67,18 @@ pub struct GreeksPayload {
     pub checksum: u32,
 }
 
+/// Aggregation payload persisted per symbol/window.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AggregationPayload {
+    pub schema_version: u8,
+    pub symbol: String,
+    pub window: String,
+    pub window_start_ns: i64,
+    pub window_end_ns: i64,
+    pub artifact_uri: String,
+    pub checksum: u32,
+}
+
 pub struct MappingStore<T> {
     path: PathBuf,
     entries: Vec<T>,
@@ -130,6 +142,7 @@ pub struct PayloadStores {
     pub quotes: MappingStore<QuoteBatchPayload>,
     pub aggressor: MappingStore<AggressorPayload>,
     pub greeks: MappingStore<GreeksPayload>,
+    pub aggregations: MappingStore<AggregationPayload>,
 }
 
 impl PayloadStores {
@@ -141,6 +154,7 @@ impl PayloadStores {
             quotes: MappingStore::load(base.join("quotes.map"))?,
             aggressor: MappingStore::load(base.join("aggressor.map"))?,
             greeks: MappingStore::load(base.join("greeks.map"))?,
+            aggregations: MappingStore::load(base.join("aggregations.map"))?,
         })
     }
 }

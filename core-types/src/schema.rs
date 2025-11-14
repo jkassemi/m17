@@ -39,6 +39,13 @@ pub fn option_trade_schema() -> Schema {
         Field::new("source", DataType::Utf8, false),
         Field::new("quality", DataType::Utf8, false),
         Field::new("watermark_ts_ns", DataType::Int64, false),
+        Field::new("underlying_nbbo_bid", DataType::Float64, true),
+        Field::new("underlying_nbbo_ask", DataType::Float64, true),
+        Field::new("underlying_nbbo_bid_sz", DataType::UInt32, true),
+        Field::new("underlying_nbbo_ask_sz", DataType::UInt32, true),
+        Field::new("underlying_nbbo_ts_ns", DataType::Int64, true),
+        Field::new("underlying_nbbo_age_us", DataType::UInt32, true),
+        Field::new("underlying_nbbo_state", DataType::Utf8, true),
     ])
 }
 

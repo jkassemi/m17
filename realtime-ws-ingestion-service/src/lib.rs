@@ -298,6 +298,7 @@ impl RealtimeWsIngestionService {
                                     &classifier,
                                     &class_params,
                                     &nbbo_lookup,
+                                    staleness_us,
                                 )
                                 .await;
                                 status.set_gauges(vec![StatusGauge {
@@ -319,6 +320,7 @@ impl RealtimeWsIngestionService {
                             &classifier,
                             &class_params,
                             &nbbo_lookup,
+                            staleness_us,
                         )
                         .await;
                         status.set_gauges(vec![StatusGauge {
@@ -348,10 +350,12 @@ async fn persist_realtime_options(
     classifier: &Arc<Classifier>,
     class_params: &ClassParams,
     nbbo: &Arc<TokioRwLock<NbboStore>>,
+    staleness_us: u32,
 ) {
     if rows.is_empty() {
         return;
     }
+    annotate_underlying_nbbo(rows, nbbo, staleness_us).await;
     greeks.enrich_batch(rows).await;
     classify_option_batch(classifier, class_params, nbbo, rows).await;
     let watermark = rows.last().map(|t| t.trade_ts_ns).unwrap_or(0);
@@ -389,5 +393,35 @@ async fn classify_option_batch(
     let guard = nbbo.read().await;
     for trade in rows.iter_mut() {
         classifier.classify_trade(trade, &*guard, params);
+    }
+}
+
+async fn annotate_underlying_nbbo(
+    rows: &mut [OptionTrade],
+    nbbo: &Arc<TokioRwLock<NbboStore>>,
+    staleness_us: u32,
+) {
+    if rows.is_empty() {
+        return;
+    }
+    let guard = nbbo.read().await;
+    for trade in rows {
+        let quote = guard.get_best_before(&trade.underlying, trade.trade_ts_ns, staleness_us);
+        if let Some(qte) = quote {
+            let age_ns = trade.trade_ts_ns.saturating_sub(qte.quote_ts_ns);
+            let age_us = (age_ns / 1_000).max(0) as u64;
+            let age = age_us.min(u32::MAX as u64) as u32;
+            trade.set_underlying_nbbo_snapshot(
+                Some(qte.bid),
+                Some(qte.ask),
+                Some(qte.bid_sz),
+                Some(qte.ask_sz),
+                Some(qte.quote_ts_ns),
+                Some(age),
+                Some(qte.state.clone()),
+            );
+        } else {
+            trade.set_underlying_nbbo_snapshot(None, None, None, None, None, None, None);
+        }
     }
 }

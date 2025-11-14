@@ -373,11 +373,17 @@ async fn clear_nbbo_store(store: Arc<TokioRwLock<NbboStore>>) {
 }
 
 fn nbbo_from_trade(trade: &OptionTrade) -> Option<Nbbo> {
-    let bid = trade.nbbo_bid?;
-    let ask = trade.nbbo_ask?;
-    let quote_ts = trade.nbbo_ts_ns?;
-    let bid_sz = trade.nbbo_bid_sz.unwrap_or(0);
-    let ask_sz = trade.nbbo_ask_sz.unwrap_or(0);
+    let bid = trade.underlying_nbbo_bid.or(trade.nbbo_bid)?;
+    let ask = trade.underlying_nbbo_ask.or(trade.nbbo_ask)?;
+    let quote_ts = trade.underlying_nbbo_ts_ns.or(trade.nbbo_ts_ns)?;
+    let bid_sz = trade
+        .underlying_nbbo_bid_sz
+        .or(trade.nbbo_bid_sz)
+        .unwrap_or(0);
+    let ask_sz = trade
+        .underlying_nbbo_ask_sz
+        .or(trade.nbbo_ask_sz)
+        .unwrap_or(0);
     let quote_uid = quote_uid(
         &trade.underlying,
         quote_ts,
@@ -398,7 +404,11 @@ fn nbbo_from_trade(trade: &OptionTrade) -> Option<Nbbo> {
         ask,
         bid_sz,
         ask_sz,
-        state: trade.nbbo_state.clone().unwrap_or(NbboState::Normal),
+        state: trade
+            .underlying_nbbo_state
+            .clone()
+            .or_else(|| trade.nbbo_state.clone())
+            .unwrap_or(NbboState::Normal),
         condition: None,
         best_bid_venue: None,
         best_ask_venue: None,
@@ -571,6 +581,13 @@ mod tests {
             nbbo_ts_ns: Some(1_700_000_000_000_000),
             nbbo_age_us: Some(10),
             nbbo_state: None,
+            underlying_nbbo_bid: Some(450.0),
+            underlying_nbbo_ask: Some(450.5),
+            underlying_nbbo_bid_sz: Some(100),
+            underlying_nbbo_ask_sz: Some(200),
+            underlying_nbbo_ts_ns: Some(1_700_000_000_000_000),
+            underlying_nbbo_age_us: Some(8),
+            underlying_nbbo_state: None,
             tick_size_used: None,
             delta: None,
             gamma: None,

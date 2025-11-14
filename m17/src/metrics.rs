@@ -1,7 +1,9 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     thread,
+    time::SystemTime,
 };
 
 use http_body_util::Full;
@@ -16,11 +18,76 @@ use nbbo_engine::{AggressorMetrics, AggressorMetricsSnapshot};
 use prometheus::{Encoder, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
 use tokio::{net::TcpListener, sync::oneshot};
 use trade_flatfile_engine::{DownloadMetrics, DownloadSnapshot};
+use trade_ws_engine::{TradeWsMetrics, TradeWsMetricsSnapshot};
 use window_space::{
-    WindowSpaceController,
-    payload::SlotKind,
+    PayloadStoreCounts, SetCounterSnapshot, WindowSpaceController,
+    payload::{EnrichmentSlotKind, SlotKind},
     slot_metrics::{SlotCountsSnapshot, SlotMetrics, SlotMetricsSnapshot},
 };
+
+pub struct EngineStatusSample {
+    pub name: String,
+    pub seconds_since_start: i64,
+}
+
+#[derive(Default)]
+pub struct EngineStatusRegistry {
+    inner: Mutex<HashMap<&'static str, EngineRuntimeState>>,
+}
+
+#[derive(Clone, Copy)]
+struct EngineRuntimeState {
+    running: bool,
+    started_at: Option<SystemTime>,
+}
+
+impl EngineStatusRegistry {
+    pub fn mark_started(&self, name: &'static str) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.insert(
+            name,
+            EngineRuntimeState {
+                running: true,
+                started_at: Some(SystemTime::now()),
+            },
+        );
+    }
+
+    pub fn mark_stopped(&self, name: &'static str) {
+        let mut guard = self.inner.lock().unwrap();
+        guard
+            .entry(name)
+            .and_modify(|state| {
+                state.running = false;
+            })
+            .or_insert(EngineRuntimeState {
+                running: false,
+                started_at: None,
+            });
+    }
+
+    pub fn snapshot(&self) -> Vec<EngineStatusSample> {
+        let guard = self.inner.lock().unwrap();
+        guard
+            .iter()
+            .map(|(name, state)| {
+                let seconds = if state.running {
+                    state
+                        .started_at
+                        .and_then(|ts| SystemTime::now().duration_since(ts).ok())
+                        .map(|dur| dur.as_secs() as i64)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                EngineStatusSample {
+                    name: (*name).to_string(),
+                    seconds_since_start: seconds,
+                }
+            })
+            .collect()
+    }
+}
 
 pub struct MetricsServer {
     shutdown: Option<oneshot::Sender<()>>,
@@ -33,6 +100,8 @@ impl MetricsServer {
         download_metrics: Arc<DownloadMetrics>,
         controller: Arc<WindowSpaceController>,
         aggressor_metrics: Arc<nbbo_engine::AggressorMetrics>,
+        trade_ws_metrics: Arc<TradeWsMetrics>,
+        engine_status: Arc<EngineStatusRegistry>,
         addr: SocketAddr,
     ) -> Self {
         static LOG_ONCE: OnceLock<()> = OnceLock::new();
@@ -47,6 +116,8 @@ impl MetricsServer {
                 download_metrics,
                 controller,
                 aggressor_metrics,
+                trade_ws_metrics,
+                engine_status,
                 addr,
                 shutdown_rx,
             ));
@@ -72,6 +143,8 @@ async fn run_http(
     download_metrics: Arc<DownloadMetrics>,
     controller: Arc<WindowSpaceController>,
     aggressor_metrics: Arc<AggressorMetrics>,
+    trade_ws_metrics: Arc<TradeWsMetrics>,
+    engine_status: Arc<EngineStatusRegistry>,
     addr: SocketAddr,
     mut shutdown: oneshot::Receiver<()>,
 ) {
@@ -94,6 +167,8 @@ async fn run_http(
                         let download_metrics = Arc::clone(&download_metrics);
                         let controller = Arc::clone(&controller);
                         let aggressor_metrics = Arc::clone(&aggressor_metrics);
+                        let trade_ws_metrics = Arc::clone(&trade_ws_metrics);
+                        let engine_status = Arc::clone(&engine_status);
                         tokio::spawn(async move {
                             if let Err(err) = serve_connection(
                                 stream,
@@ -102,6 +177,8 @@ async fn run_http(
                                 download_metrics,
                                 controller,
                                 aggressor_metrics,
+                                trade_ws_metrics,
+                                engine_status,
                             )
                             .await
                             {
@@ -125,6 +202,8 @@ async fn serve_connection(
     download_metrics: Arc<DownloadMetrics>,
     controller: Arc<WindowSpaceController>,
     aggressor_metrics: Arc<AggressorMetrics>,
+    trade_ws_metrics: Arc<TradeWsMetrics>,
+    engine_status: Arc<EngineStatusRegistry>,
 ) -> Result<(), hyper::Error> {
     let io = TokioIo::new(stream);
     let service = service_fn(move |req: Request<Incoming>| {
@@ -133,6 +212,8 @@ async fn serve_connection(
         let download_metrics = Arc::clone(&download_metrics);
         let controller = Arc::clone(&controller);
         let aggressor_metrics = Arc::clone(&aggressor_metrics);
+        let trade_ws_metrics = Arc::clone(&trade_ws_metrics);
+        let engine_status = Arc::clone(&engine_status);
         async move {
             let response = handle_request(
                 req,
@@ -141,6 +222,8 @@ async fn serve_connection(
                 download_metrics,
                 controller,
                 aggressor_metrics,
+                trade_ws_metrics,
+                engine_status,
             );
             Ok::<_, hyper::Error>(response)
         }
@@ -156,6 +239,8 @@ fn handle_request(
     download_metrics: Arc<DownloadMetrics>,
     controller: Arc<WindowSpaceController>,
     aggressor_metrics: Arc<AggressorMetrics>,
+    trade_ws_metrics: Arc<TradeWsMetrics>,
+    engine_status: Arc<EngineStatusRegistry>,
 ) -> Response<Full<Bytes>> {
     if req.uri().path() != "/metrics" {
         return Response::builder()
@@ -166,9 +251,22 @@ fn handle_request(
     let snapshot = slot_metrics.snapshot();
     let downloads = download_metrics.snapshot();
     let symbol_count = controller.symbol_count();
+    let payload_counts = controller.payload_store_counts();
     let classification = aggressor_metrics.snapshot();
+    let set_counts = controller.set_counter_snapshot();
+    let trade_ws = trade_ws_metrics.snapshot();
+    let engines = engine_status.snapshot();
     let body = exporter
-        .render(snapshot, &downloads, symbol_count, classification)
+        .render(
+            snapshot,
+            &downloads,
+            symbol_count,
+            payload_counts,
+            set_counts,
+            classification,
+            trade_ws,
+            &engines,
+        )
         .unwrap_or_else(|_| b"metrics_unavailable".to_vec());
     Response::builder()
         .status(200)
@@ -181,10 +279,20 @@ struct MetricsExporter {
     registry: Registry,
     slot_gauge: IntGaugeVec,
     window_gauge: IntGaugeVec,
+    aggregation_slot_gauge: IntGaugeVec,
     download_streamed: IntGaugeVec,
     download_remaining: IntGaugeVec,
     symbol_count: IntGauge,
+    payload_entries: IntGaugeVec,
+    set_calls: IntGaugeVec,
     classification_total: IntGaugeVec,
+    trade_ws_events: IntGauge,
+    trade_ws_quote_events: IntGauge,
+    trade_ws_errors: IntGauge,
+    trade_ws_skipped: IntGauge,
+    trade_ws_subscriptions: IntGauge,
+    trade_ws_refresh_age: IntGauge,
+    engine_runtime: IntGaugeVec,
 }
 
 impl MetricsExporter {
@@ -212,6 +320,17 @@ impl MetricsExporter {
         registry
             .register(Box::new(window_gauge.clone()))
             .expect("register window gauge");
+        let aggregation_slot_gauge = IntGaugeVec::new(
+            Opts::new(
+                "aggregation_windowspace_slots",
+                "Aggregation slot state counts across the enrichment ledger",
+            ),
+            &["slot", "state"],
+        )
+        .expect("aggregation slot gauge");
+        registry
+            .register(Box::new(aggregation_slot_gauge.clone()))
+            .expect("register aggregation slot gauge");
         let download_streamed = IntGaugeVec::new(
             Opts::new(
                 "flatfile_slot_bytes_streamed",
@@ -242,6 +361,28 @@ impl MetricsExporter {
         registry
             .register(Box::new(symbol_count.clone()))
             .expect("register symbol count gauge");
+        let payload_entries = IntGaugeVec::new(
+            Opts::new(
+                "windowspace_payload_entries",
+                "Counts of payload mapping entries per store",
+            ),
+            &["store"],
+        )
+        .expect("payload entry gauge");
+        registry
+            .register(Box::new(payload_entries.clone()))
+            .expect("register payload entry gauge");
+        let set_calls = IntGaugeVec::new(
+            Opts::new(
+                "windowspace_set_calls",
+                "Total successful slot setter calls per slot kind",
+            ),
+            &["slot"],
+        )
+        .expect("set calls gauge");
+        registry
+            .register(Box::new(set_calls.clone()))
+            .expect("register set calls gauge");
         let classification_total = IntGaugeVec::new(
             Opts::new(
                 "aggressor_classifications_total",
@@ -253,14 +394,83 @@ impl MetricsExporter {
         registry
             .register(Box::new(classification_total.clone()))
             .expect("register classification gauge");
+        let trade_ws_events = IntGauge::with_opts(Opts::new(
+            "trade_ws_events_total",
+            "Total websocket trade events observed",
+        ))
+        .expect("trade ws events");
+        registry
+            .register(Box::new(trade_ws_events.clone()))
+            .expect("register trade ws events");
+        let trade_ws_quote_events = IntGauge::with_opts(Opts::new(
+            "trade_ws_quote_events_total",
+            "Total websocket quote events observed",
+        ))
+        .expect("trade ws quote events");
+        registry
+            .register(Box::new(trade_ws_quote_events.clone()))
+            .expect("register trade ws quote events");
+        let trade_ws_errors = IntGauge::with_opts(Opts::new(
+            "trade_ws_errors_total",
+            "Total websocket ingestion errors observed",
+        ))
+        .expect("trade ws errors");
+        registry
+            .register(Box::new(trade_ws_errors.clone()))
+            .expect("register trade ws errors");
+        let trade_ws_skipped = IntGauge::with_opts(Opts::new(
+            "trade_ws_skipped_events_total",
+            "Total websocket events skipped before ingestion",
+        ))
+        .expect("trade ws skipped");
+        registry
+            .register(Box::new(trade_ws_skipped.clone()))
+            .expect("register trade ws skipped");
+        let trade_ws_subscriptions = IntGauge::with_opts(Opts::new(
+            "trade_ws_subscribed_contracts",
+            "Number of option contracts currently subscribed via websocket",
+        ))
+        .expect("trade ws subscriptions");
+        registry
+            .register(Box::new(trade_ws_subscriptions.clone()))
+            .expect("register trade ws subscribed");
+        let trade_ws_refresh_age = IntGauge::with_opts(Opts::new(
+            "trade_ws_seconds_since_contract_refresh",
+            "Seconds since the last most-active contract snapshot pull",
+        ))
+        .expect("trade ws refresh age");
+        registry
+            .register(Box::new(trade_ws_refresh_age.clone()))
+            .expect("register trade ws refresh age");
+        let engine_runtime = IntGaugeVec::new(
+            Opts::new(
+                "engine_runtime_seconds",
+                "Seconds since each engine last successfully started (0 if stopped)",
+            ),
+            &["engine"],
+        )
+        .expect("engine runtime gauge");
+        registry
+            .register(Box::new(engine_runtime.clone()))
+            .expect("register engine runtime");
         Self {
             registry,
             slot_gauge,
             window_gauge,
+            aggregation_slot_gauge,
             download_streamed,
             download_remaining,
             symbol_count,
+            payload_entries,
+            set_calls,
             classification_total,
+            trade_ws_events,
+            trade_ws_quote_events,
+            trade_ws_errors,
+            trade_ws_skipped,
+            trade_ws_subscriptions,
+            trade_ws_refresh_age,
+            engine_runtime,
         }
     }
 
@@ -269,7 +479,11 @@ impl MetricsExporter {
         snapshot: SlotMetricsSnapshot,
         downloads: &[DownloadSnapshot],
         symbols: usize,
+        payload_counts: PayloadStoreCounts,
+        set_counts: SetCounterSnapshot,
         classifications: AggressorMetricsSnapshot,
+        trade_ws: TradeWsMetricsSnapshot,
+        engine_status: &[EngineStatusSample],
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         self.window_gauge
             .with_label_values(&["trade"])
@@ -279,9 +493,14 @@ impl MetricsExporter {
             .set(snapshot.enrichment_windows as i64);
         self.record_slots(&snapshot.trade_slots);
         self.record_slots(&snapshot.enrichment_slots);
+        self.record_aggregation_slots(&snapshot.enrichment_slots);
         self.record_downloads(downloads);
         self.symbol_count.set(symbols as i64);
+        self.record_payload_counts(payload_counts);
+        self.record_set_counts(set_counts);
         self.record_classifications(classifications);
+        self.record_trade_ws(trade_ws);
+        self.record_engine_status(engine_status);
         let metric_families = self.registry.gather();
         let mut buffer = Vec::new();
         TextEncoder::new().encode(&metric_families, &mut buffer)?;
@@ -315,6 +534,31 @@ impl MetricsExporter {
         }
     }
 
+    fn record_aggregation_slots(&self, slots: &[SlotCountsSnapshot]) {
+        for slot in slots {
+            if let SlotKind::Enrichment(EnrichmentSlotKind::Aggregation) = slot.slot {
+                self.aggregation_slot_gauge
+                    .with_label_values(&["aggregation", "empty"])
+                    .set(slot.counts.empty as i64);
+                self.aggregation_slot_gauge
+                    .with_label_values(&["aggregation", "pending"])
+                    .set(slot.counts.pending as i64);
+                self.aggregation_slot_gauge
+                    .with_label_values(&["aggregation", "filled"])
+                    .set(slot.counts.filled as i64);
+                self.aggregation_slot_gauge
+                    .with_label_values(&["aggregation", "cleared"])
+                    .set(slot.counts.cleared as i64);
+                self.aggregation_slot_gauge
+                    .with_label_values(&["aggregation", "retire"])
+                    .set(slot.counts.retire as i64);
+                self.aggregation_slot_gauge
+                    .with_label_values(&["aggregation", "retired"])
+                    .set(slot.counts.retired as i64);
+            }
+        }
+    }
+
     fn record_downloads(&self, downloads: &[DownloadSnapshot]) {
         for snapshot in downloads {
             let label = snapshot.slot.label();
@@ -341,5 +585,79 @@ impl MetricsExporter {
         self.classification_total
             .with_label_values(&["combined"])
             .set((snapshot.option_total + snapshot.underlying_total) as i64);
+    }
+
+    fn record_trade_ws(&self, snapshot: TradeWsMetricsSnapshot) {
+        self.trade_ws_events.set(snapshot.trade_events as i64);
+        self.trade_ws_quote_events.set(snapshot.quote_events as i64);
+        self.trade_ws_errors.set(snapshot.error_events as i64);
+        self.trade_ws_skipped.set(snapshot.skipped_events as i64);
+        self.trade_ws_subscriptions
+            .set(snapshot.subscribed_contracts as i64);
+        let age = snapshot
+            .seconds_since_last_download
+            .map(|secs| secs as i64)
+            .unwrap_or(-1);
+        self.trade_ws_refresh_age.set(age);
+    }
+
+    fn record_engine_status(&self, statuses: &[EngineStatusSample]) {
+        self.engine_runtime.reset();
+        for sample in statuses {
+            self.engine_runtime
+                .with_label_values(&[sample.name.as_str()])
+                .set(sample.seconds_since_start);
+        }
+    }
+
+    fn record_payload_counts(&self, counts: PayloadStoreCounts) {
+        self.payload_entries
+            .with_label_values(&["rf_rate"])
+            .set(counts.rf_rate as i64);
+        self.payload_entries
+            .with_label_values(&["trades"])
+            .set(counts.trades as i64);
+        self.payload_entries
+            .with_label_values(&["quotes"])
+            .set(counts.quotes as i64);
+        self.payload_entries
+            .with_label_values(&["aggressor"])
+            .set(counts.aggressor as i64);
+        self.payload_entries
+            .with_label_values(&["greeks"])
+            .set(counts.greeks as i64);
+        self.payload_entries
+            .with_label_values(&["aggregations"])
+            .set(counts.aggregations as i64);
+    }
+
+    fn record_set_counts(&self, counts: SetCounterSnapshot) {
+        self.set_calls
+            .with_label_values(&["rf_rate"])
+            .set(counts.rf_rate as i64);
+        self.set_calls
+            .with_label_values(&["option_trade"])
+            .set(counts.option_trade as i64);
+        self.set_calls
+            .with_label_values(&["option_quote"])
+            .set(counts.option_quote as i64);
+        self.set_calls
+            .with_label_values(&["underlying_trade"])
+            .set(counts.underlying_trade as i64);
+        self.set_calls
+            .with_label_values(&["underlying_quote"])
+            .set(counts.underlying_quote as i64);
+        self.set_calls
+            .with_label_values(&["option_aggressor"])
+            .set(counts.option_aggressor as i64);
+        self.set_calls
+            .with_label_values(&["underlying_aggressor"])
+            .set(counts.underlying_aggressor as i64);
+        self.set_calls
+            .with_label_values(&["greeks"])
+            .set(counts.greeks as i64);
+        self.set_calls
+            .with_label_values(&["aggregation"])
+            .set(counts.aggregation as i64);
     }
 }

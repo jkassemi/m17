@@ -110,6 +110,7 @@ impl WindowRow for TradeWindowRow {
 pub struct EnrichmentWindowRow {
     pub header: WindowRowHeader,
     pub greeks: Slot,
+    pub aggregation: Slot,
 }
 
 impl Default for EnrichmentWindowRow {
@@ -117,6 +118,7 @@ impl Default for EnrichmentWindowRow {
         Self {
             header: WindowRowHeader::default(),
             greeks: Slot::default(),
+            aggregation: Slot::default(),
         }
     }
 }
@@ -132,6 +134,7 @@ impl WindowRow for EnrichmentWindowRow {
     fn slot(&self, index: usize) -> &Slot {
         match index {
             0 => &self.greeks,
+            1 => &self.aggregation,
             _ => panic!("invalid enrichment slot index {index}"),
         }
     }
@@ -139,6 +142,7 @@ impl WindowRow for EnrichmentWindowRow {
     fn slot_mut(&mut self, index: usize) -> &mut Slot {
         match index {
             0 => &mut self.greeks,
+            1 => &mut self.aggregation,
             _ => panic!("invalid enrichment slot index {index}"),
         }
     }
@@ -792,5 +796,6 @@ mod tests {
             .unwrap();
         let row = ledger.get_row(1, 0).unwrap();
         assert_eq!(row.greeks.payload_id, 5);
+        assert_eq!(row.aggregation.payload_id, 0);
     }
 }

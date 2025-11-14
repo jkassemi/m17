@@ -1585,14 +1585,6 @@ struct DownloadToken {
 }
 
 impl DownloadToken {
-    fn new(metrics: Arc<DownloadMetrics>, slot: TradeSlotKind) -> Self {
-        Self {
-            metrics,
-            slot,
-            temp_path: None,
-        }
-    }
-
     fn with_temp_path(
         metrics: Arc<DownloadMetrics>,
         slot: TradeSlotKind,

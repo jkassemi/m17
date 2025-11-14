@@ -2,6 +2,7 @@ mod config;
 mod metrics;
 
 use std::{
+    collections::HashSet,
     env, process,
     str::FromStr,
     sync::{Arc, Once, mpsc},
@@ -24,8 +25,11 @@ use trade_flatfile_engine::{
     DownloadMetrics, FlatfileRuntimeConfig, OptionQuoteFlatfileEngine,
     UnderlyingQuoteFlatfileEngine, UnderlyingTradeFlatfileEngine,
 };
+use trade_ws_engine::{TradeWsConfig, TradeWsEngine};
 use treasury_engine::{TreasuryEngine, TreasuryEngineConfig};
-use window_space::{WindowSpace, WindowSpaceController, WindowSpaceError, WindowSpaceStorageReport};
+use window_space::{
+    WindowSpace, WindowSpaceController, WindowSpaceError, WindowSpaceStorageReport,
+};
 
 const DEFAULT_CLASSIFIER_EPSILON: f64 = 1e-4;
 const DEFAULT_CLASSIFIER_LATENESS_MS: u32 = 1_000;
@@ -115,6 +119,23 @@ fn run() -> Result<(), AppError> {
     )
     .with_prime_symbols(prime_symbols);
     let treasury_engine = TreasuryEngine::new(treasury_cfg, controller.clone());
+    let trade_ws_cfg = TradeWsConfig {
+        label: config.env_label().to_string(),
+        state_dir: config.ledger.state_dir().to_path_buf(),
+        options_ws_url: config.options_ws_url.to_string(),
+        api_key: config.secrets.massive_api_key.clone(),
+        rest_base_url: config.rest_base_url.to_string(),
+        contracts_per_underlying: 1_000,
+        flush_interval: Duration::from_millis(1_000),
+        window_grace: Duration::from_millis(2_000),
+        contract_refresh_interval: Duration::from_secs(300),
+        symbol_filter: {
+            let mut set = HashSet::new();
+            set.insert(config.ws_target_symbol.to_string());
+            Some(set)
+        },
+    };
+    let trade_ws_engine = TradeWsEngine::new(trade_ws_cfg, controller.clone());
 
     println!(
         "m17 orchestrator booted in {:?} mode; window space state at {:?}",
@@ -150,6 +171,7 @@ fn run() -> Result<(), AppError> {
     );
 
     treasury_engine.start()?;
+    trade_ws_engine.start()?;
     option_quote_engine.start()?;
     underlying_trade_engine.start()?;
     underlying_quote_engine.start()?;
@@ -157,6 +179,7 @@ fn run() -> Result<(), AppError> {
     underlying_aggressor_engine.start()?;
     gc_engine.start()?;
     log_engine_health("treasury", &treasury_engine);
+    log_engine_health("options-ws-trade", &trade_ws_engine);
     log_engine_health("option-quote-flatfile", &option_quote_engine);
     log_engine_health("underlying-trade-flatfile", &underlying_trade_engine);
     log_engine_health("underlying-quote-flatfile", &underlying_quote_engine);
@@ -180,6 +203,7 @@ fn run() -> Result<(), AppError> {
     underlying_trade_engine.stop()?;
     option_quote_engine.stop()?;
     treasury_engine.stop()?;
+    trade_ws_engine.stop()?;
     metrics_server.shutdown();
 
     // Keep controller alive for the lifetime of engines.

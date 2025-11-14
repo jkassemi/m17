@@ -42,6 +42,7 @@ pub struct AppConfig {
     pub rest_base_url: &'static str,
     pub stocks_ws_url: &'static str,
     pub options_ws_url: &'static str,
+    pub ws_target_symbol: &'static str,
     pub secrets: Secrets,
     pub flatfile: FlatfileSettings,
     pub symbol_universe: Option<Arc<HashSet<String>>>,
@@ -69,6 +70,7 @@ impl AppConfig {
             rest_base_url: "https://api.massive.com",
             stocks_ws_url: "wss://socket.massive.com/stocks",
             options_ws_url: "wss://socket.massive.com/options",
+            ws_target_symbol: "SPY",
             secrets: Secrets::from_env()?,
             flatfile: FlatfileSettings::for_env(env),
             symbol_universe,
@@ -155,6 +157,10 @@ fn symbol_universe_for(env: Environment) -> Option<Arc<HashSet<String>>> {
         )),
         Environment::Prod => None,
     }
+}
+
+pub fn window_space_config_for_env(env: Environment) -> WindowSpaceConfig {
+    ledger_config_for(env)
 }
 
 /// Operator-provided credentials pulled from the shell environment.

@@ -2,6 +2,7 @@
 
 //! WebSocket ingestion utilities for realtime equities quotes and options trades.
 
+use crate::install_rustls_provider;
 use core_types::opra::parse_opra_contract;
 use core_types::types::{
     AggressorSide, ClassMethod, EquityTrade, Nbbo, NbboState, OptionTrade, Quality, Source,
@@ -93,6 +94,7 @@ impl WsWorker {
     }
 
     pub async fn stream(self) -> Result<WsStream, WsError> {
+        install_rustls_provider();
         self.stream_live().await
     }
 

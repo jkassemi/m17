@@ -21,7 +21,7 @@ use nbbo_engine::{
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use trade_flatfile_engine::{
-    DownloadMetrics, FlatfileRuntimeConfig, OptionQuoteFlatfileEngine, OptionTradeFlatfileEngine,
+    DownloadMetrics, FlatfileRuntimeConfig, OptionQuoteFlatfileEngine,
     UnderlyingQuoteFlatfileEngine, UnderlyingTradeFlatfileEngine,
 };
 use window_space::{
@@ -78,8 +78,6 @@ fn run() -> Result<(), AppError> {
         non_trading_ready_time: config.flatfile.non_trading_ready_time,
         window_end,
     };
-    let option_trade_engine =
-        OptionTradeFlatfileEngine::new(flatfile_cfg.clone(), controller.clone());
     let option_quote_engine =
         OptionQuoteFlatfileEngine::new(flatfile_cfg.clone(), controller.clone());
     let underlying_trade_engine =
@@ -140,14 +138,12 @@ fn run() -> Result<(), AppError> {
         describe_flatfile_ranges(&config.flatfile.date_ranges)
     );
 
-    option_trade_engine.start()?;
     option_quote_engine.start()?;
     underlying_trade_engine.start()?;
     underlying_quote_engine.start()?;
     option_aggressor_engine.start()?;
     underlying_aggressor_engine.start()?;
     gc_engine.start()?;
-    log_engine_health("option-trade-flatfile", &option_trade_engine);
     log_engine_health("option-quote-flatfile", &option_quote_engine);
     log_engine_health("underlying-trade-flatfile", &underlying_trade_engine);
     log_engine_health("underlying-quote-flatfile", &underlying_quote_engine);
@@ -170,7 +166,6 @@ fn run() -> Result<(), AppError> {
     underlying_quote_engine.stop()?;
     underlying_trade_engine.stop()?;
     option_quote_engine.stop()?;
-    option_trade_engine.stop()?;
     metrics_server.shutdown();
 
     // Keep controller alive for the lifetime of engines.

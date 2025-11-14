@@ -3,6 +3,7 @@
 1. MINIMAL CHANGES. DO NOT EXTRAPOLATE OR EXTEND ENGINEERING BEYOND THE USER'S REQUEST.
 2. The user struggles with ADHD. They may focus on a portion of your message during your response. Take this into consideration and confirm/adapt to the conversation as necessary.
 3. The entire project here was written over the past two days. It's possible to move quickly. Unless it's helpful for your framing, avoid considering explicit timeframes or subjective assignment of words like "massive" or "major" for what may be relatively simple tasks given the velocity.
+4. Let's always make sure we know the specifics of how a data file is sorted/ordered before we use it. And the production version schema. That would avoid a lot of problems.
 
 ## Project Structure & Module Organization
 

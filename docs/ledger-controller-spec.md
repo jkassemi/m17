@@ -262,8 +262,7 @@ These setters behave the same as TradeWindowSpace writes but target the enrichme
 - Greeks/aggregation engines take two handles: the trade ledger for source refs and the enrichment ledger for their outputs. They dereference payload IDs via the mapping tables as needed, then publish overlays/aggregates via enrichment setters.
 - Orchestrator supervises engines: if the ledgers detect backpressure, symbol-cap exhaustion, or priority-region starvation, `m17` can pause/resume loops, initiate repairs via ledger APIs, or clear/replay ranges.
 - Flatfile ingestion now comprises four engines bound to explicit ledger slots:
-  - `OptionTradeFlatfileEngine` (OPRA trades → `TradeBatchPayloads` → `option_trade_ref`).
-  - `OptionQuoteFlatfileEngine` (OPRA NBBO snapshots → `QuoteBatchPayloads` → `option_quote_ref`).
+  - `OptionQuoteFlatfileEngine` (OPRA NBBO + trades → option quote slots retired, trade payloads written to `option_trade_ref`, and inline aggressor payloads → `option_aggressor_ref`).
   - `UnderlyingTradeFlatfileEngine` (SIP equity trades → `TradeBatchPayloads` → `underlying_trade_ref`).
   - `UnderlyingQuoteFlatfileEngine` (SIP equity quotes/NBBO → `QuoteBatchPayloads` → `underlying_quote_ref`).
   Each worker buffers per-minute buckets, writes deterministic parquet artifacts inside `ledger.state/trade-flatfile`, appends payload descriptors to the mapping files, and performs CAS-protected `mark_pending → set_*` transitions so repairs can rewind any window.
@@ -314,8 +313,7 @@ Use `[ ]` / `[x]` to track progress.
 
 #### `trade-flatfile-engine`
 
-- [x] `OptionTradeFlatfileEngine`: walk OPRA trade dumps, emit Parquet artifacts containing raw trade columns only (no aggressor/greeks), append `TradeBatchPayload`s, and write the `option_trade_ref` slots.
-- [x] `OptionQuoteFlatfileEngine`: stream OPRA NBBO samples, emit `QuoteBatchPayload`s per minute, and fill the `option_quote_ref` columns so aggressor/NBBO engines can dereference both prerequisites.
+- [x] `OptionQuoteFlatfileEngine`: stream OPRA NBBO samples, write option trade/aggresor artifacts inline, and manage the `option_quote_ref` (retire), `option_trade_ref`, and `option_aggressor_ref` slots for each window.
 - [x] `UnderlyingTradeFlatfileEngine`: walk SIP equity trades. Trade payloads write the `underlying_trade_ref` slot and reuse the same ledger-driven restart semantics as options.
 - [x] `UnderlyingQuoteFlatfileEngine`: walk SIP equity quotes/NBBO dumps and publish `QuoteBatchPayload`s into `underlying_quote_ref`.
 - [x] Share the S3 client, batching, checksum, and ledger CAS helpers across both engines; expose repair helpers (`clear_slot`, rewind hooks) for backfills plus ingestion metrics (latency, rows, bytes).

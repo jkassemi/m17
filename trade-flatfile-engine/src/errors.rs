@@ -29,4 +29,6 @@ pub enum FlatfileError {
         last_ts: i64,
         ts: i64,
     },
+    #[error("trade cursor missing buffered record")]
+    MissingBufferedTrade,
 }

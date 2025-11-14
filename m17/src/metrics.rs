@@ -12,6 +12,7 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::rt::TokioIo;
+use nbbo_engine::{AggressorMetrics, AggressorMetricsSnapshot};
 use prometheus::{Encoder, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
 use tokio::{net::TcpListener, sync::oneshot};
 use trade_flatfile_engine::{DownloadMetrics, DownloadSnapshot};
@@ -31,6 +32,7 @@ impl MetricsServer {
         slot_metrics: Arc<SlotMetrics>,
         download_metrics: Arc<DownloadMetrics>,
         controller: Arc<WindowSpaceController>,
+        aggressor_metrics: Arc<nbbo_engine::AggressorMetrics>,
         addr: SocketAddr,
     ) -> Self {
         static LOG_ONCE: OnceLock<()> = OnceLock::new();
@@ -44,6 +46,7 @@ impl MetricsServer {
                 slot_metrics,
                 download_metrics,
                 controller,
+                aggressor_metrics,
                 addr,
                 shutdown_rx,
             ));
@@ -68,6 +71,7 @@ async fn run_http(
     slot_metrics: Arc<SlotMetrics>,
     download_metrics: Arc<DownloadMetrics>,
     controller: Arc<WindowSpaceController>,
+    aggressor_metrics: Arc<AggressorMetrics>,
     addr: SocketAddr,
     mut shutdown: oneshot::Receiver<()>,
 ) {
@@ -89,6 +93,7 @@ async fn run_http(
                         let slot_metrics = Arc::clone(&slot_metrics);
                         let download_metrics = Arc::clone(&download_metrics);
                         let controller = Arc::clone(&controller);
+                        let aggressor_metrics = Arc::clone(&aggressor_metrics);
                         tokio::spawn(async move {
                             if let Err(err) = serve_connection(
                                 stream,
@@ -96,6 +101,7 @@ async fn run_http(
                                 slot_metrics,
                                 download_metrics,
                                 controller,
+                                aggressor_metrics,
                             )
                             .await
                             {
@@ -118,6 +124,7 @@ async fn serve_connection(
     slot_metrics: Arc<SlotMetrics>,
     download_metrics: Arc<DownloadMetrics>,
     controller: Arc<WindowSpaceController>,
+    aggressor_metrics: Arc<AggressorMetrics>,
 ) -> Result<(), hyper::Error> {
     let io = TokioIo::new(stream);
     let service = service_fn(move |req: Request<Incoming>| {
@@ -125,9 +132,16 @@ async fn serve_connection(
         let slot_metrics = Arc::clone(&slot_metrics);
         let download_metrics = Arc::clone(&download_metrics);
         let controller = Arc::clone(&controller);
+        let aggressor_metrics = Arc::clone(&aggressor_metrics);
         async move {
-            let response =
-                handle_request(req, exporter, slot_metrics, download_metrics, controller);
+            let response = handle_request(
+                req,
+                exporter,
+                slot_metrics,
+                download_metrics,
+                controller,
+                aggressor_metrics,
+            );
             Ok::<_, hyper::Error>(response)
         }
     });
@@ -141,6 +155,7 @@ fn handle_request(
     slot_metrics: Arc<SlotMetrics>,
     download_metrics: Arc<DownloadMetrics>,
     controller: Arc<WindowSpaceController>,
+    aggressor_metrics: Arc<AggressorMetrics>,
 ) -> Response<Full<Bytes>> {
     if req.uri().path() != "/metrics" {
         return Response::builder()
@@ -151,8 +166,9 @@ fn handle_request(
     let snapshot = slot_metrics.snapshot();
     let downloads = download_metrics.snapshot();
     let symbol_count = controller.symbol_count();
+    let classification = aggressor_metrics.snapshot();
     let body = exporter
-        .render(snapshot, &downloads, symbol_count)
+        .render(snapshot, &downloads, symbol_count, classification)
         .unwrap_or_else(|_| b"metrics_unavailable".to_vec());
     Response::builder()
         .status(200)
@@ -168,6 +184,7 @@ struct MetricsExporter {
     download_streamed: IntGaugeVec,
     download_remaining: IntGaugeVec,
     symbol_count: IntGauge,
+    classification_total: IntGaugeVec,
 }
 
 impl MetricsExporter {
@@ -225,6 +242,17 @@ impl MetricsExporter {
         registry
             .register(Box::new(symbol_count.clone()))
             .expect("register symbol count gauge");
+        let classification_total = IntGaugeVec::new(
+            Opts::new(
+                "aggressor_classifications_total",
+                "Cumulative aggressor classifications by stream",
+            ),
+            &["kind"],
+        )
+        .expect("classification gauge");
+        registry
+            .register(Box::new(classification_total.clone()))
+            .expect("register classification gauge");
         Self {
             registry,
             slot_gauge,
@@ -232,6 +260,7 @@ impl MetricsExporter {
             download_streamed,
             download_remaining,
             symbol_count,
+            classification_total,
         }
     }
 
@@ -240,6 +269,7 @@ impl MetricsExporter {
         snapshot: SlotMetricsSnapshot,
         downloads: &[DownloadSnapshot],
         symbols: usize,
+        classifications: AggressorMetricsSnapshot,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         self.window_gauge
             .with_label_values(&["trade"])
@@ -251,6 +281,7 @@ impl MetricsExporter {
         self.record_slots(&snapshot.enrichment_slots);
         self.record_downloads(downloads);
         self.symbol_count.set(symbols as i64);
+        self.record_classifications(classifications);
         let metric_families = self.registry.gather();
         let mut buffer = Vec::new();
         TextEncoder::new().encode(&metric_families, &mut buffer)?;
@@ -295,5 +326,17 @@ impl MetricsExporter {
                 .with_label_values(&[label])
                 .set(remaining as i64);
         }
+    }
+
+    fn record_classifications(&self, snapshot: AggressorMetricsSnapshot) {
+        self.classification_total
+            .with_label_values(&["option"])
+            .set(snapshot.option_total as i64);
+        self.classification_total
+            .with_label_values(&["underlying"])
+            .set(snapshot.underlying_total as i64);
+        self.classification_total
+            .with_label_values(&["combined"])
+            .set((snapshot.option_total + snapshot.underlying_total) as i64);
     }
 }

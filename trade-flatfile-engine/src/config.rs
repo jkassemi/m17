@@ -1,6 +1,7 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use crate::download_metrics::DownloadMetrics;
+use chrono::{NaiveDate, NaiveTime};
 use core_types::config::DateRange;
 
 /// Runtime wiring supplied by the orchestrator.
@@ -19,6 +20,9 @@ pub struct FlatfileRuntimeConfig {
     pub progress_logging: bool,
     pub download_metrics: Arc<DownloadMetrics>,
     pub symbol_universe: Option<Arc<HashSet<String>>>,
+    pub next_day_ready_time: NaiveTime,
+    pub non_trading_ready_time: NaiveTime,
+    pub window_end: NaiveDate,
 }
 
 impl FlatfileRuntimeConfig {

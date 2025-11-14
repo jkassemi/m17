@@ -29,5 +29,5 @@ Living task list that captures the outstanding work needed to fully separate Gre
 ## Runbooks & Automation (Hold)
 
 - [ ] **Backfill playbooks:** document the end-to-end process for (a) full historical rebuild after the schema cutover, and (b) per-day replays driven by the enrichment state machine.
-- [ ] **Operator tooling:** expose a CLI or RPC endpoint to enqueue manual reruns (instead of editing `config.toml`), integrating with the state machine so the “Outdated data” panel clears automatically once the rerun publishes.
+- [ ] **Operator tooling:** expose a CLI or RPC endpoint to enqueue manual reruns (instead of editing `m17/src/config.rs`), integrating with the state machine so the “Outdated data” panel clears automatically once the rerun publishes.
 - [ ] **Partition writer follow-up:** evaluate reintroducing pooled parquet writers or a compaction job so manifests don’t explode file counts now that writes flush one file per batch.

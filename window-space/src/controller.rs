@@ -112,6 +112,18 @@ impl WindowSpaceController {
         map.iter().map(|(id, _)| id).collect()
     }
 
+    pub fn symbols(&self) -> Vec<(SymbolId, String)> {
+        let map = self.symbol_map.read();
+        map.iter()
+            .map(|(id, symbol)| (id, symbol.to_string()))
+            .collect()
+    }
+
+    pub fn lookup_symbol(&self, symbol_id: SymbolId) -> Option<String> {
+        let map = self.symbol_map.read();
+        map.lookup(symbol_id).map(|sym| sym.to_string())
+    }
+
     #[deprecated(
         since = "0.1.0",
         note = "trade_ledger() has been renamed to trade_window_space(); update call sites to window_space::WindowSpaceController::trade_window_space"
@@ -337,6 +349,42 @@ impl WindowSpaceController {
         Ok(slot_meta)
     }
 
+    pub fn mark_prune(
+        &self,
+        symbol: &str,
+        window_idx: WindowIndex,
+        slot: SlotKind,
+    ) -> Result<Slot> {
+        let symbol_id = self.resolve_symbol(symbol)?;
+        let slot_meta = match slot {
+            SlotKind::Trade(kind) => self
+                .trade_window_space
+                .mark_prune(symbol_id, window_idx, kind)?,
+            SlotKind::Enrichment(kind) => self
+                .enrichment_window_space
+                .mark_prune(symbol_id, window_idx, kind)?,
+        };
+        Ok(slot_meta)
+    }
+
+    pub fn mark_pruned(
+        &self,
+        symbol: &str,
+        window_idx: WindowIndex,
+        slot: SlotKind,
+    ) -> Result<Slot> {
+        let symbol_id = self.resolve_symbol(symbol)?;
+        let slot_meta = match slot {
+            SlotKind::Trade(kind) => self
+                .trade_window_space
+                .mark_pruned(symbol_id, window_idx, kind)?,
+            SlotKind::Enrichment(kind) => self
+                .enrichment_window_space
+                .mark_pruned(symbol_id, window_idx, kind)?,
+        };
+        Ok(slot_meta)
+    }
+
     pub fn get_trade_row(
         &self,
         symbol: &str,
@@ -482,6 +530,8 @@ pub struct SlotStatusCounts {
     pub filled: usize,
     pub cleared: usize,
     pub retired: usize,
+    pub prune: usize,
+    pub pruned: usize,
 }
 
 impl SlotStatusCounts {
@@ -492,11 +542,19 @@ impl SlotStatusCounts {
             SlotStatus::Filled => self.filled += 1,
             SlotStatus::Cleared => self.cleared += 1,
             SlotStatus::Retired => self.retired += 1,
+            SlotStatus::Prune => self.prune += 1,
+            SlotStatus::Pruned => self.pruned += 1,
         }
     }
 
     pub fn total(&self) -> usize {
-        self.empty + self.pending + self.filled + self.cleared + self.retired
+        self.empty
+            + self.pending
+            + self.filled
+            + self.cleared
+            + self.retired
+            + self.prune
+            + self.pruned
     }
 
     pub fn is_zero(&self) -> bool {
@@ -508,8 +566,14 @@ impl fmt::Display for SlotStatusCounts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "empty={}, pending={}, filled={}, cleared={}, retired={}",
-            self.empty, self.pending, self.filled, self.cleared, self.retired
+            "empty={}, pending={}, filled={}, cleared={}, retired={}, prune={}, pruned={}",
+            self.empty,
+            self.pending,
+            self.filled,
+            self.cleared,
+            self.retired,
+            self.prune,
+            self.pruned
         )
     }
 }

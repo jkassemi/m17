@@ -206,6 +206,32 @@ impl TradeWindowSpace {
             })
     }
 
+    pub fn mark_prune(
+        &self,
+        symbol_id: SymbolId,
+        window_idx: WindowIndex,
+        kind: TradeSlotKind,
+    ) -> Result<Slot, SlotWriteError> {
+        self.core
+            .mutate_slot(symbol_id, window_idx, kind.index(), |slot| {
+                slot.mark_prune();
+                Ok(())
+            })
+    }
+
+    pub fn mark_pruned(
+        &self,
+        symbol_id: SymbolId,
+        window_idx: WindowIndex,
+        kind: TradeSlotKind,
+    ) -> Result<Slot, SlotWriteError> {
+        self.core
+            .mutate_slot(symbol_id, window_idx, kind.index(), |slot| {
+                slot.mark_pruned();
+                Ok(())
+            })
+    }
+
     pub fn write_slot(
         &self,
         symbol_id: SymbolId,
@@ -335,6 +361,32 @@ impl EnrichmentWindowSpace {
         self.core
             .mutate_slot(symbol_id, window_idx, kind.index(), |slot| {
                 slot.clear();
+                Ok(())
+            })
+    }
+
+    pub fn mark_prune(
+        &self,
+        symbol_id: SymbolId,
+        window_idx: WindowIndex,
+        kind: EnrichmentSlotKind,
+    ) -> Result<Slot, SlotWriteError> {
+        self.core
+            .mutate_slot(symbol_id, window_idx, kind.index(), |slot| {
+                slot.mark_prune();
+                Ok(())
+            })
+    }
+
+    pub fn mark_pruned(
+        &self,
+        symbol_id: SymbolId,
+        window_idx: WindowIndex,
+        kind: EnrichmentSlotKind,
+    ) -> Result<Slot, SlotWriteError> {
+        self.core
+            .mutate_slot(symbol_id, window_idx, kind.index(), |slot| {
+                slot.mark_pruned();
                 Ok(())
             })
     }
@@ -592,7 +644,10 @@ impl<Row: WindowRow> WindowSpaceCore<Row> {
         for idx in start..self.storage.window_count() {
             let row = self.storage.read_row(symbol_id, idx);
             let status = row.slot(slot_index).status;
-            if status != SlotStatus::Filled && status != SlotStatus::Retired {
+            if !matches!(
+                status,
+                SlotStatus::Filled | SlotStatus::Retired | SlotStatus::Prune | SlotStatus::Pruned
+            ) {
                 return Ok(Some(idx as WindowIndex));
             }
         }

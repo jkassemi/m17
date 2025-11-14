@@ -42,7 +42,7 @@ use core_types::{
     types::{NbboState, Quality, Source},
     uid::{equity_trade_uid, option_trade_uid, quote_uid},
 };
-use csv_async::{AsyncReaderBuilder, Trim};
+use csv_async::{AsyncReaderBuilder, ErrorKind as CsvErrorKind, Trim};
 use engine_api::{
     Engine, EngineError, EngineHealth, EngineResult, HealthStatus, PriorityHookDescription,
 };
@@ -54,6 +54,7 @@ use tokio::{
     io::{AsyncRead, BufReader, ReadBuf},
     runtime::Runtime,
     task::JoinHandle,
+    time::sleep,
 };
 use tokio_util::sync::CancellationToken;
 use trading_calendar::{Market, TradingCalendar};
@@ -147,24 +148,51 @@ impl OptionTradeInner {
         let mut dates = planned_dates(&self.config, &self.calendar);
         dates.sort();
         dates.dedup();
-        for date in dates {
+        loop {
             if cancel.is_cancelled() {
                 break;
             }
-            if !day_requires_ingest(
-                self.ledger.as_ref(),
-                self.day_index.as_ref(),
-                date,
-                TradeSlotKind::OptionTrade,
-            ) {
-                info!(
-                    "[{}] skipping option trade day {} (already ingested)",
-                    self.config.label, date
-                );
-                continue;
+            let now = Utc::now();
+            let mut made_progress = false;
+            let mut has_future_work = false;
+            let mut next_ready_at: Option<DateTime<Utc>> = None;
+            for &date in &dates {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                if let Some(ready_at) = ready_instant(&self.config, &self.calendar, date) {
+                    if ready_at > now {
+                        has_future_work = true;
+                        update_next_ready(&mut next_ready_at, ready_at);
+                        continue;
+                    }
+                }
+                if !day_requires_ingest(
+                    self.ledger.as_ref(),
+                    self.day_index.as_ref(),
+                    date,
+                    TradeSlotKind::OptionTrade,
+                ) {
+                    continue;
+                }
+                has_future_work = true;
+                if let Err(err) = self.process_options_day(date, cancel.clone()).await {
+                    error!("option trade day {} failed: {err}", date);
+                }
+                made_progress = true;
             }
-            if let Err(err) = self.process_options_day(date, cancel.clone()).await {
-                error!("option trade day {} failed: {err}", date);
+            if !has_future_work {
+                break;
+            }
+            if !made_progress {
+                let cancelled = if let Some(ready_at) = next_ready_at {
+                    wait_until_ready(ready_at, cancel.clone()).await
+                } else {
+                    sleep_with_cancel(Duration::from_secs(60), cancel.clone()).await
+                };
+                if cancelled {
+                    break;
+                }
             }
         }
         info!(
@@ -221,14 +249,22 @@ impl OptionTradeInner {
                 );
                 return Ok(());
             }
-            let record = record?;
+            let record = match record {
+                Ok(record) => record,
+                Err(err) => {
+                    log_streaming_error(self.config.label, "option trades", date, &err);
+                    return Err(err.into());
+                }
+            };
             if record.len() < 8 {
                 continue;
             }
-            if let Some((symbol, trade)) = parse_option_trade_row(&record) {
-                if !self.config.allows_underlying(&trade.underlying) {
+            if let Some((_contract, trade)) = parse_option_trade_row(&record) {
+                let underlying = trade.underlying.clone();
+                if underlying.is_empty() || !self.config.allows_underlying(&underlying) {
                     continue;
                 }
+                let symbol = underlying;
                 let ts = trade.timestamp_ns();
                 let window_idx = match self.window_idx_for_timestamp(ts) {
                     Some(idx) => idx,
@@ -238,7 +274,7 @@ impl OptionTradeInner {
                     }
                 };
                 tracker.with_bucket(
-                    &symbol,
+                    symbol.as_str(),
                     window_idx,
                     |sym, idx| self.open_option_trade_window(date, sym, idx),
                     |state| self.finalize_option_trade_state(date, state),
@@ -352,14 +388,11 @@ impl OptionTradeInner {
     fn open_option_trade_window(
         &self,
         date: NaiveDate,
-        symbol: &str,
+        underlying: &str,
         window_idx: WindowIndex,
     ) -> Result<SymbolWindow<OptionTradeRecord>, FlatfileError> {
-        if !self.config.allows_symbol(symbol) {
-            return Ok(SymbolWindow::skipped(symbol, window_idx));
-        }
         let key = WindowKey {
-            symbol: symbol.to_string(),
+            symbol: underlying.to_string(),
             window_idx,
         };
         let status = ensure_slot_pending(
@@ -368,20 +401,20 @@ impl OptionTradeInner {
             SlotKind::Trade(TradeSlotKind::OptionTrade),
         )?;
         if status == SlotStatus::Filled {
-            return Ok(SymbolWindow::skipped(symbol, window_idx));
+            return Ok(SymbolWindow::skipped(underlying, window_idx));
         }
         if status == SlotStatus::Pending {
             let relative_path = artifact_path(
                 &self.config,
                 "options/trades",
                 date,
-                symbol,
+                underlying,
                 window_idx,
                 "parquet",
             );
             cleanup_partial_artifacts(&self.config, &relative_path)?;
         }
-        Ok(SymbolWindow::writable(symbol, window_idx))
+        Ok(SymbolWindow::writable(underlying, window_idx))
     }
 
     fn window_idx_for_timestamp(&self, ts_ns: i64) -> Option<WindowIndex> {
@@ -416,24 +449,51 @@ impl OptionQuoteInner {
         let mut dates = planned_dates(&self.config, &self.calendar);
         dates.sort();
         dates.dedup();
-        for date in dates {
+        loop {
             if cancel.is_cancelled() {
                 break;
             }
-            if !day_requires_ingest(
-                self.ledger.as_ref(),
-                self.day_index.as_ref(),
-                date,
-                TradeSlotKind::OptionQuote,
-            ) {
-                info!(
-                    "[{}] skipping option quote day {} (already ingested)",
-                    self.config.label, date
-                );
-                continue;
+            let now = Utc::now();
+            let mut made_progress = false;
+            let mut has_future_work = false;
+            let mut next_ready_at: Option<DateTime<Utc>> = None;
+            for &date in &dates {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                if let Some(ready_at) = ready_instant(&self.config, &self.calendar, date) {
+                    if ready_at > now {
+                        has_future_work = true;
+                        update_next_ready(&mut next_ready_at, ready_at);
+                        continue;
+                    }
+                }
+                if !day_requires_ingest(
+                    self.ledger.as_ref(),
+                    self.day_index.as_ref(),
+                    date,
+                    TradeSlotKind::OptionQuote,
+                ) {
+                    continue;
+                }
+                has_future_work = true;
+                if let Err(err) = self.process_option_quotes_day(date, cancel.clone()).await {
+                    error!("option quote day {} failed: {err}", date);
+                }
+                made_progress = true;
             }
-            if let Err(err) = self.process_option_quotes_day(date, cancel.clone()).await {
-                error!("option quote day {} failed: {err}", date);
+            if !has_future_work {
+                break;
+            }
+            if !made_progress {
+                let cancelled = if let Some(ready_at) = next_ready_at {
+                    wait_until_ready(ready_at, cancel.clone()).await
+                } else {
+                    sleep_with_cancel(Duration::from_secs(60), cancel.clone()).await
+                };
+                if cancelled {
+                    break;
+                }
             }
         }
         info!(
@@ -490,16 +550,24 @@ impl OptionQuoteInner {
                 );
                 return Ok(());
             }
-            let record = record?;
+            let record = match record {
+                Ok(record) => record,
+                Err(err) => {
+                    log_streaming_error(self.config.label, "option quotes", date, &err);
+                    return Err(err.into());
+                }
+            };
             if record.len() < 12 {
                 continue;
             }
-            if let Some((symbol, quote, underlying)) = parse_quote_row(&record, QuoteSource::Option)
+            if let Some((_contract, quote, underlying)) =
+                parse_quote_row(&record, QuoteSource::Option)
             {
-                if let Some(base) = underlying.as_deref() {
-                    if !self.config.allows_underlying(base) {
-                        continue;
-                    }
+                let Some(base) = underlying else {
+                    continue;
+                };
+                if !self.config.allows_underlying(&base) {
+                    continue;
                 }
                 let ts = quote.timestamp_ns();
                 let window_idx = match self.window_idx_for_timestamp(ts) {
@@ -507,7 +575,7 @@ impl OptionQuoteInner {
                     None => continue,
                 };
                 tracker.with_bucket(
-                    &symbol,
+                    &base,
                     window_idx,
                     |sym, idx| self.open_option_quote_window(date, sym, idx),
                     |state| self.finalize_option_quote_state(date, state),
@@ -621,14 +689,11 @@ impl OptionQuoteInner {
     fn open_option_quote_window(
         &self,
         date: NaiveDate,
-        symbol: &str,
+        underlying: &str,
         window_idx: WindowIndex,
     ) -> Result<SymbolWindow<QuoteRecord>, FlatfileError> {
-        if !self.config.allows_symbol(symbol) {
-            return Ok(SymbolWindow::skipped(symbol, window_idx));
-        }
         let key = WindowKey {
-            symbol: symbol.to_string(),
+            symbol: underlying.to_string(),
             window_idx,
         };
         let status = ensure_slot_pending(
@@ -637,20 +702,20 @@ impl OptionQuoteInner {
             SlotKind::Trade(TradeSlotKind::OptionQuote),
         )?;
         if status == SlotStatus::Filled {
-            return Ok(SymbolWindow::skipped(symbol, window_idx));
+            return Ok(SymbolWindow::skipped(underlying, window_idx));
         }
         if status == SlotStatus::Pending {
             let relative_path = artifact_path(
                 &self.config,
                 "options/quotes",
                 date,
-                symbol,
+                underlying,
                 window_idx,
                 "parquet",
             );
             cleanup_partial_artifacts(&self.config, &relative_path)?;
         }
-        Ok(SymbolWindow::writable(symbol, window_idx))
+        Ok(SymbolWindow::writable(underlying, window_idx))
     }
 
     fn window_idx_for_timestamp(&self, ts_ns: i64) -> Option<WindowIndex> {
@@ -685,24 +750,51 @@ impl UnderlyingTradeInner {
         let mut dates = planned_dates(&self.config, &self.calendar);
         dates.sort();
         dates.dedup();
-        for date in dates {
+        loop {
             if cancel.is_cancelled() {
                 break;
             }
-            if !day_requires_ingest(
-                self.ledger.as_ref(),
-                self.day_index.as_ref(),
-                date,
-                TradeSlotKind::UnderlyingTrade,
-            ) {
-                info!(
-                    "[{}] skipping underlying trade day {} (already ingested)",
-                    self.config.label, date
-                );
-                continue;
+            let now = Utc::now();
+            let mut made_progress = false;
+            let mut has_future_work = false;
+            let mut next_ready_at: Option<DateTime<Utc>> = None;
+            for &date in &dates {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                if let Some(ready_at) = ready_instant(&self.config, &self.calendar, date) {
+                    if ready_at > now {
+                        has_future_work = true;
+                        update_next_ready(&mut next_ready_at, ready_at);
+                        continue;
+                    }
+                }
+                if !day_requires_ingest(
+                    self.ledger.as_ref(),
+                    self.day_index.as_ref(),
+                    date,
+                    TradeSlotKind::UnderlyingTrade,
+                ) {
+                    continue;
+                }
+                has_future_work = true;
+                if let Err(err) = self.process_equity_trades_day(date, cancel.clone()).await {
+                    error!("underlying trades day {} failed: {err}", date);
+                }
+                made_progress = true;
             }
-            if let Err(err) = self.process_equity_trades_day(date, cancel.clone()).await {
-                error!("underlying trades day {} failed: {err}", date);
+            if !has_future_work {
+                break;
+            }
+            if !made_progress {
+                let cancelled = if let Some(ready_at) = next_ready_at {
+                    wait_until_ready(ready_at, cancel.clone()).await
+                } else {
+                    sleep_with_cancel(Duration::from_secs(60), cancel.clone()).await
+                };
+                if cancelled {
+                    break;
+                }
             }
         }
         info!(
@@ -764,7 +856,13 @@ impl UnderlyingTradeInner {
                 );
                 return Ok(());
             }
-            let record = record?;
+            let record = match record {
+                Ok(record) => record,
+                Err(err) => {
+                    log_streaming_error(self.config.label, "underlying trades", date, &err);
+                    return Err(err.into());
+                }
+            };
             if record.len() < 12 {
                 continue;
             }
@@ -953,24 +1051,51 @@ impl UnderlyingQuoteInner {
         let mut dates = planned_dates(&self.config, &self.calendar);
         dates.sort();
         dates.dedup();
-        for date in dates {
+        loop {
             if cancel.is_cancelled() {
                 break;
             }
-            if !day_requires_ingest(
-                self.ledger.as_ref(),
-                self.day_index.as_ref(),
-                date,
-                TradeSlotKind::UnderlyingQuote,
-            ) {
-                info!(
-                    "[{}] skipping underlying quote day {} (already ingested)",
-                    self.config.label, date
-                );
-                continue;
+            let now = Utc::now();
+            let mut made_progress = false;
+            let mut has_future_work = false;
+            let mut next_ready_at: Option<DateTime<Utc>> = None;
+            for &date in &dates {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                if let Some(ready_at) = ready_instant(&self.config, &self.calendar, date) {
+                    if ready_at > now {
+                        has_future_work = true;
+                        update_next_ready(&mut next_ready_at, ready_at);
+                        continue;
+                    }
+                }
+                if !day_requires_ingest(
+                    self.ledger.as_ref(),
+                    self.day_index.as_ref(),
+                    date,
+                    TradeSlotKind::UnderlyingQuote,
+                ) {
+                    continue;
+                }
+                has_future_work = true;
+                if let Err(err) = self.process_equity_quotes_day(date, cancel.clone()).await {
+                    error!("underlying quotes day {} failed: {err}", date);
+                }
+                made_progress = true;
             }
-            if let Err(err) = self.process_equity_quotes_day(date, cancel.clone()).await {
-                error!("underlying quotes day {} failed: {err}", date);
+            if !has_future_work {
+                break;
+            }
+            if !made_progress {
+                let cancelled = if let Some(ready_at) = next_ready_at {
+                    wait_until_ready(ready_at, cancel.clone()).await
+                } else {
+                    sleep_with_cancel(Duration::from_secs(60), cancel.clone()).await
+                };
+                if cancelled {
+                    break;
+                }
             }
         }
         info!(
@@ -1032,7 +1157,13 @@ impl UnderlyingQuoteInner {
                 );
                 return Ok(());
             }
-            let record = record?;
+            let record = match record {
+                Ok(record) => record,
+                Err(err) => {
+                    log_streaming_error(self.config.label, "underlying quotes", date, &err);
+                    return Err(err.into());
+                }
+            };
             if record.len() < 12 {
                 continue;
             }
@@ -1227,13 +1358,22 @@ fn planned_dates(config: &FlatfileRuntimeConfig, calendar: &TradingCalendar) -> 
             continue;
         };
         let start = ts_ns_to_date(start_ns);
-        let end_ns = range
+        if start > config.window_end {
+            continue;
+        }
+        let mut end = range
             .end_ts_ns()
             .ok()
             .flatten()
-            .unwrap_or_else(|| Utc::now().timestamp_nanos_opt().unwrap());
+            .map(ts_ns_to_date)
+            .unwrap_or(config.window_end);
+        if end > config.window_end {
+            end = config.window_end;
+        }
+        if start > end {
+            continue;
+        }
         let mut current = start;
-        let end = ts_ns_to_date(end_ns);
         while current <= end {
             if calendar.is_trading_day(current).unwrap_or(false) {
                 days.push(current);
@@ -1242,6 +1382,66 @@ fn planned_dates(config: &FlatfileRuntimeConfig, calendar: &TradingCalendar) -> 
         }
     }
     days
+}
+
+fn ready_instant(
+    config: &FlatfileRuntimeConfig,
+    calendar: &TradingCalendar,
+    date: NaiveDate,
+) -> Option<DateTime<Utc>> {
+    let next_day = date.succ_opt()?;
+    let next_is_trading = calendar.is_trading_day(next_day).unwrap_or(false);
+    let ready_time = if next_is_trading {
+        config.next_day_ready_time
+    } else {
+        config.non_trading_ready_time
+    };
+    let naive = next_day.and_time(ready_time);
+    Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
+fn update_next_ready(slot: &mut Option<DateTime<Utc>>, candidate: DateTime<Utc>) {
+    match slot {
+        Some(current) if candidate < *current => *current = candidate,
+        Some(_) => {}
+        None => *slot = Some(candidate),
+    }
+}
+
+async fn wait_until_ready(target: DateTime<Utc>, cancel: CancellationToken) -> bool {
+    let now = Utc::now();
+    let wait = target.signed_duration_since(now);
+    let duration = wait.to_std().unwrap_or_default();
+    let duration = if duration.is_zero() {
+        Duration::from_secs(5)
+    } else {
+        duration
+    };
+    sleep_with_cancel(duration, cancel).await
+}
+
+async fn sleep_with_cancel(duration: Duration, cancel: CancellationToken) -> bool {
+    tokio::select! {
+        _ = sleep(duration) => false,
+        _ = cancel.cancelled() => true,
+    }
+}
+
+fn log_streaming_error(engine_label: &str, dataset: &str, date: NaiveDate, err: &csv_async::Error) {
+    match err.kind() {
+        CsvErrorKind::Io(io_err) => error!(
+            "[{}] {} day {} streaming error: kind={:?} message={}",
+            engine_label,
+            dataset,
+            date,
+            io_err.kind(),
+            io_err
+        ),
+        _ => error!(
+            "[{}] {} day {} csv error: {}",
+            engine_label, dataset, date, err
+        ),
+    }
 }
 
 fn ts_ns_to_date(ns: i64) -> NaiveDate {

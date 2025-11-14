@@ -1,5 +1,7 @@
 use std::{collections::HashSet, env, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
+use chrono::NaiveTime;
+
 use core_types::config::DateRange;
 use thiserror::Error;
 use time::macros::date;
@@ -89,6 +91,8 @@ pub struct FlatfileSettings {
     pub date_ranges: Vec<DateRange>,
     pub batch_size: usize,
     pub progress_update_ms: u64,
+    pub next_day_ready_time: NaiveTime,
+    pub non_trading_ready_time: NaiveTime,
 }
 
 impl FlatfileSettings {
@@ -103,6 +107,8 @@ impl FlatfileSettings {
             }],
             batch_size: 2000,
             progress_update_ms: 250,
+            next_day_ready_time: NaiveTime::from_hms_opt(11, 0, 0).unwrap(),
+            non_trading_ready_time: NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
         }
     }
 }

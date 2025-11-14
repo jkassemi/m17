@@ -25,6 +25,8 @@ pub enum SlotStatus {
     Filled = 2,
     Cleared = 3,
     Retired = 4,
+    Prune = 5,
+    Pruned = 6,
 }
 
 /// Metadata recorded for each slot column.
@@ -83,6 +85,23 @@ impl Slot {
     pub fn retire(&mut self) {
         self.payload_type = PayloadType::Unknown;
         self.status = SlotStatus::Retired;
+        self.payload_id = 0;
+        self.checksum = 0;
+        self.version = self.version.wrapping_add(1);
+        self.last_updated_ns = current_time_ns();
+    }
+
+    pub fn mark_prune(&mut self) {
+        if matches!(self.status, SlotStatus::Prune | SlotStatus::Pruned) {
+            return;
+        }
+        self.status = SlotStatus::Prune;
+        self.last_updated_ns = current_time_ns();
+    }
+
+    pub fn mark_pruned(&mut self) {
+        self.status = SlotStatus::Pruned;
+        self.payload_type = PayloadType::Unknown;
         self.payload_id = 0;
         self.checksum = 0;
         self.version = self.version.wrapping_add(1);

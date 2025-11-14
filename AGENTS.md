@@ -1,11 +1,13 @@
 # Repository Guidelines
 
 1. MINIMAL CHANGES. DO NOT EXTRAPOLATE OR EXTEND ENGINEERING BEYOND THE USER'S REQUEST.
+2. The user struggles with ADHD. They may focus on a portion of your message during your response. Take this into consideration and confirm/adapt to the conversation as necessary.
+3. The entire project here was written over the past two days. It's possible to move quickly. Unless it's helpful for your framing, avoid considering explicit timeframes or subjective assignment of words like "massive" or "major" for what may be relatively simple tasks given the velocity.
 
 ## Project Structure & Module Organization
 
 - Root is a Cargo workspace (`Cargo.toml`) with service crates under directories like `orchestrator/`, `treasury-ingestion-service/`, `tui/`, and shared libraries such as `core-types/`, `metrics/`, and `nbbo-cache/`.
-- Config assets (`config.toml`, `config.toml.example`) live at the repo root; logs default to `orchestrator.log`.
+- Runtime configuration now lives in code (`m17/src/config.rs`); there is no repo-level `config.toml`. Logs default to `orchestrator.log`.
 - Tests reside alongside sources (e.g., `classifier/src/greeks.rs`), so `cargo test -p <crate>` discovers them automatically.
 
 ## Build, Test, and Development Commands
@@ -13,7 +15,7 @@
 - `cargo fmt`: formats all Rust crates—run before opening a PR.
 - `cargo check`: fast verify that every crate compiles; orchestrator depends on most others, so this surfaces integration issues early.
 - `cargo test` or `cargo test -p <crate>`: executes unit/integration tests; prefer scoped runs when iterating on a single service.
-- `cargo run -p orchestrator`: boots the orchestrator; requires a valid `config.toml` and Massive API key.
+- `cargo run -p orchestrator`: boots the legacy orchestrator (still expects a config file; we no longer ship one). `cargo run -p m17 dev` is the canonical path with hardcoded settings.
 - It's fine (and preferred) to make real requests (within reason) to remote
 APIs during testing for shape/content validation.
 
@@ -37,7 +39,7 @@ APIs during testing for shape/content validation.
 
 ## Security & Configuration Tips
 
-- Secrets (Massive API keys, flatfile credentials) belong only in `config.toml`; never commit real values—use `config.toml.example` for documentation.
+- Secrets (Massive API keys, flatfile credentials) stay out of git. For the new stack we read them from env vars in `m17/src/config.rs`; do not commit plaintext credentials anywhere.
 - Services now treat missing treasury data as `CRIT`; ensure staging/prod environments expose reachable `/fed/v1/treasury-yields` endpoints before deploys.
 
 ## Mindset & Operational Expectations

@@ -8,11 +8,15 @@ use std::{
     time::Duration,
 };
 
+use chrono::{DateTime, Utc};
 use config::{AppConfig, ConfigError, Environment};
-use core_types::config::DateRange;
+use core_types::{config::DateRange, types::ClassParams};
 use engine_api::{Engine, EngineError};
 use log::{LevelFilter, Log, Metadata, Record};
 use metrics::MetricsServer;
+use nbbo_engine::{
+    AggressorEngineConfig, AggressorMetrics, OptionAggressorEngine, UnderlyingAggressorEngine,
+};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use trade_flatfile_engine::{
@@ -22,6 +26,9 @@ use trade_flatfile_engine::{
 use window_space::{
     WindowSpace, WindowSpaceController, WindowSpaceError, WindowSpaceStorageReport,
 };
+
+const DEFAULT_CLASSIFIER_EPSILON: f64 = 1e-4;
+const DEFAULT_CLASSIFIER_LATENESS_MS: u32 = 1_000;
 
 fn main() {
     init_logger();
@@ -34,12 +41,24 @@ fn main() {
 fn run() -> Result<(), AppError> {
     let args = parse_cli_args()?;
     let config = AppConfig::load(args.env)?;
+    assert!(
+        !config.secrets.massive_api_key.is_empty(),
+        "POLYGONIO_KEY must be set"
+    );
 
     config.ledger.ensure_dirs()?;
     let (controller_inner, storage_report) =
         WindowSpaceController::bootstrap(config.ledger.clone())?;
     let controller = Arc::new(controller_inner);
+    let window_end = controller
+        .window_space()
+        .iter()
+        .last()
+        .and_then(|meta| DateTime::<Utc>::from_timestamp(meta.start_ts, 0))
+        .map(|dt| dt.date_naive())
+        .unwrap_or_else(|| Utc::now().date_naive());
     let download_metrics = Arc::new(DownloadMetrics::new());
+    let aggressor_metrics = Arc::new(AggressorMetrics::new());
     let flatfile_cfg = FlatfileRuntimeConfig {
         label: config.env_label(),
         state_dir: config.ledger.state_dir().to_path_buf(),
@@ -54,6 +73,9 @@ fn run() -> Result<(), AppError> {
         progress_logging: args.progress_logging,
         download_metrics: Arc::clone(&download_metrics),
         symbol_universe: config.symbol_universe.clone(),
+        next_day_ready_time: config.flatfile.next_day_ready_time,
+        non_trading_ready_time: config.flatfile.non_trading_ready_time,
+        window_end,
     };
     let option_trade_engine =
         OptionTradeFlatfileEngine::new(flatfile_cfg.clone(), controller.clone());
@@ -62,7 +84,20 @@ fn run() -> Result<(), AppError> {
     let underlying_trade_engine =
         UnderlyingTradeFlatfileEngine::new(flatfile_cfg.clone(), controller.clone());
     let underlying_quote_engine =
-        UnderlyingQuoteFlatfileEngine::new(flatfile_cfg, controller.clone());
+        UnderlyingQuoteFlatfileEngine::new(flatfile_cfg.clone(), controller.clone());
+    let aggressor_cfg = AggressorEngineConfig::for_label(config.env_label());
+    let option_aggressor_engine = OptionAggressorEngine::new(
+        aggressor_cfg.clone(),
+        controller.clone(),
+        default_class_params(),
+        Arc::clone(&aggressor_metrics),
+    );
+    let underlying_aggressor_engine = UnderlyingAggressorEngine::new(
+        aggressor_cfg,
+        controller.clone(),
+        default_class_params(),
+        Arc::clone(&aggressor_metrics),
+    );
 
     println!(
         "m17 orchestrator booted in {:?} mode; window space state at {:?}",
@@ -101,19 +136,26 @@ fn run() -> Result<(), AppError> {
     option_quote_engine.start()?;
     underlying_trade_engine.start()?;
     underlying_quote_engine.start()?;
+    option_aggressor_engine.start()?;
+    underlying_aggressor_engine.start()?;
     log_engine_health("option-trade-flatfile", &option_trade_engine);
     log_engine_health("option-quote-flatfile", &option_quote_engine);
     log_engine_health("underlying-trade-flatfile", &underlying_trade_engine);
     log_engine_health("underlying-quote-flatfile", &underlying_quote_engine);
+    log_engine_health("option-aggressor", &option_aggressor_engine);
+    log_engine_health("underlying-aggressor", &underlying_aggressor_engine);
     println!("Flatfile engines are running; press Ctrl+C to shut down.");
     let metrics_server = MetricsServer::start(
         controller.slot_metrics(),
         download_metrics,
         Arc::clone(&controller),
+        aggressor_metrics,
         config.metrics_addr,
     );
     wait_for_shutdown_signal()?;
     println!("Shutdown signal received; stopping flatfile engines...");
+    underlying_aggressor_engine.stop()?;
+    option_aggressor_engine.stop()?;
     underlying_quote_engine.stop()?;
     underlying_trade_engine.stop()?;
     option_quote_engine.stop()?;
@@ -232,6 +274,14 @@ fn format_creation_duration(duration: Option<Duration>) -> String {
     match duration {
         Some(dur) => format!("{:?}", dur),
         None => "existing".to_string(),
+    }
+}
+
+fn default_class_params() -> ClassParams {
+    ClassParams {
+        use_tick_rule_fallback: true,
+        epsilon_price: DEFAULT_CLASSIFIER_EPSILON,
+        allowed_lateness_ms: DEFAULT_CLASSIFIER_LATENESS_MS,
     }
 }
 

@@ -26,15 +26,16 @@ Replace `<DATE>` with the ISO date (e.g., `2025-02-14`).
 
 ## 4. Scope the replay window
 
-Edit `config.toml` and temporarily set `flatfile.date_ranges` to a single window that covers only the flagged day, for example:
+Edit `m17/src/config.rs` and update `FlatfileSettings::for_env` so the `date_ranges` vector contains just the flagged day, for example:
 
-```toml
-[[flatfile.date_ranges]]
-start_ts = "2025-02-14T00:00:00Z"
-end_ts   = "2025-02-14T23:59:59Z"
+```rust
+date_ranges: vec![DateRange {
+    start_ts: "2025-02-14T00:00:00Z".to_string(),
+    end_ts: Some("2025-02-14T23:59:59Z".to_string()),
+}],
 ```
 
-Leave other ranges commented out to avoid rehydrating unrelated days.
+Rebuild/restart after saving so the binary picks up the new hardcoded range.
 
 ## 5. Rehydrate the day
 
@@ -43,8 +44,8 @@ Leave other ranges commented out to avoid rehydrating unrelated days.
 
 ## 6. Restore the normal schedule
 
-1. Revert `flatfile.date_ranges` to the long-running configuration.
-2. Start the orchestrator again if you stopped it in the previous step.
+1. Revert the `date_ranges` definition in `m17/src/config.rs` to the long-running configuration.
+2. Restart the orchestrator once the code is back in its steady-state form.
 
 ## 7. Verification
 

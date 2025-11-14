@@ -347,3 +347,31 @@ pub fn greeks_overlay_schema() -> Schema {
         Field::new("run_id", DataType::Utf8, false),
     ])
 }
+
+/// Aggressor overlay schema.
+pub fn aggressor_record_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("instrument_id", DataType::Utf8, false),
+        Field::new("underlying_symbol", DataType::Utf8, true),
+        Field::new("trade_uid", DataType::FixedSizeBinary(16), false),
+        Field::new("trade_ts_ns", DataType::Int64, false),
+        Field::new("window_start_ts_ns", DataType::Int64, false),
+        Field::new("price", DataType::Float64, false),
+        Field::new("size", DataType::UInt32, false),
+        Field::new("aggressor_side", DataType::Utf8, false),
+        Field::new("class_method", DataType::Utf8, false),
+        Field::new("aggressor_offset_mid_bp", DataType::Int32, true),
+        Field::new("aggressor_confidence", DataType::Float64, true),
+        Field::new("nbbo_bid", DataType::Float64, true),
+        Field::new("nbbo_ask", DataType::Float64, true),
+        Field::new("nbbo_bid_sz", DataType::UInt32, true),
+        Field::new("nbbo_ask_sz", DataType::UInt32, true),
+        Field::new("nbbo_ts_ns", DataType::Int64, true),
+        Field::new("nbbo_age_us", DataType::UInt32, true),
+        Field::new("nbbo_state", DataType::Utf8, true),
+        Field::new("tick_size_used", DataType::Float64, true),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("quality", DataType::Utf8, false),
+        Field::new("watermark_ts_ns", DataType::Int64, false),
+    ])
+}

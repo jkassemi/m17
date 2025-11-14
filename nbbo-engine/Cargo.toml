@@ -1,0 +1,17 @@
+[package]
+name = "nbbo-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrow = "57.0.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+classifier = { path = "../classifier" }
+core-types = { path = "../core-types" }
+crc32fast = "1"
+engine-api = { path = "../engine-api" }
+log = "0.4"
+nbbo-cache = { path = "../nbbo-cache" }
+parquet = { version = "57.0", features = ["arrow"] }
+thiserror = "1"
+window-space = { path = "../window-space" }
